@@ -35,14 +35,20 @@ async def test_long_training_does_not_block_other_jobs(seeded, platform):
     api = seeded
     # Job B reaches pending_approval with the fast backend.
     async with api.client("alice@acme", SUBMIT) as c:
-        b = (await c.post("/v1/customization/jobs", json=job_body(), headers={"Idempotency-Key": f"k-{uuid.uuid4()}"})).json()
+        b = (
+            await c.post("/v1/customization/jobs", json=job_body(), headers={"Idempotency-Key": f"k-{uuid.uuid4()}"})
+        ).json()
     await PipelineRunner(platform).run_until_idle()
     assert (await _status(api, b["id"]))["lifecycle_status"] == "pending_approval"
 
     # Job A trains slowly (~6 s). While it trains, B is approved and must deploy.
     platform.backend = RehearsalBackend(step_delay_s=1.0, steps=6)
     async with api.client("alice@acme", SUBMIT) as c:
-        a = (await c.post("/v1/customization/jobs", json=job_body(seed=9), headers={"Idempotency-Key": f"k-{uuid.uuid4()}"})).json()
+        a = (
+            await c.post(
+                "/v1/customization/jobs", json=job_body(seed=9), headers={"Idempotency-Key": f"k-{uuid.uuid4()}"}
+            )
+        ).json()
     async with api.client("bob@acme", APPROVE) as c:
         assert (await c.post(f"/v1/approvals/{b['id']}:approve", json={"justification": "reviewed"})).status_code == 200
 
@@ -75,7 +81,11 @@ async def test_control_only_worker_never_runs_gpu_stages(seeded, platform):
     platform.settings.worker_lanes = ["control"]
     try:
         async with seeded.client("alice@acme", SUBMIT) as c:
-            j = (await c.post("/v1/customization/jobs", json=job_body(), headers={"Idempotency-Key": f"k-{uuid.uuid4()}"})).json()
+            j = (
+                await c.post(
+                    "/v1/customization/jobs", json=job_body(), headers={"Idempotency-Key": f"k-{uuid.uuid4()}"}
+                )
+            ).json()
         await PipelineRunner(platform).run_until_idle()
         st = await _status(seeded, j["id"])
         # Validation (control lane) ran; training (gpu lane) was left for a GPU worker.

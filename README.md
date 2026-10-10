@@ -78,15 +78,41 @@ uv run mccp api &                                # :8080
 
 The rehearsal backend writes a valid no-op adapter. It exercises every stage, and the production gate refuses it by design.
 
-## VPS control plane (CPU-only host, e.g. srv1507394)
+## Topologies
 
-`deploy/vps/install.sh` brings up Postgres, the migration job, OPA, MLflow and the MCCP API on a CPU-only box. The API listens on 127.0.0.1:8095. The script also adds an optional Caddy route `https://<site>/mccp/*`. It generates every secret and the signing keypair once, creates the first tenant, and writes 24-hour tokens for three separate demo users (admin, submitter, approver).
+**Single GPU host:** run `deploy/compose.yaml`. Everything runs on one machine, the object store is a shared Docker volume, and one worker serves all three lanes.
+
+**Split (VPS + GPU host):** the control plane runs on a CPU-only VPS and the training and serving plane on a GPU host. They share state through Postgres, an S3-compatible bucket and MLflow, over a private network (WireGuard or Tailscale).
+
+| Host | Compose file | Runs | Holds |
+|---|---|---|---|
+| VPS | `deploy/vps/compose.vps.yaml` (installed by `deploy/vps/install.sh`) | Postgres, MinIO (S3), OPA, MLflow, API, controller (`control` lane) | Signing **public** key only |
+| GPU host | `deploy/gpu/compose.gpu.yaml` | worker (`gpu` and `serving` lanes), vLLM, Qwen3Guard, LiteLLM | Signing **private** key |
+
+### Work lanes
+
+Each pipeline stage belongs to a lane: `gpu` (data staging → training → registration), `serving` (publish guard, eval, canary, rollback), or `control` (validation, policy gates, approvals). A worker serves the lanes in `MCCP_WORKER_LANES`, with concurrent slots per lane (`MCCP_WORKER_SLOTS_*`). When a job's next stage is in a different lane, it is handed to a worker for that lane, so a long training run never delays another job's approval or canary.
+
+### VPS install
 
 ```bash
 mkdir -p /opt/mccp && cd /opt/mccp && unzip -q -o ~/mccp-control-plane.zip && cd mccp-py && bash deploy/vps/install.sh
 ```
 
-Re-running it upgrades the code and keeps the generated secrets. Training and serving need a GPU: run `deploy/compose.yaml` (worker, Soup trainer, vLLM, LiteLLM) on a GPU host. Point that worker's `MCCP_DATABASE_URL` at this Postgres, with `MCCP_PG_BIND` set to a firewalled private address. Then set `MCCP_VLLM_BASE_URL` in `deploy/vps/.env`.
+The installer is idempotent. It generates secrets once and adds any missing ones on upgrade. It creates the bucket and the first tenant, writes 24-hour dev tokens for three separate users, and optionally adds a `/mccp` Caddy route.
+
+Postgres (`:55432`), S3 (`:59000`) and MLflow (`:55055`) bind to `MCCP_PRIVATE_BIND`. Leave it at `127.0.0.1` until the private network exists, then set it to the VPS's private address. **Never bind them to a public interface: these links are not TLS-protected yet.**
+
+### GPU host
+
+```bash
+cp deploy/gpu/.env.example deploy/gpu/.env      # VPS private address + secrets from deploy/vps/.env
+uv run mccp keys generate --out-dir deploy/gpu/secrets
+# copy deploy/gpu/secrets/signing-pub.pem to the VPS at deploy/vps/secrets/signing-pub.pem, then re-run the VPS installer
+docker compose -f deploy/gpu/compose.gpu.yaml --env-file deploy/gpu/.env up -d --build
+```
+
+Until the VPS has the public key, the policy gate denies every promotion (`adapter_verified=false`). This is deliberate: an unverified adapter can never be promoted.
 
 ## Real run (GPU host)
 
@@ -116,7 +142,7 @@ mccp audit-verify
 ## Tests
 
 ```bash
-uv run pytest                     # 104 tests; DB/OPA tests skip if unavailable
+uv run pytest                     # 115 tests; DB/OPA/S3 (moto) tests skip if unavailable
 MCCP_TEST_ADMIN_DSN=postgresql://postgres@127.0.0.1/postgres MCCP_TEST_OPA_BIN=$(which opa) uv run pytest
 MCCP_TEST_SOUP_PYTHON=/path/to/venv-with-soup/bin/python uv run pytest tests/test_soup_contract.py
 ```
@@ -137,7 +163,10 @@ The sandbox had no GPU and no Hugging Face access. Before relying on this, valid
 - **The pre-flight render-check against the real Qwen3 tokenizer.** It is the gate for the tools pre-rendering decision.
 - **vLLM v0.29 image flags, runtime LoRA loading, and the hermes tool parser on your adapters.** The fleet allowlist for `qwen3_5` is a placeholder until M7.
 - **Container image tags in `deploy/compose.yaml`** (vLLM, MLflow, LiteLLM, OPA). These are pins to confirm, not tested builds.
-- **Dependency drift.** The Soup 0.72.4 extras pin `trl<0.25` and `transformers<5`. That is why the worker image keeps its trainer venv separate from the control plane.
+- **Dependency drift.** The Soup 0.72.4 extras pin `trl<0.25` and `transformers<5`. That is why the worker image keeps its trainer venv separate from the control plane. The trainer environment is hash-locked in `trainer/requirements.lock.txt`.
+- **`--default-chat-template-kwargs`** (the server-side thinking-off default) must exist in the pinned vLLM. If it doesn't, vLLM fails to start, which is loud. In any case, the canary's gateway smoke test rejects any adapter that produces thinking output on the production path.
+- **LiteLLM behaviour.** Keeping the custom `model_info.id`, forwarding `extra_body`, model access groups, and `/key/generate` for `mccp gateway-key` all need confirming against a real LiteLLM.
+- **MinIO.** MinIO stopped publishing maintained community images in late 2025. Pin `MINIO_IMAGE` to a digest you have vetted, or use AWS S3 or another S3-compatible service.
 
 ## Phase 2 (DPO, then GRPO)
 

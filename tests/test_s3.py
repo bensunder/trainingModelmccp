@@ -92,9 +92,15 @@ async def test_vertical_runs_on_s3_store(settings, s3_endpoint, fake_serving):
         async with api.client("admin@s3", "Customizer.Admin") as c:
             assert (await c.post("/v1/recipes", json=RECIPE)).status_code in (201, 409)
         async with api.client("alice@s3", SUBMIT) as c:
-            assert (await c.post("/v1/datasets/finance-ops/invoice-exceptions/versions", content=invoices_ndjson())).status_code == 201
+            assert (
+                await c.post("/v1/datasets/finance-ops/invoice-exceptions/versions", content=invoices_ndjson())
+            ).status_code == 201
             assert (await c.post("/v1/eval-suites/finance-ops", json=suite_body())).status_code == 201
-            job = (await c.post("/v1/customization/jobs", json=job_body(), headers={"Idempotency-Key": f"k-{uuid.uuid4()}"})).json()
+            job = (
+                await c.post(
+                    "/v1/customization/jobs", json=job_body(), headers={"Idempotency-Key": f"k-{uuid.uuid4()}"}
+                )
+            ).json()
         await PipelineRunner(pf).run_until_idle()
         async with api.client("alice@s3", SUBMIT) as c:
             st = (await c.get(f"/v1/customization/jobs/{job['id']}")).json()

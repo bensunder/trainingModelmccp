@@ -166,7 +166,14 @@ class PipelineRunner:
                 if lc.value in ("failed", "cancelled", "rejected", "retired"):
                     await self._dequeue(job)
                     return
-                if job["cancel_requested"] and lc in (L.CREATED, L.VALIDATING, L.QUEUED, L.PROVISIONING, L.RUNNING, L.PAUSED):
+                if job["cancel_requested"] and lc in (
+                    L.CREATED,
+                    L.VALIDATING,
+                    L.QUEUED,
+                    L.PROVISIONING,
+                    L.RUNNING,
+                    L.PAUSED,
+                ):
                     await self._move(job, L.CANCELLED, data={"reason": "user cancel"}, cancel_requested=False)
                     continue
                 if lane_of(lc).value not in lanes:
@@ -880,7 +887,9 @@ class PipelineRunner:
         await self._promote(job)
         raise Park(None)
 
-    async def _gateway_smoke(self, job: dict[str, Any], suite: EvalSuite, golden: list[dict[str, Any]]) -> dict[str, Any]:
+    async def _gateway_smoke(
+        self, job: dict[str, Any], suite: EvalSuite, golden: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         """Smoke-test the canary through the gateway, i.e. the production path,
         sending what a plain agent sends (no chat_template_kwargs). Catches a
         gateway that drops extra_body or a vLLM without the server-side

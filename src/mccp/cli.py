@@ -197,7 +197,9 @@ def gateway_key(
     require_slug("tenant", tenant)
     if not s.litellm_master_key:
         raise typer.BadParameter("MCCP_LITELLM_MASTER_KEY is required")
-    gw = GatewayClient(s.litellm_base_url, s.litellm_master_key.get_secret_value(), s.litellm_vllm_api_base or s.vllm_base_url)
+    gw = GatewayClient(
+        s.litellm_base_url, s.litellm_master_key.get_secret_value(), s.litellm_vllm_api_base or s.vllm_base_url
+    )
     typer.echo(asyncio.run(gw.tenant_key(tenant, alias=alias, duration=duration)))
 
 

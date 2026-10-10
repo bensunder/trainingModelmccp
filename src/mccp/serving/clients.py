@@ -137,7 +137,9 @@ class GatewayClient:
 
     async def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Call the gateway exactly as an agent would (OpenAI-compatible)."""
-        r = await self._client.post(f"{self.base}/v1/chat/completions", json=payload, headers=self._headers, timeout=120.0)
+        r = await self._client.post(
+            f"{self.base}/v1/chat/completions", json=payload, headers=self._headers, timeout=120.0
+        )
         if r.status_code >= 400:
             raise ServingError(f"gateway chat failed: {r.status_code} {r.text[:300]}")
         return r.json()
@@ -149,7 +151,11 @@ class GatewayClient:
     async def tenant_key(self, tenant: str, *, alias: str, duration: str | None = None) -> str:
         """Create a LiteLLM virtual key limited to the tenant's access group.
         Untested against a real LiteLLM; verify with /key/info after creation."""
-        body: dict[str, Any] = {"models": [self.access_group(tenant)], "key_alias": alias, "metadata": {"mccp_tenant": tenant}}
+        body: dict[str, Any] = {
+            "models": [self.access_group(tenant)],
+            "key_alias": alias,
+            "metadata": {"mccp_tenant": tenant},
+        }
         if duration:
             body["duration"] = duration
         r = await self._client.post(f"{self.base}/key/generate", json=body, headers=self._headers)

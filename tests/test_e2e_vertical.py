@@ -19,7 +19,6 @@ from tests.conftest import ADMIN, APPROVE, SUBMIT, job_body, needs_db, needs_opa
 pytestmark = [needs_db, needs_opa, pytest.mark.e2e]
 
 
-
 async def submit(api, body=None, key=None):
     async with api.client("alice@acme", SUBMIT) as c:
         r = await c.post(
@@ -317,7 +316,9 @@ async def test_same_adapter_name_in_two_tenants_never_collides(seeded, platform,
     async with b.client("admin@globex", ADMIN) as c:
         assert (await c.post("/v1/recipes", json=RECIPE)).status_code in (201, 409)
     async with b.client("dana@globex", SUBMIT) as c:
-        assert (await c.post("/v1/datasets/finance-ops/invoice-exceptions/versions", content=invoices_ndjson())).status_code == 201
+        assert (
+            await c.post("/v1/datasets/finance-ops/invoice-exceptions/versions", content=invoices_ndjson())
+        ).status_code == 201
         assert (await c.post("/v1/eval-suites/finance-ops", json=suite_body())).status_code == 201
 
     runner = PipelineRunner(platform)
@@ -328,7 +329,9 @@ async def test_same_adapter_name_in_two_tenants_never_collides(seeded, platform,
     await runner.run_until_idle()
     assert (await approve(a, job_a["id"])).status_code == 200
     async with b.client("erin@globex", APPROVE) as c:
-        assert (await c.post(f"/v1/approvals/{job_b['id']}:approve", json={"justification": "reviewed"})).status_code == 200
+        assert (
+            await c.post(f"/v1/approvals/{job_b['id']}:approve", json={"justification": "reviewed"})
+        ).status_code == 200
     await runner.run_until_idle()
 
     a_name = (await get_job(a, job_a["id"]))["output_adapter"]
