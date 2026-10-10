@@ -18,7 +18,6 @@ from tests.conftest import ADMIN, APPROVE, SUBMIT, job_body, needs_db, needs_opa
 
 pytestmark = [needs_db, needs_opa, pytest.mark.e2e]
 
-LOGICAL = "finance-ops.invoice-triage"
 
 
 async def submit(api, body=None, key=None):
@@ -44,6 +43,7 @@ async def approve(api, job_id, who="bob@acme"):
 
 async def test_full_vertical_promote_supersede_rollback(seeded, platform, fake_serving):
     api = seeded
+    LOGICAL = api.logical
     runner = PipelineRunner(platform)
 
     # ---- v1: train -> guard -> eval -> staging gate -> pending approval
@@ -55,7 +55,7 @@ async def test_full_vertical_promote_supersede_rollback(seeded, platform, fake_s
     assert job["status"] == "succeeded"
     assert job["trained_tokens"] > 0 and job["flop_estimate"] > 0 and job["cost_usd"] is not None
     v1_name = job["output_adapter"]
-    assert v1_name.endswith("-finance-ops-invoice-triage-v1")
+    assert v1_name == f"{api.tenant_name}-finance-ops-invoice-triage-v1"
     assert v1_name in fake_serving.loaded  # loaded by the publish guard
 
     async with api.client("alice@acme", SUBMIT) as c:
@@ -301,3 +301,42 @@ async def test_cancel_flag_on_orphaned_running_job(seeded, platform):
     await PipelineRunner(platform).run_until_idle()
     job = await get_job(seeded, job["id"])
     assert job["lifecycle_status"] == "cancelled" and job["trained_tokens"] is None
+
+
+async def test_same_adapter_name_in_two_tenants_never_collides(seeded, platform, fake_serving):
+    """C1: tenants with identical project/adapter names get disjoint gateway
+    entries; promoting in one tenant leaves the other tenant's champion alone."""
+    from mccp.services.core import create_tenant
+    from tests.conftest import RECIPE, Api, invoices_ndjson, suite_body
+
+    a = seeded
+    other_idp = f"tid-{uuid.uuid4().hex[:8]}"
+    await create_tenant(platform, f"globex-{other_idp}", other_idp)
+    b = Api(a.app, a.secret, other_idp)
+    b_logical = f"globex-{other_idp}.finance-ops.invoice-triage"
+    async with b.client("admin@globex", ADMIN) as c:
+        assert (await c.post("/v1/recipes", json=RECIPE)).status_code in (201, 409)
+    async with b.client("dana@globex", SUBMIT) as c:
+        assert (await c.post("/v1/datasets/finance-ops/invoice-exceptions/versions", content=invoices_ndjson())).status_code == 201
+        assert (await c.post("/v1/eval-suites/finance-ops", json=suite_body())).status_code == 201
+
+    runner = PipelineRunner(platform)
+    job_a = await submit(a)
+    async with b.client("dana@globex", SUBMIT) as c:
+        r = await c.post("/v1/customization/jobs", json=job_body(), headers={"Idempotency-Key": f"k-{uuid.uuid4()}"})
+        job_b = r.json()
+    await runner.run_until_idle()
+    assert (await approve(a, job_a["id"])).status_code == 200
+    async with b.client("erin@globex", APPROVE) as c:
+        assert (await c.post(f"/v1/approvals/{job_b['id']}:approve", json={"justification": "reviewed"})).status_code == 200
+    await runner.run_until_idle()
+
+    a_name = (await get_job(a, job_a["id"]))["output_adapter"]
+    async with b.client("dana@globex", SUBMIT) as c:
+        b_job = (await c.get(f"/v1/customization/jobs/{job_b['id']}")).json()
+    assert b_job["lifecycle_status"] == "deployed", b_job["error"]
+    assert a_name != b_job["output_adapter"]
+    assert fake_serving.weights(a.logical) == {a_name: 100}
+    assert fake_serving.weights(b_logical) == {b_job["output_adapter"]: 100}
+    for d in fake_serving.litellm.values():
+        assert d["model_info"]["access_groups"] == [f"mccp-tenant-{d['model_name'].split('.')[0]}"]

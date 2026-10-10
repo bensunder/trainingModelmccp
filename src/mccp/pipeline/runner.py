@@ -41,7 +41,7 @@ from mccp.db.engine import jsonb, system_tx, tenant_tx
 from mccp.domain.errors import Conflict, NotFound
 from mccp.domain.hashing import digest_of
 from mccp.domain.recipe import Recipe
-from mccp.domain.refs import DatasetRef, SuiteRef, new_id
+from mccp.domain.refs import DatasetRef, SuiteRef, logical_model_name, new_id
 from mccp.domain.spec import ResolvedConfig
 from mccp.domain.status import AdapterStatus
 from mccp.domain.status import LifecycleStatus as L
@@ -382,7 +382,8 @@ class PipelineRunner:
         cfg = self._resolved(job)
         state = job.get("stage_state") or {}
         if job["adapter_version_id"]:
-            await self._move(job, L.PUBLISH_GUARD)
+            # Crash after the DB insert: finish from the registered row.
+            await self._finish_registration(job, cfg)
             return
         adapter_dir = Path(state["adapter_dir"])
         if not adapter_dir.exists():
@@ -392,8 +393,8 @@ class PipelineRunner:
         )
         adapter_cfg = json.loads((adapter_dir / "adapter_config.json").read_text())
         name = job["output_adapter"]
-        tshort = str(job["tenant_id"]).split("-")[0]
         async with tenant_tx(self.pf.engine, job["tenant_id"]) as conn:
+            tenant_slug = await repo.tenant_slug(conn, job["tenant_id"])
             await conn.execute(
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
                 {"k": f"adapter:{job['tenant_id']}:{job['project']}/{name}"},
@@ -409,7 +410,11 @@ class PipelineRunner:
                 ).scalar_one()
             )
             vid = new_id("adv")
-            serving_name = f"{tshort}-{job['project']}-{name}-v{version}"
+            # Tenant-qualified names: unique across tenants by construction, so
+            # one tenant's promotion can never touch another tenant's serving
+            # entries in vLLM, LiteLLM or MLflow.
+            serving_name = f"{tenant_slug}-{job['project']}-{name}-v{version}"
+            logical_name = logical_model_name(tenant_slug, job["project"], name)
             card = {
                 "base_model": cfg.base_model.model_dump(),
                 "peft": {
@@ -427,6 +432,7 @@ class PipelineRunner:
                 "attested_files": art.attested,
                 "signature_sha256": art.signature_sha256,
                 "risk_tier": job["risk_tier"],
+                "logical_name": logical_name,
             }
             await conn.execute(
                 text(
@@ -459,27 +465,35 @@ class PipelineRunner:
             )
             await repo.update_job(conn, job["id"], adapter_version_id=vid)
             job["adapter_version_id"] = vid
+        await self._finish_registration(job, cfg)
+
+    async def _finish_registration(self, job: dict[str, Any], cfg: ResolvedConfig) -> None:
+        """Idempotent tail of registration, driven only by the committed row."""
+        async with tenant_tx(self.pf.engine, job["tenant_id"]) as conn:
+            v = await repo.get_adapter_version(conn, job["adapter_version_id"])
+        card = v["card"]
         mlflow_version = await self.pf.mirror.register_version(
-            f"{job['project']}.{name}",
-            self.pf.store.uri(art.key_prefix),
+            card["logical_name"],
+            v["artifact_uri"],
             {
-                "mccp.serving_name": serving_name,
-                "mccp.artifact_sha256": art.digest,
+                "mccp.serving_name": v["serving_name"],
+                "mccp.artifact_sha256": v["artifact_sha256"],
                 "mccp.job_id": job["id"],
                 "mccp.config_hash": job["config_hash"],
                 "mccp.base_model": f"{cfg.base_model.id}@{cfg.base_model.revision}",
                 "mccp.approval_status": "pending",
             },
-            f"QLoRA SFT adapter from {job['id']}",
+            f"{cfg.method.upper()} {cfg.finetuning_type} adapter from {job['id']}",
         )
         await self._save_state(
             job,
-            serving_name=serving_name,
-            artifact_digest=art.digest,
-            artifact_prefix=art.key_prefix,
+            serving_name=v["serving_name"],
+            logical_name=card["logical_name"],
+            artifact_digest=v["artifact_sha256"],
+            artifact_prefix=card["artifact_prefix"],
             mlflow_version=mlflow_version,
         )
-        await self._move(job, L.PUBLISH_GUARD, data={"adapter_version_id": vid, "serving_name": serving_name})
+        await self._move(job, L.PUBLISH_GUARD, data={"adapter_version_id": v["id"], "serving_name": v["serving_name"]})
 
     async def _materialize(self, serving_name: str, artifact_prefix: str, artifact_digest: str) -> tuple[str, str]:
         """Verified copy into the vLLM adapter root; returns (local, server) paths."""
@@ -767,7 +781,11 @@ class PipelineRunner:
         raise Park(self.s.canary_window_s)
 
     def _logical(self, job: dict[str, Any]) -> str:
-        return f"{job['project']}.{job['output_adapter']}"
+        """Tenant-qualified gateway/registry name recorded at registration."""
+        name = (job.get("stage_state") or {}).get("logical_name")
+        if not name:
+            raise StageFailed("job has no tenant-qualified logical name; it was registered before this fix")
+        return name
 
     async def stage_canary(self, job: dict[str, Any]) -> None:
         st = job["stage_state"]

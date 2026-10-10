@@ -128,6 +128,21 @@ class GatewayClient:
     def deployment_id(serving_name: str) -> str:
         return f"mccp::{serving_name}"
 
+    @staticmethod
+    def access_group(tenant: str) -> str:
+        return f"mccp-tenant-{tenant}"
+
+    async def tenant_key(self, tenant: str, *, alias: str, duration: str | None = None) -> str:
+        """Create a LiteLLM virtual key limited to the tenant's access group.
+        Untested against a real LiteLLM; verify with /key/info after creation."""
+        body: dict[str, Any] = {"models": [self.access_group(tenant)], "key_alias": alias, "metadata": {"mccp_tenant": tenant}}
+        if duration:
+            body["duration"] = duration
+        r = await self._client.post(f"{self.base}/key/generate", json=body, headers=self._headers)
+        if r.status_code >= 400:
+            raise ServingError(f"LiteLLM /key/generate failed: {r.status_code} {r.text[:300]}")
+        return r.json()["key"]
+
     async def _deployments(self) -> dict[str, dict[str, Any]]:
         r = await self._client.get(f"{self.base}/model/info", headers=self._headers)
         if r.status_code >= 400:
@@ -144,6 +159,7 @@ class GatewayClient:
     ) -> None:
         """Make the deployments under `logical_name` exactly `weights`
         (serving_name -> weight). Weight 0 removes the deployment."""
+        tenant = logical_name.split(".", 1)[0]
         existing = await self._deployments()
         wanted = {self.deployment_id(n): (n, w) for n, w in weights.items() if w > 0}
         for dep_id, (serving_name, weight) in wanted.items():
@@ -155,7 +171,14 @@ class GatewayClient:
                     "weight": weight,
                     **({"extra_body": extra_body} if extra_body else {}),
                 },
-                "model_info": {"id": dep_id, "mccp_serving_name": serving_name},
+                "model_info": {
+                    "id": dep_id,
+                    "mccp_serving_name": serving_name,
+                    "mccp_tenant": tenant,
+                    # LiteLLM model access group: a tenant-scoped virtual key
+                    # (see tenant_key) can call only its own tenant's models.
+                    "access_groups": [self.access_group(tenant)],
+                },
             }
             if dep_id in existing:
                 if (existing[dep_id].get("litellm_params") or {}).get("weight") == weight:
@@ -165,7 +188,12 @@ class GatewayClient:
             if r.status_code >= 400:
                 raise ServingError(f"LiteLLM /model/new failed: {r.status_code} {r.text[:300]}")
         for dep_id, d in existing.items():
-            if dep_id.startswith("mccp::") and d.get("model_name") == logical_name and dep_id not in wanted:
+            if (
+                dep_id.startswith("mccp::")
+                and d.get("model_name") == logical_name
+                and (d.get("model_info") or {}).get("mccp_tenant") in (tenant, None)
+                and dep_id not in wanted
+            ):
                 await self._delete(dep_id)
 
     async def _delete(self, dep_id: str) -> None:

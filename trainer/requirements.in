@@ -1,0 +1,9 @@
+soup-cli[train]==0.72.4
+trl==0.24.0
+peft==0.17.1
+transformers==4.57.1
+bitsandbytes==0.48.1
+accelerate>=1.10
+huggingface_hub>=0.34
+pyyaml
+mlflow-skinny

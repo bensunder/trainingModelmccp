@@ -160,3 +160,11 @@ def parse_job_id(s: str) -> str:
     if not _JOB_ID.fullmatch(s):
         raise InvalidReference(f"job id `{s}` is malformed")
     return s
+
+
+def logical_model_name(tenant: str, project: str, adapter: str) -> str:
+    """Gateway/registry name `<tenant>.<project>.<adapter>`. Every part is a
+    slug (no dots), so the name is unambiguous and unique across tenants."""
+    for field, v in (("tenant", tenant), ("project", project), ("adapter", adapter)):
+        require_slug(field, v)
+    return f"{tenant}.{project}.{adapter}"

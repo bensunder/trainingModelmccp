@@ -72,6 +72,7 @@ services:
       --model Qwen/Qwen3-8B --revision ${QWEN3_8B_REVISION}
       --served-model-name qwen3-8b-base
       --dtype bfloat16 --max-model-len 16384
+      --gpu-memory-utilization ${VLLM_GPU_MEM_FRACTION:-0.70}
       --enable-lora --max-loras 8 --max-lora-rank 64 --max-cpu-loras 16
       --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3
       --api-key ${VLLM_API_KEY}
@@ -91,7 +92,7 @@ services:
     image: vllm/vllm-openai:v0.29.0
     command: >
       --model Qwen/Qwen3Guard-Gen-4B --port 8001
-      --gpu-memory-utilization 0.15 --max-model-len 4096
+      --gpu-memory-utilization ${GUARD_GPU_MEM_FRACTION:-0.22} --max-model-len 4096 --dtype bfloat16
     environment: {HF_TOKEN: "${HF_TOKEN:-}"}
     volumes: ["hfcache:/root/.cache/huggingface"]
     deploy:

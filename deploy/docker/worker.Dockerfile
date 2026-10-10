@@ -1,32 +1,41 @@
-# GPU worker image: pipeline runner + Soup trainer in one image, so the runner
-# launches the trainer entrypoint as a supervised subprocess on the same GPU host.
+# GPU worker image: pipeline runner + trainer environment in one image, so the
+# runner launches the trainer entrypoint as a supervised subprocess.
 #   docker build -f deploy/docker/worker.Dockerfile -t mccp-worker .
-# Pins below are the versions the recipe records; keep them in sync with
-# examples/recipe-qwen3-8b-qlora-sft.yaml (engine + soup.version).
+# Trainer dependencies are hash-locked in trainer/requirements.lock.txt
+# (regenerate with the command at the top of that file). Keep the recipe's
+# `engine` and `soup.version` fields equal to those pins.
+ARG UV_VERSION=0.11.32
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
-ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
+# Ubuntu 24.04 ships Python 3.12, which both the trainer and control plane target.
 RUN apt-get update && apt-get install -y --no-install-recommends python3.12 python3.12-venv git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=ghcr.io/astral-sh/uv:0.8 /uv /usr/local/bin/uv
+COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
 
 # Trainer environment (Soup + TRL/PEFT/bitsandbytes), isolated from the control plane.
-RUN uv venv /opt/trainer --python python3.12 \
- && uv pip install --python /opt/trainer/bin/python \
-      "soup-cli[train]==0.72.4" "trl==0.24.0" "peft==0.17.1" "transformers==4.57.1" \
-      "bitsandbytes==0.48.1" "accelerate>=1.10" "huggingface_hub>=0.34" pyyaml mlflow-skinny
-ENV PATH="/opt/trainer/bin:$PATH"
+COPY trainer/requirements.lock.txt /tmp/trainer-requirements.lock.txt
+RUN uv venv /opt/trainer --python /usr/bin/python3.12 \
+ && uv pip install --python /opt/trainer/bin/python --require-hashes -r /tmp/trainer-requirements.lock.txt
 
 # Control-plane package (pipeline runner).
 COPY pyproject.toml uv.lock README.md ./
-RUN uv venv /app/.venv --python python3.12 && uv sync --frozen --no-dev --no-install-project --python /app/.venv/bin/python
+RUN uv sync --frozen --no-dev --no-install-project --python /usr/bin/python3.12
 COPY src ./src
-RUN uv sync --frozen --no-dev --python /app/.venv/bin/python
+RUN uv sync --frozen --no-dev --python /usr/bin/python3.12
 COPY trainer ./trainer
 COPY policy ./policy
 COPY deploy/fleet.yaml ./deploy/fleet.yaml
 
-RUN useradd --uid 10001 --create-home mccp && mkdir -p /var/lib/mccp && chown -R mccp /var/lib/mccp
+# Volume mount points owned by the runtime user (copied into fresh named volumes).
+RUN useradd --uid 10001 --create-home mccp \
+ && mkdir -p /var/lib/mccp/objects /var/lib/mccp/work /var/lib/mccp/lora /home/mccp/.cache/huggingface \
+ && chown -R mccp:mccp /var/lib/mccp /home/mccp/.cache
 USER mccp
-ENV MCCP_TRAINER_PYTHON=/opt/trainer/bin/python MCCP_TRAINER_ENTRY=/app/trainer/mccp_trainer_entry.py
+ENV PATH="/app/.venv/bin:/opt/trainer/bin:$PATH" \
+    MCCP_TRAINER_PYTHON=/opt/trainer/bin/python \
+    MCCP_TRAINER_ENTRY=/app/trainer/mccp_trainer_entry.py \
+    HF_HOME=/home/mccp/.cache/huggingface
 CMD ["/app/.venv/bin/mccp", "worker"]

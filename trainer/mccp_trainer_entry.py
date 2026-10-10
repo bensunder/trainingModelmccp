@@ -158,7 +158,10 @@ def train(run: dict[str, Any], ev: Events, preflight_result: dict[str, Any]) -> 
     cfg["base"] = "./model"
     with open("soup.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
-    cmd = ["soup", "train", "--config", "soup.yaml", "--yes"]
+    # Resolve `soup` from the trainer interpreter's own environment so a
+    # different venv earlier on PATH can never supply a different Soup.
+    soup_bin = os.path.join(os.path.dirname(sys.executable), "soup")
+    cmd = [soup_bin if os.path.exists(soup_bin) else "soup", "train", "--config", "soup.yaml", "--yes"]
     if os.environ.get("MLFLOW_TRACKING_URI"):
         cmd += ["--tracker", "mlflow"]
     output = os.path.abspath(cfg["output"])

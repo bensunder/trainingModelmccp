@@ -61,8 +61,11 @@ GRANT CONNECT ON DATABASE mccp TO mccp_app;
 CREATE ROLE mlflow LOGIN PASSWORD '${MLFLOW_DB_PASSWORD}';
 CREATE DATABASE mlflow OWNER mlflow;
 EOF
-  chmod 644 "$VPS/postgres-init.sql"  # read by the postgres container user
 fi
+# Readable only by the postgres container user (uid 999 in the official
+# Debian-based image), never by other local users: it contains DB passwords.
+chown 999:999 "$VPS/postgres-init.sql"
+chmod 600 "$VPS/postgres-init.sql"
 
 mkdir -p "$SECRETS"
 if [[ ! -f "$SECRETS/signing-key.pem" ]]; then

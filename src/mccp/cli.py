@@ -163,6 +163,24 @@ def worker(once: bool = typer.Option(False, help="Process ready work then exit")
     asyncio.run(run())
 
 
+@app.command("gateway-key")
+def gateway_key(
+    tenant: Annotated[str, typer.Argument(help="Tenant slug (tenants.name)")],
+    alias: Annotated[str, typer.Option(help="Key alias, e.g. the agent's name")],
+    duration: Annotated[str | None, typer.Option(help="LiteLLM duration, e.g. 30d")] = None,
+) -> None:
+    """Create a LiteLLM virtual key that can call only this tenant's adapters."""
+    from mccp.domain.refs import require_slug
+    from mccp.serving.clients import GatewayClient
+
+    s = _settings()
+    require_slug("tenant", tenant)
+    if not s.litellm_master_key:
+        raise typer.BadParameter("MCCP_LITELLM_MASTER_KEY is required")
+    gw = GatewayClient(s.litellm_base_url, s.litellm_master_key.get_secret_value(), s.litellm_vllm_api_base or s.vllm_base_url)
+    typer.echo(asyncio.run(gw.tenant_key(tenant, alias=alias, duration=duration)))
+
+
 @examples_app.command("invoices")
 def examples_invoices(out: Path = Path("examples/out"), n: int = 3000, seed: int = 7) -> None:
     """Write the AP invoice-triage demo dataset and the agent's tool fixtures."""

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Enterprise Model Customization Control Plane: governed Qwen QLoRA adapter pipeline (Soup) from dataset to agent"
 readme = "README.md"
 authors = [{ name = "Ben Sunder" }]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "asyncpg>=0.31.0",
     "cryptography>=50.0.2",

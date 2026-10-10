@@ -111,7 +111,7 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(description="Run the AP triage agent against the gateway")
     ap.add_argument("--gateway", default=os.environ.get("MCCP_GATEWAY_URL", "http://127.0.0.1:4000"))
-    ap.add_argument("--model", default="finance-ops.invoice-triage")
+    ap.add_argument("--model", required=True, help="Tenant-qualified logical name: <tenant>.<project>.<adapter>")
     ap.add_argument("--fixtures", default="examples/out/fixtures.json")
     ap.add_argument("--n", type=int, default=5)
     ap.add_argument("--feedback", action="store_true", help="Post correctness feedback to the control plane")

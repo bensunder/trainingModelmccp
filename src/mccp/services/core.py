@@ -595,6 +595,8 @@ async def resolve_tenant(pf: Platform, idp_tenant: str) -> uuid.UUID | None:
 
 
 async def create_tenant(pf: Platform, name: str, idp_tenant_id: str, region: str = "us") -> uuid.UUID:
+    # The name becomes part of serving and gateway names, so it must be a slug.
+    require_slug("tenant", name)
     tid = uuid.uuid4()
     async with tenant_tx(pf.engine, tid) as conn:
         await conn.execute(

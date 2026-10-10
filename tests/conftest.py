@@ -192,6 +192,8 @@ async def api(platform):
     tenant_id = await create_tenant(platform, f"acme-{idp}", idp)
     a = Api(app, platform.settings.dev_jwt_secret.get_secret_value(), idp)
     a.tenant_id = tenant_id
+    a.tenant_name = f"acme-{idp}"
+    a.logical = f"acme-{idp}.finance-ops.invoice-triage"
     return a
 
 

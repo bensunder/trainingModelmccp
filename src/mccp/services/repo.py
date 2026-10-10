@@ -494,3 +494,11 @@ async def latest_evidence(conn: AsyncConnection, job_id: str) -> dict[str, Any] 
 
 def iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
+
+
+async def tenant_slug(conn: AsyncConnection, tenant_id: uuid.UUID | str) -> str:
+    """The tenant's slug name (RLS lets a tenant read only its own row)."""
+    r = (await conn.execute(text("SELECT name FROM tenants WHERE id = CAST(:t AS uuid)"), {"t": str(tenant_id)})).first()
+    if r is None:
+        raise NotFound(f"tenant {tenant_id} not found")
+    return r.name
