@@ -340,3 +340,38 @@ async def test_same_adapter_name_in_two_tenants_never_collides(seeded, platform,
     assert fake_serving.weights(b_logical) == {b_job["output_adapter"]: 100}
     for d in fake_serving.litellm.values():
         assert d["model_info"]["access_groups"] == [f"mccp-tenant-{d['model_name'].split('.')[0]}"]
+
+
+@pytest.mark.parametrize(
+    ("server_default_on", "gateway_forwards", "expect"),
+    [
+        (False, False, "deployed"),  # server-side default works; gateway irrelevant
+        (True, True, "deployed"),  # server flag missing but gateway extra_body saves it
+        (True, False, "rejected"),  # both mechanisms fail -> thinking in production
+    ],
+)
+async def test_canary_gateway_smoke_catches_thinking_on_production_path(
+    seeded, platform, fake_serving, server_default_on, gateway_forwards, expect
+):
+    """R5: eval talks to vLLM directly with thinking disabled per request; the
+    canary must prove the *gateway* path also has thinking off."""
+    fake_serving.server_thinking_default = server_default_on
+    fake_serving.gateway_forwards_extra_body = gateway_forwards
+    try:
+        runner = PipelineRunner(platform)
+        job = await submit(seeded)
+        await runner.run_until_idle()
+        assert (await get_job(seeded, job["id"]))["lifecycle_status"] == "pending_approval"
+        assert (await approve(seeded, job["id"])).status_code == 200
+        await runner.run_until_idle()
+        st = await get_job(seeded, job["id"])
+        assert st["lifecycle_status"] == expect, st["error"]
+        probe = f"{seeded.logical}~probe"
+        assert fake_serving.weights(probe) == {}  # probe route removed either way
+        if expect == "rejected":
+            assert st["error"]["code"] == "canary_rolled_back"
+            assert "thinking output on the production path" in st["error"]["message"]
+            assert fake_serving.weights(seeded.logical) == {}
+    finally:
+        fake_serving.server_thinking_default = False
+        fake_serving.gateway_forwards_extra_body = True

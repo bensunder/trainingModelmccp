@@ -54,6 +54,7 @@ from mccp.platform import Platform
 from mccp.registry.artifacts import materialize_verified, publish_adapter
 from mccp.services import repo
 from mccp.services.repo import SYSTEM_ACTOR
+from mccp.serving.clients import GatewayClient, NullGateway
 from mccp.storage.objectstore import tenant_prefix
 from mccp.training.backends import TrainContext
 
@@ -795,6 +796,10 @@ class PipelineRunner:
         champion = await self._champion_serving_name(job)
         weights = {champion: 90, name: 10} if champion else {name: 100}
         await self.pf.gateway.set_weights(self._logical(job), weights, extra_body=self._extra_body(cfg))
+        # Probe route: same gateway config, challenger only, for the smoke test.
+        await self.pf.gateway.set_weights(
+            GatewayClient.probe_name(self._logical(job)), {name: 100}, extra_body=self._extra_body(cfg)
+        )
         async with tenant_tx(self.pf.engine, job["tenant_id"]) as conn:
             await repo.upsert_deployment(
                 conn,
@@ -852,7 +857,8 @@ class PipelineRunner:
                 self.pf.vllm.chat, name, layers.golden_items(golden, 10), suite, self._extra_body(cfg), 2
             )
         )
-        problems = []
+        gateway_smoke = await self._gateway_smoke(job, suite, golden)
+        problems = list(gateway_smoke.get("problems", []))
         if fb.n >= 5 and neg_rate > self.s.canary_max_negative_feedback_rate:
             problems.append(f"negative feedback rate {neg_rate:.2f} > {self.s.canary_max_negative_feedback_rate}")
         if smoke["errors"]:
@@ -860,7 +866,13 @@ class PipelineRunner:
         if smoke["json_validity"] is not None and smoke["json_validity"] < 1.0:
             problems.append(f"smoke JSON validity {smoke['json_validity']:.2f} < 1.0")
         await self._save_state(
-            job, canary_result={"feedback": {"n": fb.n, "negative": fb.neg}, "smoke": smoke, "problems": problems}
+            job,
+            canary_result={
+                "feedback": {"n": fb.n, "negative": fb.neg},
+                "smoke": smoke,
+                "gateway_smoke": gateway_smoke,
+                "problems": problems,
+            },
         )
         if problems:
             await self._abort_canary(job, "; ".join(problems))
@@ -868,8 +880,45 @@ class PipelineRunner:
         await self._promote(job)
         raise Park(None)
 
+    async def _gateway_smoke(self, job: dict[str, Any], suite: EvalSuite, golden: list[dict[str, Any]]) -> dict[str, Any]:
+        """Smoke-test the canary through the gateway, i.e. the production path,
+        sending what a plain agent sends (no chat_template_kwargs). Catches a
+        gateway that drops extra_body or a vLLM without the server-side
+        thinking-off default: eval talked to vLLM directly and could not."""
+        if isinstance(self.pf.gateway, NullGateway):
+            return {"status": "skipped", "reason": "no gateway configured"}
+        probe = GatewayClient.probe_name(self._logical(job))
+        items = layers.golden_items(golden, 10)
+        thinking = 0
+        scores = []
+        for it in items:
+            payload: dict[str, Any] = {"model": probe, "messages": it.messages, "temperature": 0.0, "max_tokens": 512}
+            if it.tools:
+                payload["tools"] = it.tools
+            try:
+                resp = await self.pf.gateway.chat(payload)
+            except Exception as e:  # noqa: BLE001 - recorded as a canary problem
+                return {"status": "error", "problems": [f"gateway smoke request failed: {e}"[:300]]}
+            msg = resp["choices"][0]["message"]
+            if (msg.get("reasoning_content") or msg.get("reasoning")) or "<think>" in (msg.get("content") or ""):
+                thinking += 1
+            scores.append(layers.score_item(it, resp, suite.output_schema, suite.compare_fields))
+        summary = layers.summarize_l1(scores)
+        problems = []
+        if thinking:
+            problems.append(
+                f"thinking output on the production path in {thinking}/{len(items)} gateway responses "
+                "(server-side enable_thinking=false default or gateway extra_body not effective)"
+            )
+        if summary["json_validity"] is not None and summary["json_validity"] < 1.0:
+            problems.append(f"gateway JSON validity {summary['json_validity']:.2f} < 1.0")
+        if summary["tool_call_parse_rate"] is not None and summary["tool_call_parse_rate"] < 1.0:
+            problems.append(f"gateway tool-call parse rate {summary['tool_call_parse_rate']:.2f} < 1.0")
+        return {"status": "ok", "n": len(items), "thinking_responses": thinking, "l1": summary, "problems": problems}
+
     async def _abort_canary(self, job: dict[str, Any], reason: str) -> None:
         cfg = self._resolved(job)
+        await self.pf.gateway.set_weights(GatewayClient.probe_name(self._logical(job)), {})
         champion = await self._champion_serving_name(job)
         await self.pf.gateway.set_weights(
             self._logical(job), {champion: 100} if champion else {}, extra_body=self._extra_body(cfg)
@@ -893,6 +942,7 @@ class PipelineRunner:
         cfg = self._resolved(job)
         name = job["stage_state"]["serving_name"]
         await self.pf.gateway.set_weights(self._logical(job), {name: 100}, extra_body=self._extra_body(cfg))
+        await self.pf.gateway.set_weights(GatewayClient.probe_name(self._logical(job)), {})
         async with tenant_tx(self.pf.engine, job["tenant_id"]) as conn:
             dep = await repo.get_deployment(conn, job["project"], job["output_adapter"], for_update=True)
             old_id = dep["champion_version_id"] if dep else None

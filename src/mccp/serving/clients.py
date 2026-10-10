@@ -125,8 +125,22 @@ class GatewayClient:
         self._client = client or httpx.AsyncClient(timeout=30.0)
 
     @staticmethod
-    def deployment_id(serving_name: str) -> str:
-        return f"mccp::{serving_name}"
+    def deployment_id(logical_name: str, serving_name: str) -> str:
+        # Keyed by (model name, adapter version) so the same adapter can back
+        # both the logical name and its canary probe name.
+        return f"mccp::{logical_name}::{serving_name}"
+
+    @staticmethod
+    def probe_name(logical_name: str) -> str:
+        """Gateway name that routes only to the canary adapter (smoke tests)."""
+        return f"{logical_name}~probe"
+
+    async def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Call the gateway exactly as an agent would (OpenAI-compatible)."""
+        r = await self._client.post(f"{self.base}/v1/chat/completions", json=payload, headers=self._headers, timeout=120.0)
+        if r.status_code >= 400:
+            raise ServingError(f"gateway chat failed: {r.status_code} {r.text[:300]}")
+        return r.json()
 
     @staticmethod
     def access_group(tenant: str) -> str:
@@ -161,7 +175,7 @@ class GatewayClient:
         (serving_name -> weight). Weight 0 removes the deployment."""
         tenant = logical_name.split(".", 1)[0]
         existing = await self._deployments()
-        wanted = {self.deployment_id(n): (n, w) for n, w in weights.items() if w > 0}
+        wanted = {self.deployment_id(logical_name, n): (n, w) for n, w in weights.items() if w > 0}
         for dep_id, (serving_name, weight) in wanted.items():
             body = {
                 "model_name": logical_name,
@@ -203,6 +217,9 @@ class GatewayClient:
 
 
 class NullGateway:
+    async def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raise ServingError("no gateway configured")
+
     async def set_weights(
         self, logical_name: str, weights: dict[str, int], extra_body: dict[str, Any] | None = None
     ) -> None:

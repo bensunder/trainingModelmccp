@@ -43,6 +43,12 @@ class FakeServing:
         self.mlflow_versions: dict[str, list[dict[str, Any]]] = {}
         self.mlflow_aliases: dict[tuple[str, str], str] = {}
         self.requests: list[str] = []
+        # Serving-path realism toggles (R5):
+        # server_thinking_default: vLLM thinks unless the request disables it
+        #   (i.e. the --default-chat-template-kwargs flag is missing/ignored).
+        # gateway_forwards_extra_body: LiteLLM passes deployment extra_body on.
+        self.server_thinking_default = False
+        self.gateway_forwards_extra_body = True
         self.app = self._build()
         self.port = _free_port()
         self.url = f"http://127.0.0.1:{self.port}"
@@ -169,10 +175,24 @@ class FakeServing:
         async def chat(req: Request):
             body = await req.json()
             fake.requests.append(body["model"])
+            # Gateway route: a LiteLLM model name -> pick a weighted deployment.
+            deps = [d for d in fake.litellm.values() if d["model_name"] == body["model"]]
+            if deps:
+                import random
+
+                d = random.choices(deps, weights=[x["litellm_params"]["weight"] for x in deps])[0]
+                extra = d["litellm_params"].get("extra_body") or {}
+                if fake.gateway_forwards_extra_body:
+                    body = {**body, **extra}
+                body = {**body, "model": d["model_info"]["mccp_serving_name"]}
             try:
                 msg = fake.respond(body["model"], body["messages"], body.get("tools"))
             except KeyError:
                 return JSONResponse({"error": {"message": f"model {body['model']} not found"}}, status_code=404)
+            kwargs = body.get("chat_template_kwargs") or {}
+            thinking = kwargs.get("enable_thinking", fake.server_thinking_default)
+            if thinking and body["model"] not in (GUARD,):
+                msg = {**msg, "reasoning_content": "Let me think about this invoice..."}
             if body.get("stream"):
 
                 async def gen():
