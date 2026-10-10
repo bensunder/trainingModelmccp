@@ -43,7 +43,7 @@ from mccp.domain.hashing import digest_of
 from mccp.domain.recipe import Recipe
 from mccp.domain.refs import DatasetRef, SuiteRef, logical_model_name, new_id
 from mccp.domain.spec import ResolvedConfig
-from mccp.domain.status import AdapterStatus
+from mccp.domain.status import AdapterStatus, Lane, lane_of
 from mccp.domain.status import LifecycleStatus as L
 from mccp.evals import guard as publish_guard
 from mccp.evals import layers
@@ -87,41 +87,74 @@ class PipelineRunner:
         self.owner = f"{self.s.worker_id}:{uuid.uuid4().hex[:8]}"
 
     # ------------------------------------------------------------ main loop --
+    @property
+    def lanes(self) -> tuple[str, ...]:
+        return tuple(self.s.worker_lanes)
+
     async def run_forever(self, stop: asyncio.Event, idle_sleep_s: float = 2.0) -> None:
-        last_sweep = 0.0
+        """Run independent slot loops per lane so a long training run (gpu
+        lane) never delays evaluation, approvals or canaries (S1)."""
+        slots = {
+            Lane.GPU.value: self.s.worker_slots_gpu,
+            Lane.SERVING.value: self.s.worker_slots_serving,
+            Lane.CONTROL.value: self.s.worker_slots_control,
+        }
+        tasks = [
+            asyncio.create_task(self._slot_loop(lane, stop, idle_sleep_s), name=f"mccp-{lane}-{i}")
+            for lane in self.lanes
+            for i in range(slots[lane])
+        ]
+        if Lane.SERVING.value in self.lanes:
+            tasks.append(asyncio.create_task(self._sweep_loop(stop), name="mccp-retire-sweep"))
+        try:
+            await stop.wait()
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _slot_loop(self, lane: str, stop: asyncio.Event, idle_sleep_s: float) -> None:
         while not stop.is_set():
             try:
-                worked = await self.run_once()
-                if time.monotonic() - last_sweep > 60:
-                    await self.retire_sweep()
-                    last_sweep = time.monotonic()
-            except Exception:  # noqa: BLE001 - the loop must survive anything
-                log.exception("pipeline loop error")
+                worked = await self.run_once((lane,))
+            except Exception:  # noqa: BLE001 - a slot must survive anything
+                log.exception("pipeline slot error (lane %s)", lane)
                 worked = False
             if not worked:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), idle_sleep_s)
 
-    async def run_until_idle(self, max_iterations: int = 200) -> int:
-        """Process ready work until none is left (tests, CLI `--once`)."""
+    async def _sweep_loop(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                await self.retire_sweep()
+            except Exception:  # noqa: BLE001
+                log.exception("retire sweep failed")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), 60)
+
+    async def run_until_idle(self, max_iterations: int = 500) -> int:
+        """Process ready work sequentially until none is left (tests, `--once`)."""
         n = 0
         while n < max_iterations and await self.run_once():
             n += 1
         return n
 
-    async def run_once(self) -> bool:
+    async def run_once(self, lanes: tuple[str, ...] | None = None) -> bool:
+        lanes = lanes or self.lanes
         async with system_tx(self.pf.engine) as conn:
             row = (
                 await conn.execute(
-                    text("SELECT * FROM mccp_lease_job(:o, :s)"), {"o": self.owner, "s": self.s.lease_seconds}
+                    text("SELECT * FROM mccp_lease_job(:o, :s, CAST(:l AS text[]))"),
+                    {"o": self.owner, "s": self.s.lease_seconds, "l": list(lanes)},
                 )
             ).first()
         if row is None:
             return False
-        await self._drive(row.job_id, row.tenant_id, row.attempts)
+        await self._drive(row.job_id, row.tenant_id, row.attempts, frozenset(lanes))
         return True
 
-    async def _drive(self, job_id: str, tenant_id: uuid.UUID, attempts: int) -> None:
+    async def _drive(self, job_id: str, tenant_id: uuid.UUID, attempts: int, lanes: frozenset[str]) -> None:
         hb = asyncio.create_task(self._heartbeat(job_id, tenant_id))
         try:
             progressed = False
@@ -135,6 +168,11 @@ class PipelineRunner:
                 if job["cancel_requested"] and lc in (L.CREATED, L.VALIDATING, L.QUEUED, L.PROVISIONING, L.RUNNING, L.PAUSED):
                     await self._move(job, L.CANCELLED, data={"reason": "user cancel"}, cancel_requested=False)
                     continue
+                if lane_of(lc).value not in lanes:
+                    # Stage moved to another lane: hand the job over instead of
+                    # holding this slot (a GPU slot must not run evaluation).
+                    await self._release(job, 0, None, reset=True)
+                    return
                 handler = self._handlers().get(lc)
                 if handler is None:
                     await self._dequeue(job)

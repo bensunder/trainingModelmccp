@@ -79,6 +79,12 @@ class Settings(BaseSettings):
 
     # --- pipeline runner ------------------------------------------------
     worker_id: str = "worker-local"
+    worker_lanes: list[Literal["control", "gpu", "serving"]] = ["control", "gpu", "serving"]
+    """Lanes this worker serves. GPU host: gpu,serving. Control-plane host: control."""
+    worker_slots_gpu: int = 1
+    """Concurrent training jobs (one per GPU dedicated to training)."""
+    worker_slots_serving: int = 2
+    worker_slots_control: int = 4
     lease_seconds: int = 120
     heartbeat_seconds: int = 30
     max_stage_attempts: int = 5

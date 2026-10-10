@@ -150,3 +150,25 @@ class AdapterStatus(StrEnum):
     SUPERSEDED = "superseded"
     RETIRED = "retired"
     REJECTED = "rejected"
+
+
+class Lane(StrEnum):
+    """Which kind of worker may run a stage (must match SQL mccp_lane())."""
+
+    CONTROL = "control"
+    GPU = "gpu"
+    SERVING = "serving"
+
+
+LANE: dict[LifecycleStatus, Lane] = {
+    **{s: Lane.CONTROL for s in LifecycleStatus},
+    **{s: Lane.GPU for s in (L.QUEUED, L.PROVISIONING, L.RUNNING, L.PAUSED, L.REGISTERING)},
+    **{
+        s: Lane.SERVING
+        for s in (L.PUBLISH_GUARD, L.EVALUATING, L.APPROVED, L.CANARY, L.DEPLOYED, L.SUPERSEDED)
+    },
+}
+
+
+def lane_of(s: LifecycleStatus) -> Lane:
+    return LANE[s]
