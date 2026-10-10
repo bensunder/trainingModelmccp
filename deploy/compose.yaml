@@ -1,0 +1,155 @@
+# Single-GPU-host deployment of the full Phase 1 vertical.
+#   cp deploy/.env.example deploy/.env  &&  edit secrets
+#   uv run mccp keys generate --out-dir deploy/secrets
+#   docker compose -f deploy/compose.yaml --env-file deploy/.env up -d --build
+#
+# Network: only `api` (8080) and `litellm` (4000) are published. vLLM's runtime
+# LoRA endpoints stay on the private compose network (vLLM documents them as
+# unsafe outside a trusted network). Image tags are pins to verify before use.
+name: mccp
+
+x-mccp-env: &mccp-env
+  MCCP_DATABASE_URL: postgresql+asyncpg://mccp_app:mccp_app@postgres:5432/mccp
+  MCCP_OWNER_DATABASE_URL: postgresql+asyncpg://mccp_owner:mccp_owner@postgres:5432/mccp
+  MCCP_AUTH_MODE: ${MCCP_AUTH_MODE:-oidc}
+  MCCP_OIDC_ISSUER: ${MCCP_OIDC_ISSUER:-}
+  MCCP_OIDC_AUDIENCE: ${MCCP_OIDC_AUDIENCE:-}
+  MCCP_OIDC_JWKS_URL: ${MCCP_OIDC_JWKS_URL:-}
+  MCCP_DEV_JWT_SECRET: ${MCCP_DEV_JWT_SECRET:-}
+  MCCP_OBJECT_STORE_URL: ${MCCP_OBJECT_STORE_URL:-file:///var/lib/mccp/objects}
+  MCCP_SIGNING_MODE: key
+  MCCP_SIGNING_PRIVATE_KEY_PATH: /run/secrets/signing-key.pem
+  MCCP_SIGNING_PUBLIC_KEY_PATH: /run/secrets/signing-pub.pem
+  MCCP_VLLM_BASE_URL: http://vllm:8000
+  MCCP_VLLM_API_KEY: ${VLLM_API_KEY}
+  MCCP_VLLM_LORA_ROOT: /var/lib/mccp/lora
+  MCCP_VLLM_LORA_ROOT_IN_SERVER: /adapters
+  MCCP_FLEET_PROFILE_PATH: /app/deploy/fleet.yaml
+  MCCP_LITELLM_BASE_URL: http://litellm:4000
+  MCCP_LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+  MCCP_LITELLM_VLLM_API_BASE: http://vllm:8000
+  MCCP_MLFLOW_TRACKING_URI: http://mlflow:5000
+  MCCP_OPA_URL: http://opa:8181
+  MCCP_WORK_DIR: /var/lib/mccp/work
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 20
+
+  migrate:
+    build: {context: .., dockerfile: deploy/docker/control-plane.Dockerfile}
+    environment: *mccp-env
+    command: ["mccp", "db", "migrate"]
+    depends_on: {postgres: {condition: service_healthy}}
+    restart: "no"
+
+  opa:
+    image: openpolicyagent/opa:1.21.1
+    command: ["run", "--server", "--addr", "0.0.0.0:8181", "--log-level", "error", "/policy"]
+    volumes: ["../policy:/policy:ro"]
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.4.0
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri postgresql://mlflow:mlflow@postgres:5432/mlflow
+      --artifacts-destination /mlartifacts
+    volumes: ["mlartifacts:/mlartifacts"]
+    depends_on: {postgres: {condition: service_healthy}}
+
+  vllm:
+    image: vllm/vllm-openai:v0.29.0
+    command: >
+      --model Qwen/Qwen3-8B --revision ${QWEN3_8B_REVISION}
+      --served-model-name qwen3-8b-base
+      --dtype bfloat16 --max-model-len 16384
+      --enable-lora --max-loras 8 --max-lora-rank 64 --max-cpu-loras 16
+      --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3
+      --api-key ${VLLM_API_KEY}
+    environment:
+      VLLM_ALLOW_RUNTIME_LORA_UPDATING: "True"
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - hfcache:/root/.cache/huggingface
+      - lora:/adapters:ro
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]
+    ipc: host
+
+  vllm-guard:
+    image: vllm/vllm-openai:v0.29.0
+    command: >
+      --model Qwen/Qwen3Guard-Gen-4B --port 8001
+      --gpu-memory-utilization 0.15 --max-model-len 4096
+    environment: {HF_TOKEN: "${HF_TOKEN:-}"}
+    volumes: ["hfcache:/root/.cache/huggingface"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    environment:
+      DATABASE_URL: postgresql://litellm:litellm@postgres:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      STORE_MODEL_IN_DB: "True"
+      HOSTED_VLLM_API_KEY: ${VLLM_API_KEY}
+    command: ["--port", "4000"]
+    ports: ["4000:4000"]
+    depends_on: {postgres: {condition: service_healthy}}
+
+  api:
+    build: {context: .., dockerfile: deploy/docker/control-plane.Dockerfile}
+    environment: *mccp-env
+    ports: ["8080:8080"]
+    volumes: ["objects:/var/lib/mccp/objects"]
+    secrets: [signing-key.pem, signing-pub.pem]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      opa: {condition: service_started}
+
+  worker:
+    build: {context: .., dockerfile: deploy/docker/worker.Dockerfile}
+    environment:
+      <<: *mccp-env
+      HF_TOKEN: ${HF_TOKEN:-}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - objects:/var/lib/mccp/objects
+      - work:/var/lib/mccp/work
+      - lora:/var/lib/mccp/lora
+      - hfcache:/home/mccp/.cache/huggingface
+    secrets: [signing-key.pem, signing-pub.pem]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["${TRAIN_GPU:-1}"], capabilities: [gpu]}]
+    ipc: host
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      vllm: {condition: service_started}
+
+secrets:
+  signing-key.pem: {file: ./secrets/signing-key.pem}
+  signing-pub.pem: {file: ./secrets/signing-pub.pem}
+
+volumes:
+  pgdata: {}
+  mlartifacts: {}
+  hfcache: {}
+  objects: {}
+  work: {}
+  lora: {}

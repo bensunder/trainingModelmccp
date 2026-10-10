@@ -1,0 +1,16 @@
+# Submit with: mccp job submit examples/job-invoice-triage.yaml
+project: finance-ops
+recipe: qwen3-8b-qlora-sft@v1.0.0+L40S
+method:
+  type: sft
+  sft:
+    hyperparameters: {n_epochs: 2, learning_rate: 0.0002, lora_r: 16}
+finetuning_type: qlora
+training_dataset: finance-ops/invoice-exceptions@v1:train
+validation_dataset: finance-ops/invoice-exceptions@v1:val
+eval_suite: invoice-triage-suite@v1
+output_adapter: invoice-triage
+risk_tier: medium
+intended_use: Classify AP invoice exceptions and propose the next action; human-in-the-loop review
+seed: 42
+metadata: {ticket: AIGOV-112, cost_center: FIN-OPS}

@@ -1,0 +1,67 @@
+[project]
+name = "mccp"
+version = "0.1.0"
+description = "Enterprise Model Customization Control Plane: governed Qwen QLoRA adapter pipeline (Soup) from dataset to agent"
+readme = "README.md"
+authors = [{ name = "Ben Sunder" }]
+requires-python = ">=3.13"
+dependencies = [
+    "asyncpg>=0.31.0",
+    "cryptography>=50.0.2",
+    "datasketch>=2.0.0",
+    "fastapi>=0.115",
+    "httpx>=0.28.1",
+    "jsonschema>=4.26.0",
+    "model-signing>=1.1.1",
+    "numpy>=2.4.6",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.15.0",
+    "pyjwt[crypto]>=2.15.1",
+    "pyyaml>=6.0.3",
+    "safetensors>=0.8.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "typer>=0.27.2",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.optional-dependencies]
+agent = [
+    "langchain-openai>=1.6.7",
+    "langgraph>=1.2.12",
+]
+presidio = [
+    "presidio-analyzer>=2.2.364",
+    "presidio-anonymizer>=2.2.362",
+]
+
+[project.scripts]
+mccp = "mccp.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.10",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+markers = [
+  "db: requires a reachable Postgres (MCCP_TEST_ADMIN_DSN)",
+  "e2e: end-to-end vertical against fake vLLM/LiteLLM/MLflow and a real OPA binary",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "I"]
+ignore = ["E501", "UP037", "SIM105", "B008"]

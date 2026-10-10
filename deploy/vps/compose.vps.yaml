@@ -1,0 +1,84 @@
+# Control-plane stack for a CPU-only VPS (srv1507394).
+# Runs: Postgres, migrations, OPA, MLflow, MCCP API. The GPU side (worker +
+# Soup trainer + vLLM + LiteLLM) runs on a GPU host from deploy/compose.yaml and
+# connects back to this Postgres (bind it to the GPU host's allow-listed IP).
+#
+# Ports avoid what is already used on srv1507394 (4000, 4001, 4003, 8080, 8090, 8888).
+name: mccp
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    ports: ["${MCCP_PG_BIND:-127.0.0.1}:55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    build: {context: ../.., dockerfile: deploy/docker/control-plane.Dockerfile}
+    environment:
+      MCCP_OWNER_DATABASE_URL: postgresql+asyncpg://mccp_owner:${MCCP_OWNER_DB_PASSWORD}@postgres:5432/mccp
+    command: ["mccp", "db", "migrate"]
+    depends_on: {postgres: {condition: service_healthy}}
+    restart: "no"
+
+  opa:
+    image: openpolicyagent/opa:1.21.1
+    command: ["run", "--server", "--addr", "0.0.0.0:8181", "--log-level", "error", "/policy"]
+    volumes: ["../../policy:/policy:ro"]
+    restart: unless-stopped
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.4.0
+    command: >
+      sh -c "pip install --quiet psycopg2-binary &&
+             mlflow server --host 0.0.0.0 --port 5000
+             --backend-store-uri postgresql://mlflow:${MLFLOW_DB_PASSWORD}@postgres:5432/mlflow
+             --artifacts-destination /mlartifacts --allowed-hosts '*'"
+    volumes: ["mlartifacts:/mlartifacts"]
+    ports: ["127.0.0.1:5055:5000"]
+    depends_on: {postgres: {condition: service_healthy}}
+    restart: unless-stopped
+
+  api:
+    build: {context: ../.., dockerfile: deploy/docker/control-plane.Dockerfile}
+    environment:
+      MCCP_DATABASE_URL: postgresql+asyncpg://mccp_app:${MCCP_APP_DB_PASSWORD}@postgres:5432/mccp
+      MCCP_OWNER_DATABASE_URL: postgresql+asyncpg://mccp_owner:${MCCP_OWNER_DB_PASSWORD}@postgres:5432/mccp
+      MCCP_AUTH_MODE: ${MCCP_AUTH_MODE:-dev}
+      MCCP_DEV_JWT_SECRET: ${MCCP_DEV_JWT_SECRET}
+      MCCP_OIDC_ISSUER: ${MCCP_OIDC_ISSUER:-}
+      MCCP_OIDC_AUDIENCE: ${MCCP_OIDC_AUDIENCE:-}
+      MCCP_OIDC_JWKS_URL: ${MCCP_OIDC_JWKS_URL:-}
+      MCCP_OBJECT_STORE_URL: file:///var/lib/mccp/objects
+      MCCP_SIGNING_MODE: key
+      MCCP_SIGNING_PRIVATE_KEY_PATH: /run/secrets/signing-key.pem
+      MCCP_SIGNING_PUBLIC_KEY_PATH: /run/secrets/signing-pub.pem
+      MCCP_FLEET_PROFILE_PATH: /app/deploy/fleet.yaml
+      MCCP_OPA_URL: http://opa:8181
+      MCCP_MLFLOW_TRACKING_URI: http://mlflow:5000
+      MCCP_GATEWAY_KIND: none
+      MCCP_VLLM_BASE_URL: ${MCCP_VLLM_BASE_URL:-http://127.0.0.1:9}
+    volumes: ["objects:/var/lib/mccp/objects"]
+    ports: ["127.0.0.1:8095:8080"]
+    secrets: [signing-key.pem, signing-pub.pem]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      opa: {condition: service_started}
+    restart: unless-stopped
+
+secrets:
+  signing-key.pem: {file: ./secrets/signing-key.pem}
+  signing-pub.pem: {file: ./secrets/signing-pub.pem}
+
+volumes:
+  pgdata: {}
+  mlartifacts: {}
+  objects: {}

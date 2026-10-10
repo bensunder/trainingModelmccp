@@ -1,0 +1,20 @@
+# Serving fleet profile. Pin it to the exact vLLM version deployed; the
+# publish guard rejects any adapter whose trained modules are not in the
+# architecture's allowlist (vLLM silently skips unsupported LoRA modules,
+# vllm-project/vllm#38085).
+vllm_version: "0.29.0"
+max_lora_rank: 64
+max_loras: 8
+base_models:
+  Qwen/Qwen3-8B:
+    served_name: qwen3-8b-base
+    architecture: qwen3
+architectures:
+  qwen3:
+    # Dense Qwen3: vLLM packs q/k/v into qkv_proj and gate/up into
+    # gate_up_proj internally and maps the unfused PEFT names onto them.
+    lora_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  qwen3_5:
+    # Hybrid Gated-DeltaNet models. Only fused names are accepted; verify
+    # against the pinned vLLM before enabling any Qwen3.5 recipe (spec M7).
+    lora_modules: [in_proj_qkv, in_proj_z, out_proj, qkv_proj, o_proj, gate_up_proj, down_proj]
