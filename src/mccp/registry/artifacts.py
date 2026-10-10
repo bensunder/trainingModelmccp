@@ -62,16 +62,19 @@ def manifest_digest(manifest: dict[str, Any]) -> str:
 
 class Signer:
     def __init__(self, mode: str, private_key: Path | None, public_key: Path | None) -> None:
+        # Least privilege: only the host that registers adapters (GPU worker)
+        # holds the private key; the control plane is verify-only (public key)
+        # and the API needs neither. Missing keys fail at use, not at startup.
         self.mode = mode
         self.private_key = private_key
         self.public_key = public_key
-        if mode == "key" and (private_key is None or public_key is None):
-            raise ArtifactError("key signing requires MCCP_SIGNING_PRIVATE_KEY_PATH and MCCP_SIGNING_PUBLIC_KEY_PATH")
 
     def sign(self, model_dir: Path, signature: Path) -> None:
         import model_signing
 
         cfg = model_signing.signing.Config()
+        if self.mode == "key" and (self.private_key is None or not Path(self.private_key).is_file()):
+            raise ArtifactError("signing needs MCCP_SIGNING_PRIVATE_KEY_PATH on this host (GPU worker only)")
         if self.mode == "key":
             cfg = cfg.use_elliptic_key_signer(private_key=str(self.private_key))
         else:
@@ -84,6 +87,8 @@ class Signer:
         import model_signing
 
         cfg = model_signing.verifying.Config()
+        if self.mode == "key" and (self.public_key is None or not Path(self.public_key).is_file()):
+            raise ArtifactError("verification needs MCCP_SIGNING_PUBLIC_KEY_PATH on this host")
         if self.mode == "key":
             cfg = cfg.use_elliptic_key_verifier(public_key=str(self.public_key))
         else:

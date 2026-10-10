@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     object_store_url: str = "file:///var/lib/mccp/objects"
     """`file:///abs/path` or `s3://bucket/prefix` (S3-compatible, e.g. MinIO)."""
     s3_endpoint_url: str | None = None
+    s3_region: str | None = None
     work_dir: Path = Path("/var/lib/mccp/work")
     max_dataset_upload_bytes: int = 256 * 1024 * 1024
 

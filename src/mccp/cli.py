@@ -98,6 +98,26 @@ def tenant_create(
     typer.echo(str(asyncio.run(run())))
 
 
+@app.command("storage-init")
+def storage_init(wait: int = typer.Option(0, help="Seconds to keep retrying while the store starts")) -> None:
+    """Create the object-store bucket/root if it does not exist (idempotent)."""
+    from mccp.storage.objectstore import open_store
+
+    s = _settings()
+    store = open_store(s.object_store_url, s.s3_endpoint_url, s.s3_region)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            asyncio.run(store.ensure_bucket())
+            break
+        except Exception as e:  # noqa: BLE001 - retried until the deadline, then surfaced
+            if time.monotonic() >= deadline:
+                raise
+            typer.echo(f"object store not ready ({type(e).__name__}); retrying", err=True)
+            time.sleep(3)
+    typer.echo(f"object store ready: {store.url}")
+
+
 @keys_app.command("generate")
 def keys_generate(out_dir: Path = Path("secrets")) -> None:
     """Generate an ECDSA P-256 keypair for OpenSSF model signing (key mode)."""

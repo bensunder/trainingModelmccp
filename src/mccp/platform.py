@@ -44,7 +44,7 @@ class Platform:
         return cls(
             settings=s,
             engine=make_engine(s),
-            store=open_store(s.object_store_url, s.s3_endpoint_url),
+            store=open_store(s.object_store_url, s.s3_endpoint_url, s.s3_region),
             signer=Signer(s.signing_mode, s.signing_private_key_path, s.signing_public_key_path),
             fleet=FleetProfile.load(s.fleet_profile_path),
             vllm=VllmClient(s.vllm_base_url, vllm_key, timeout=s.eval_request_timeout_s),

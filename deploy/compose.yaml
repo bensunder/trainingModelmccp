@@ -75,6 +75,7 @@ services:
       --gpu-memory-utilization ${VLLM_GPU_MEM_FRACTION:-0.70}
       --enable-lora --max-loras 8 --max-lora-rank 64 --max-cpu-loras 16
       --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3
+      --default-chat-template-kwargs '{"enable_thinking": false}'
       --api-key ${VLLM_API_KEY}
     environment:
       VLLM_ALLOW_RUNTIME_LORA_UPDATING: "True"
@@ -117,7 +118,6 @@ services:
     environment: *mccp-env
     ports: ["8080:8080"]
     volumes: ["objects:/var/lib/mccp/objects"]
-    secrets: [signing-key.pem, signing-pub.pem]
     depends_on:
       migrate: {condition: service_completed_successfully}
       opa: {condition: service_started}

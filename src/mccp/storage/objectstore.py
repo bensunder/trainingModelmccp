@@ -43,6 +43,7 @@ class ObjectStore(Protocol):
     async def download_file(self, key: str, dest: Path) -> None: ...
     async def exists(self, key: str) -> bool: ...
     async def list(self, prefix: str) -> list[str]: ...
+    async def ensure_bucket(self) -> None: ...
     def uri(self, key: str) -> str: ...
 
 
@@ -60,6 +61,9 @@ class LocalStore:
 
     def uri(self, key: str) -> str:
         return f"{self.url}/{check_key(key)}"
+
+    async def ensure_bucket(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _atomic_write(dest: Path, writer) -> None:
@@ -127,14 +131,21 @@ class LocalStore:
 
 
 class S3Store:
-    """S3-compatible store. boto3 is imported lazily (optional dependency)."""
+    """S3-compatible store (AWS S3, MinIO, Ceph RGW). Credentials come from the
+    standard AWS chain (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY env, instance or
+    workload identity). Path-style addressing so MinIO works without wildcard DNS."""
 
-    def __init__(self, bucket: str, prefix: str, endpoint_url: str | None) -> None:
-        try:
-            import boto3  # type: ignore[import-not-found]
-        except ImportError as e:  # pragma: no cover - depends on deployment extras
-            raise StorageError("s3:// object store requires `pip install boto3`") from e
-        self._client = boto3.client("s3", endpoint_url=endpoint_url)
+    def __init__(self, bucket: str, prefix: str, endpoint_url: str | None, region: str | None = None) -> None:
+        import boto3
+        from botocore.config import Config
+
+        cfg = Config(
+            s3={"addressing_style": "path"},
+            retries={"max_attempts": 5, "mode": "standard"},
+            connect_timeout=10,
+            read_timeout=120,
+        )
+        self._client = boto3.client("s3", endpoint_url=endpoint_url, region_name=region or "us-east-1", config=cfg)
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self.url = f"s3://{bucket}/{self.prefix}".rstrip("/")
@@ -143,8 +154,23 @@ class S3Store:
         check_key(key)
         return f"{self.prefix}/{key}" if self.prefix else key
 
+    @staticmethod
+    def _not_found(e: Exception) -> bool:
+        code = str(getattr(e, "response", {}).get("Error", {}).get("Code", ""))
+        return code in ("404", "NoSuchKey", "NotFound")
+
     def uri(self, key: str) -> str:
         return f"s3://{self.bucket}/{self._k(key)}"
+
+    async def ensure_bucket(self) -> None:
+        from botocore.exceptions import ClientError
+
+        try:
+            await asyncio.to_thread(self._client.head_bucket, Bucket=self.bucket)
+        except ClientError as e:
+            if str(e.response.get("Error", {}).get("Code")) not in ("404", "NoSuchBucket", "NotFound"):
+                raise
+            await asyncio.to_thread(self._client.create_bucket, Bucket=self.bucket)
 
     async def put_bytes(self, key: str, data: bytes) -> str:
         await asyncio.to_thread(self._client.put_object, Bucket=self.bucket, Key=self._k(key), Body=data)
@@ -155,30 +181,49 @@ class S3Store:
         return self.uri(key)
 
     async def get_bytes(self, key: str) -> bytes:
+        from botocore.exceptions import ClientError
+
         try:
             obj = await asyncio.to_thread(self._client.get_object, Bucket=self.bucket, Key=self._k(key))
             return await asyncio.to_thread(obj["Body"].read)
-        except self._client.exceptions.NoSuchKey as e:
-            raise StorageError(f"object not found: {key}") from e
+        except ClientError as e:
+            if self._not_found(e):
+                raise StorageError(f"object not found: {key}") from e
+            raise
 
     async def download_file(self, key: str, dest: Path) -> None:
+        from botocore.exceptions import ClientError
+
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(f".tmp-{dest.name}")
-        await asyncio.to_thread(self._client.download_file, self.bucket, self._k(key), str(tmp))
-        os.replace(tmp, dest)
+        try:
+            await asyncio.to_thread(self._client.download_file, self.bucket, self._k(key), str(tmp))
+            os.replace(tmp, dest)
+        except ClientError as e:
+            if self._not_found(e):
+                raise StorageError(f"object not found: {key}") from e
+            raise
+        finally:
+            tmp.unlink(missing_ok=True)
 
     async def exists(self, key: str) -> bool:
+        from botocore.exceptions import ClientError
+
         try:
             await asyncio.to_thread(self._client.head_object, Bucket=self.bucket, Key=self._k(key))
             return True
-        except Exception:
-            return False
+        except ClientError as e:
+            # Only "not found" means absent; auth/network errors must surface.
+            if self._not_found(e):
+                return False
+            raise
 
     async def list(self, prefix: str) -> list[str]:
         def run() -> list[str]:
             out: list[str] = []
             paginator = self._client.get_paginator("list_objects_v2")
-            full = self._k(prefix) if prefix else self.prefix
+            # Directory semantics, same as LocalStore: "t/a" lists t/a/*, not t/ab.
+            full = (self._k(prefix.rstrip("/")) + "/") if prefix else (self.prefix + "/" if self.prefix else "")
             for page in paginator.paginate(Bucket=self.bucket, Prefix=full):
                 for item in page.get("Contents", []):
                     k = item["Key"]
@@ -188,12 +233,12 @@ class S3Store:
         return await asyncio.to_thread(run)
 
 
-def open_store(url: str, s3_endpoint_url: str | None = None) -> ObjectStore:
+def open_store(url: str, s3_endpoint_url: str | None = None, s3_region: str | None = None) -> ObjectStore:
     parsed = urlparse(url)
     if parsed.scheme == "file":
         return LocalStore(Path(parsed.path))
     if parsed.scheme == "s3":
-        return S3Store(parsed.netloc, parsed.path, s3_endpoint_url)
+        return S3Store(parsed.netloc, parsed.path, s3_endpoint_url, s3_region)
     raise StorageError(f"unsupported object store url: {url}")
 
 

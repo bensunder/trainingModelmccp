@@ -1,10 +1,27 @@
-# Control-plane stack for a CPU-only VPS (srv1507394).
-# Runs: Postgres, migrations, OPA, MLflow, MCCP API. The GPU side (worker +
-# Soup trainer + vLLM + LiteLLM) runs on a GPU host from deploy/compose.yaml and
-# connects back to this Postgres (bind it to the GPU host's allow-listed IP).
+# Control plane for a CPU-only VPS (srv1507394) in the split topology:
+#   VPS:      Postgres, MinIO (S3), OPA, MLflow, API, controller (control lane)
+#   GPU host: worker (gpu + serving lanes), vLLM, guard, LiteLLM  -> deploy/gpu/compose.gpu.yaml
 #
-# Ports avoid what is already used on srv1507394 (4000, 4001, 4003, 8080, 8090, 8888).
+# Postgres, MinIO and MLflow are reached by the GPU host, so they bind to
+# MCCP_PRIVATE_BIND: the VPS's address on a private network (WireGuard /
+# Tailscale), never a public interface. Default 127.0.0.1 = single-box only.
+# TLS on these links is not configured yet (open P1); the private network is
+# the only transport protection until then.
+#
+# Ports avoid what srv1507394 already uses (4000, 4001, 4003, 8080, 8090, 8888).
 name: mccp
+
+x-cp-env: &cp-env
+  MCCP_DATABASE_URL: postgresql+asyncpg://mccp_app:${MCCP_APP_DB_PASSWORD}@postgres:5432/mccp
+  MCCP_OWNER_DATABASE_URL: postgresql+asyncpg://mccp_owner:${MCCP_OWNER_DB_PASSWORD}@postgres:5432/mccp
+  MCCP_OBJECT_STORE_URL: s3://${MCCP_S3_BUCKET:-mccp}/objects
+  MCCP_S3_ENDPOINT_URL: http://minio:9000
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  MCCP_FLEET_PROFILE_PATH: /app/deploy/fleet.yaml
+  MCCP_OPA_URL: http://opa:8181
+  MCCP_MLFLOW_TRACKING_URI: http://mlflow:5000
+  MCCP_GATEWAY_KIND: none
 
 services:
   postgres:
@@ -14,17 +31,38 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
-    ports: ["${MCCP_PG_BIND:-127.0.0.1}:55432:5432"]
+    ports: ["${MCCP_PRIVATE_BIND:-127.0.0.1}:55432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       retries: 20
     restart: unless-stopped
 
+  minio:
+    # MinIO stopped publishing maintained community images in late 2025; pin
+    # MINIO_IMAGE to a digest you have vetted, or point MCCP_S3_ENDPOINT_URL at
+    # AWS S3 / another S3-compatible service and drop this service.
+    image: ${MINIO_IMAGE:-quay.io/minio/minio:latest}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes: ["s3data:/data"]
+    ports:
+      - "${MCCP_PRIVATE_BIND:-127.0.0.1}:59000:9000"
+      - "127.0.0.1:59001:9001"
+    restart: unless-stopped
+
+  storage-init:
+    build: {context: ../.., dockerfile: deploy/docker/control-plane.Dockerfile}
+    environment: *cp-env
+    command: ["mccp", "storage-init", "--wait", "90"]
+    depends_on: {minio: {condition: service_started}}
+    restart: "no"
+
   migrate:
     build: {context: ../.., dockerfile: deploy/docker/control-plane.Dockerfile}
-    environment:
-      MCCP_OWNER_DATABASE_URL: postgresql+asyncpg://mccp_owner:${MCCP_OWNER_DB_PASSWORD}@postgres:5432/mccp
+    environment: *cp-env
     command: ["mccp", "db", "migrate"]
     depends_on: {postgres: {condition: service_healthy}}
     restart: "no"
@@ -41,44 +79,52 @@ services:
       sh -c "pip install --quiet psycopg2-binary &&
              mlflow server --host 0.0.0.0 --port 5000
              --backend-store-uri postgresql://mlflow:${MLFLOW_DB_PASSWORD}@postgres:5432/mlflow
-             --artifacts-destination /mlartifacts --allowed-hosts '*'"
+             --artifacts-destination /mlartifacts"
     volumes: ["mlartifacts:/mlartifacts"]
-    ports: ["127.0.0.1:5055:5000"]
+    ports: ["${MCCP_PRIVATE_BIND:-127.0.0.1}:55055:5000"]
     depends_on: {postgres: {condition: service_healthy}}
     restart: unless-stopped
 
   api:
     build: {context: ../.., dockerfile: deploy/docker/control-plane.Dockerfile}
     environment:
-      MCCP_DATABASE_URL: postgresql+asyncpg://mccp_app:${MCCP_APP_DB_PASSWORD}@postgres:5432/mccp
-      MCCP_OWNER_DATABASE_URL: postgresql+asyncpg://mccp_owner:${MCCP_OWNER_DB_PASSWORD}@postgres:5432/mccp
+      <<: *cp-env
       MCCP_AUTH_MODE: ${MCCP_AUTH_MODE:-dev}
       MCCP_DEV_JWT_SECRET: ${MCCP_DEV_JWT_SECRET}
       MCCP_OIDC_ISSUER: ${MCCP_OIDC_ISSUER:-}
       MCCP_OIDC_AUDIENCE: ${MCCP_OIDC_AUDIENCE:-}
       MCCP_OIDC_JWKS_URL: ${MCCP_OIDC_JWKS_URL:-}
-      MCCP_OBJECT_STORE_URL: file:///var/lib/mccp/objects
-      MCCP_SIGNING_MODE: key
-      MCCP_SIGNING_PRIVATE_KEY_PATH: /run/secrets/signing-key.pem
-      MCCP_SIGNING_PUBLIC_KEY_PATH: /run/secrets/signing-pub.pem
-      MCCP_FLEET_PROFILE_PATH: /app/deploy/fleet.yaml
-      MCCP_OPA_URL: http://opa:8181
-      MCCP_MLFLOW_TRACKING_URI: http://mlflow:5000
-      MCCP_GATEWAY_KIND: none
-      MCCP_VLLM_BASE_URL: ${MCCP_VLLM_BASE_URL:-http://127.0.0.1:9}
-    volumes: ["objects:/var/lib/mccp/objects"]
+    # No signing keys: the API never signs or verifies adapters.
     ports: ["127.0.0.1:8095:8080"]
-    secrets: [signing-key.pem, signing-pub.pem]
     depends_on:
       migrate: {condition: service_completed_successfully}
+      storage-init: {condition: service_completed_successfully}
+      opa: {condition: service_started}
+    restart: unless-stopped
+
+  controller:
+    # Control-lane worker: validation, policy gates, approvals. Verify-only:
+    # it holds the public key, never the private signing key.
+    build: {context: ../.., dockerfile: deploy/docker/control-plane.Dockerfile}
+    environment:
+      <<: *cp-env
+      MCCP_WORKER_ID: vps-controller
+      MCCP_WORKER_LANES: '["control"]'
+      MCCP_SIGNING_MODE: key
+      MCCP_SIGNING_PUBLIC_KEY_PATH: /run/secrets/signing-pub.pem
+      MCCP_WORK_DIR: /var/lib/mccp/work
+    command: ["mccp", "worker"]
+    secrets: [signing-pub.pem]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      storage-init: {condition: service_completed_successfully}
       opa: {condition: service_started}
     restart: unless-stopped
 
 secrets:
-  signing-key.pem: {file: ./secrets/signing-key.pem}
   signing-pub.pem: {file: ./secrets/signing-pub.pem}
 
 volumes:
   pgdata: {}
+  s3data: {}
   mlartifacts: {}
-  objects: {}

@@ -21,34 +21,34 @@ command -v docker >/dev/null || die "docker is not installed"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 command -v openssl >/dev/null || die "openssl is required"
 
-for port in 8095 55432 5055; do
+for port in 8095 55432 55055 59000 59001; do
   if ss -ltnH "( sport = :$port )" 2>/dev/null | grep -q . && ! docker ps --format '{{.Names}}' | grep -q '^mccp-'; then
     die "port $port is already in use on this host; free it or edit compose.vps.yaml"
   fi
 done
 
-# ---- secrets (generated once) -------------------------------------------------
+# ---- secrets (generated once; missing keys added on upgrade) --------------------
 rnd() { openssl rand -hex 24; }
-if [[ ! -f "$ENV_FILE" ]]; then
-  log "generating $ENV_FILE"
-  umask 077
-  cat >"$ENV_FILE" <<EOF
-POSTGRES_PASSWORD=$(rnd)
-MCCP_OWNER_DB_PASSWORD=$(rnd)
-MCCP_APP_DB_PASSWORD=$(rnd)
-MLFLOW_DB_PASSWORD=$(rnd)
-MCCP_AUTH_MODE=dev
-MCCP_DEV_JWT_SECRET=$(openssl rand -hex 32)
-# Bind Postgres to a private/allow-listed address when the GPU worker runs elsewhere.
-MCCP_PG_BIND=127.0.0.1
-# Private vLLM endpoint on the GPU host (used by evaluation and the publish guard).
-MCCP_VLLM_BASE_URL=http://127.0.0.1:9
-# Switch to Entra ID: MCCP_AUTH_MODE=oidc and set these.
-MCCP_OIDC_ISSUER=
-MCCP_OIDC_AUDIENCE=
-MCCP_OIDC_JWKS_URL=
-EOF
-fi
+umask 077
+touch "$ENV_FILE"
+add_env() {  # add_env KEY VALUE  -- only if KEY is not already set
+  grep -q "^$1=" "$ENV_FILE" || printf '%s=%s\n' "$1" "$2" >>"$ENV_FILE"
+}
+add_env POSTGRES_PASSWORD "$(rnd)"
+add_env MCCP_OWNER_DB_PASSWORD "$(rnd)"
+add_env MCCP_APP_DB_PASSWORD "$(rnd)"
+add_env MLFLOW_DB_PASSWORD "$(rnd)"
+add_env MINIO_ROOT_USER "mccp$(openssl rand -hex 6)"
+add_env MINIO_ROOT_PASSWORD "$(rnd)"
+add_env MCCP_S3_BUCKET mccp
+add_env MCCP_AUTH_MODE dev
+add_env MCCP_DEV_JWT_SECRET "$(openssl rand -hex 32)"
+# Address on the private network (WireGuard/Tailscale) that the GPU host uses
+# to reach Postgres, S3 and MLflow. Keep 127.0.0.1 until that network exists.
+add_env MCCP_PRIVATE_BIND 127.0.0.1
+add_env MCCP_OIDC_ISSUER ""
+add_env MCCP_OIDC_AUDIENCE ""
+add_env MCCP_OIDC_JWKS_URL ""
 set -a; source "$ENV_FILE"; set +a
 
 if [[ ! -f "$VPS/postgres-init.sql" ]]; then
@@ -68,14 +68,17 @@ chown 999:999 "$VPS/postgres-init.sql"
 chmod 600 "$VPS/postgres-init.sql"
 
 mkdir -p "$SECRETS"
-if [[ ! -f "$SECRETS/signing-key.pem" ]]; then
-  log "generating adapter signing keypair (ECDSA P-256)"
-  openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt -out "$SECRETS/signing-key.pem"
-  openssl ec -in "$SECRETS/signing-key.pem" -pubout -out "$SECRETS/signing-pub.pem" 2>/dev/null
+# Least privilege: the VPS only verifies adapters. The private signing key is
+# generated and kept on the GPU host; copy its signing-pub.pem here.
+if [[ ! -s "$SECRETS/signing-pub.pem" ]]; then
+  : >"$SECRETS/signing-pub.pem"
+  log "WARNING: $SECRETS/signing-pub.pem is empty. Promotions will be denied"
+  log "         (adapter_verified=false) until you copy it from the GPU host."
 fi
-# The API container runs as uid 10001.
-chown 10001:10001 "$SECRETS/signing-key.pem" "$SECRETS/signing-pub.pem"
-chmod 400 "$SECRETS/signing-key.pem"; chmod 444 "$SECRETS/signing-pub.pem"
+chown 10001:10001 "$SECRETS/signing-pub.pem"; chmod 444 "$SECRETS/signing-pub.pem"
+if [[ -f "$SECRETS/signing-key.pem" ]]; then
+  log "WARNING: a private signing key exists on the VPS from an earlier install; move it to the GPU host and delete it here."
+fi
 
 # ---- build and start ------------------------------------------------------------
 log "building and starting containers"
@@ -86,7 +89,7 @@ for _ in $(seq 1 60); do
   curl -fsS http://127.0.0.1:8095/readyz >/dev/null 2>&1 && break
   sleep 2
 done
-curl -fsS http://127.0.0.1:8095/readyz >/dev/null || { "${COMPOSE[@]}" logs --tail=80 api migrate; die "API did not become ready"; }
+curl -fsS http://127.0.0.1:8095/readyz >/dev/null || { "${COMPOSE[@]}" logs --tail=80 api migrate storage-init; die "API did not become ready"; }
 
 # ---- first tenant (idempotent) ---------------------------------------------------
 if ! "${COMPOSE[@]}" exec -T postgres psql -U postgres -d mccp -tAc "SELECT 1 FROM tenants WHERE idp_tenant_id='whyaidata'" | grep -q 1; then
@@ -126,3 +129,5 @@ log "done."
 log "  API (local):  http://127.0.0.1:8095/docs"
 log "  Tokens (24h): $VPS/tokens.env   (submitter and approver are different users by design)"
 log "  Status:       docker compose -f $VPS/compose.vps.yaml --env-file $ENV_FILE ps"
+log "  GPU host:     needs MCCP_APP_DB_PASSWORD, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD from $ENV_FILE"
+log "                and MCCP_PRIVATE_BIND set to this host's private-network address."

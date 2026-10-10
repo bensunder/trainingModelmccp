@@ -1,0 +1,126 @@
+# GPU host in the split topology. Runs the gpu + serving lanes, vLLM, the
+# guard model and the LiteLLM gateway; state lives on the VPS control plane
+# (Postgres, S3, MLflow) reached over the private network (WireGuard/Tailscale).
+#
+#   cp deploy/gpu/.env.example deploy/gpu/.env   # fill in VPS private address + secrets
+#   (on this host) uv run mccp keys generate --out-dir deploy/gpu/secrets
+#   copy deploy/gpu/secrets/signing-pub.pem to the VPS: deploy/vps/secrets/signing-pub.pem
+#   docker compose -f deploy/gpu/compose.gpu.yaml --env-file deploy/gpu/.env up -d --build
+#
+# Requires: GPU 0 >= 48 GB (vLLM + guard), GPU ${TRAIN_GPU} for training.
+name: mccp-gpu
+
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.29.0
+    command: >
+      --model Qwen/Qwen3-8B --revision ${QWEN3_8B_REVISION}
+      --served-model-name qwen3-8b-base
+      --dtype bfloat16 --max-model-len 16384
+      --gpu-memory-utilization ${VLLM_GPU_MEM_FRACTION:-0.70}
+      --enable-lora --max-loras 8 --max-lora-rank 64 --max-cpu-loras 16
+      --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3
+      --default-chat-template-kwargs '{"enable_thinking": false}'
+      --api-key ${VLLM_API_KEY}
+    environment:
+      VLLM_ALLOW_RUNTIME_LORA_UPDATING: "True"
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - hfcache:/root/.cache/huggingface
+      - lora:/adapters:ro
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]
+    ipc: host
+    restart: unless-stopped
+
+  vllm-guard:
+    image: vllm/vllm-openai:v0.29.0
+    command: >
+      --model Qwen/Qwen3Guard-Gen-4B --port 8001 --dtype bfloat16
+      --gpu-memory-utilization ${GUARD_GPU_MEM_FRACTION:-0.22} --max-model-len 4096
+    environment: {HF_TOKEN: "${HF_TOKEN:-}"}
+    volumes: ["hfcache:/root/.cache/huggingface"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]
+    restart: unless-stopped
+
+  litellm-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${LITELLM_DB_PASSWORD}
+      POSTGRES_DB: litellm
+    volumes: ["litellmdb:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    environment:
+      DATABASE_URL: postgresql://litellm:${LITELLM_DB_PASSWORD}@litellm-db:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      STORE_MODEL_IN_DB: "True"
+      HOSTED_VLLM_API_KEY: ${VLLM_API_KEY}
+    command: ["--port", "4000"]
+    ports: ["${GATEWAY_BIND:-127.0.0.1}:4000:4000"]
+    depends_on: {litellm-db: {condition: service_healthy}}
+    restart: unless-stopped
+
+  worker:
+    build: {context: ../.., dockerfile: deploy/docker/worker.Dockerfile}
+    environment:
+      MCCP_WORKER_ID: gpu-${HOSTNAME:-host}
+      MCCP_WORKER_LANES: '["gpu","serving"]'
+      MCCP_DATABASE_URL: postgresql+asyncpg://mccp_app:${MCCP_APP_DB_PASSWORD}@${VPS_PRIVATE_ADDR}:55432/mccp
+      MCCP_OBJECT_STORE_URL: s3://${MCCP_S3_BUCKET:-mccp}/objects
+      MCCP_S3_ENDPOINT_URL: http://${VPS_PRIVATE_ADDR}:59000
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      MCCP_MLFLOW_TRACKING_URI: http://${VPS_PRIVATE_ADDR}:55055
+      MLFLOW_TRACKING_URI: http://${VPS_PRIVATE_ADDR}:55055
+      MCCP_SIGNING_MODE: key
+      MCCP_SIGNING_PRIVATE_KEY_PATH: /run/secrets/signing-key.pem
+      MCCP_SIGNING_PUBLIC_KEY_PATH: /run/secrets/signing-pub.pem
+      MCCP_VLLM_BASE_URL: http://vllm:8000
+      MCCP_VLLM_API_KEY: ${VLLM_API_KEY}
+      MCCP_VLLM_LORA_ROOT: /var/lib/mccp/lora
+      MCCP_VLLM_LORA_ROOT_IN_SERVER: /adapters
+      MCCP_FLEET_PROFILE_PATH: /app/deploy/fleet.yaml
+      MCCP_LITELLM_BASE_URL: http://litellm:4000
+      MCCP_LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      MCCP_LITELLM_VLLM_API_BASE: http://vllm:8000
+      MCCP_WORK_DIR: /var/lib/mccp/work
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - work:/var/lib/mccp/work
+      - lora:/var/lib/mccp/lora
+      - hfcache-trainer:/home/mccp/.cache/huggingface
+    secrets: [signing-key.pem, signing-pub.pem]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["${TRAIN_GPU:-1}"], capabilities: [gpu]}]
+    ipc: host
+    depends_on:
+      vllm: {condition: service_started}
+      litellm: {condition: service_started}
+    restart: unless-stopped
+
+secrets:
+  signing-key.pem: {file: ./secrets/signing-key.pem}
+  signing-pub.pem: {file: ./secrets/signing-pub.pem}
+
+volumes:
+  hfcache: {}
+  hfcache-trainer: {}
+  lora: {}
+  work: {}
+  litellmdb: {}
