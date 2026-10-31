@@ -79,13 +79,13 @@ services:
     environment:
       MCCP_WORKER_ID: gpu-${HOSTNAME:-host}
       MCCP_WORKER_LANES: '["gpu","serving"]'
-      MCCP_DATABASE_URL: postgresql+asyncpg://mccp_app:${MCCP_APP_DB_PASSWORD}@${VPS_PRIVATE_ADDR}:55432/mccp
+      MCCP_DATABASE_URL: postgresql+asyncpg://mccp_app:${MCCP_APP_DB_PASSWORD}@${VPS_PRIVATE_ADDR}:${VPS_PG_PORT:-55432}/mccp
       MCCP_OBJECT_STORE_URL: s3://${MCCP_S3_BUCKET:-mccp}/objects
-      MCCP_S3_ENDPOINT_URL: http://${VPS_PRIVATE_ADDR}:59000
+      MCCP_S3_ENDPOINT_URL: http://${VPS_PRIVATE_ADDR}:${VPS_S3_PORT:-59000}
       AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
-      MCCP_MLFLOW_TRACKING_URI: http://${VPS_PRIVATE_ADDR}:55055
-      MLFLOW_TRACKING_URI: http://${VPS_PRIVATE_ADDR}:55055
+      MCCP_MLFLOW_TRACKING_URI: http://${VPS_PRIVATE_ADDR}:${VPS_MLFLOW_PORT:-55055}
+      MLFLOW_TRACKING_URI: http://${VPS_PRIVATE_ADDR}:${VPS_MLFLOW_PORT:-55055}
       MCCP_SIGNING_MODE: key
       MCCP_SIGNING_PRIVATE_KEY_PATH: /run/secrets/signing-key.pem
       MCCP_SIGNING_PUBLIC_KEY_PATH: /run/secrets/signing-pub.pem

@@ -101,7 +101,7 @@ mkdir -p /opt/mccp && cd /opt/mccp && unzip -q -o ~/mccp-control-plane.zip && cd
 
 The installer is idempotent. It generates secrets once and adds any missing ones on upgrade. It creates the bucket and the first tenant, writes 24-hour dev tokens for three separate users, and optionally adds a `/mccp` Caddy route.
 
-Postgres (`:55432`), S3 (`:59000`) and MLflow (`:55055`) bind to `MCCP_PRIVATE_BIND`. Leave it at `127.0.0.1` until the private network exists, then set it to the VPS's private address. **Never bind them to a public interface: these links are not TLS-protected yet.**
+Postgres, S3 and MLflow bind to `MCCP_PRIVATE_BIND`. Their host ports (`MCCP_PG_PORT`, `MCCP_S3_PORT`, `MCCP_MLFLOW_PORT`, plus `MCCP_API_PORT` for the API) are picked once as the first free port at or above the defaults (55432, 59000, 55055, 8195) and kept in `deploy/vps/.env`. Leave it at `127.0.0.1` until the private network exists, then set it to the VPS's private address. **Never bind them to a public interface: these links are not TLS-protected yet.**
 
 ### GPU host
 

@@ -8,7 +8,7 @@
 # TLS on these links is not configured yet (open P1); the private network is
 # the only transport protection until then.
 #
-# Ports avoid what srv1507394 already uses (4000, 4001, 4003, 8080, 8090, 8888).
+# Host ports are set in deploy/vps/.env (MCCP_*_PORT); the installer picks free ones on first run.
 name: mccp
 
 x-cp-env: &cp-env
@@ -31,7 +31,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
-    ports: ["${MCCP_PRIVATE_BIND:-127.0.0.1}:55432:5432"]
+    ports: ["${MCCP_PRIVATE_BIND:-127.0.0.1}:${MCCP_PG_PORT:-55432}:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -49,8 +49,8 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes: ["s3data:/data"]
     ports:
-      - "${MCCP_PRIVATE_BIND:-127.0.0.1}:59000:9000"
-      - "127.0.0.1:59001:9001"
+      - "${MCCP_PRIVATE_BIND:-127.0.0.1}:${MCCP_S3_PORT:-59000}:9000"
+      - "127.0.0.1:${MCCP_S3_CONSOLE_PORT:-59001}:9001"
     restart: unless-stopped
 
   storage-init:
@@ -81,7 +81,7 @@ services:
              --backend-store-uri postgresql://mlflow:${MLFLOW_DB_PASSWORD}@postgres:5432/mlflow
              --artifacts-destination /mlartifacts"
     volumes: ["mlartifacts:/mlartifacts"]
-    ports: ["${MCCP_PRIVATE_BIND:-127.0.0.1}:55055:5000"]
+    ports: ["${MCCP_PRIVATE_BIND:-127.0.0.1}:${MCCP_MLFLOW_PORT:-55055}:5000"]
     depends_on: {postgres: {condition: service_healthy}}
     restart: unless-stopped
 
@@ -95,7 +95,7 @@ services:
       MCCP_OIDC_AUDIENCE: ${MCCP_OIDC_AUDIENCE:-}
       MCCP_OIDC_JWKS_URL: ${MCCP_OIDC_JWKS_URL:-}
     # No signing keys: the API never signs or verifies adapters.
-    ports: ["127.0.0.1:8095:8080"]
+    ports: ["127.0.0.1:${MCCP_API_PORT:-8195}:8080"]
     depends_on:
       migrate: {condition: service_completed_successfully}
       storage-init: {condition: service_completed_successfully}

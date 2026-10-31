@@ -21,12 +21,6 @@ command -v docker >/dev/null || die "docker is not installed"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 command -v openssl >/dev/null || die "openssl is required"
 
-for port in 8095 55432 55055 59000 59001; do
-  if ss -ltnH "( sport = :$port )" 2>/dev/null | grep -q . && ! docker ps --format '{{.Names}}' | grep -q '^mccp-'; then
-    die "port $port is already in use on this host; free it or edit compose.vps.yaml"
-  fi
-done
-
 # ---- secrets (generated once; missing keys added on upgrade) --------------------
 rnd() { openssl rand -hex 24; }
 umask 077
@@ -49,7 +43,30 @@ add_env MCCP_PRIVATE_BIND 127.0.0.1
 add_env MCCP_OIDC_ISSUER ""
 add_env MCCP_OIDC_AUDIENCE ""
 add_env MCCP_OIDC_JWKS_URL ""
+
+# Host ports: chosen once (first free port at or above the default), then kept.
+port_busy() {
+  if command -v ss >/dev/null; then
+    ss -ltnH "( sport = :$1 )" 2>/dev/null | grep -q .
+  else  # no iproute2: a successful local connect means something is listening
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+  fi
+}
+first_free() { local p=$1; while port_busy "$p"; do p=$((p + 1)); done; echo "$p"; }
+add_env MCCP_API_PORT "$(first_free 8195)"
+add_env MCCP_PG_PORT "$(first_free 55432)"
+add_env MCCP_MLFLOW_PORT "$(first_free 55055)"
+add_env MCCP_S3_PORT "$(first_free 59000)"
+add_env MCCP_S3_CONSOLE_PORT "$(first_free 59001)"
 set -a; source "$ENV_FILE"; set +a
+
+# A configured port held by something other than MCCP's own containers is a hard stop.
+mccp_running=$(docker ps --format '{{.Names}}' | grep -c '^mccp-' || true)
+for var in MCCP_API_PORT MCCP_PG_PORT MCCP_MLFLOW_PORT MCCP_S3_PORT MCCP_S3_CONSOLE_PORT; do
+  if port_busy "${!var}" && [[ "$mccp_running" == "0" ]]; then
+    die "port ${!var} ($var) is in use by another service; set a free one in $ENV_FILE and re-run"
+  fi
+done
 
 if [[ ! -f "$VPS/postgres-init.sql" ]]; then
   umask 077
@@ -86,10 +103,10 @@ log "building and starting containers"
 
 log "waiting for the API"
 for _ in $(seq 1 60); do
-  curl -fsS http://127.0.0.1:8095/readyz >/dev/null 2>&1 && break
+  curl -fsS http://127.0.0.1:${MCCP_API_PORT}/readyz >/dev/null 2>&1 && break
   sleep 2
 done
-curl -fsS http://127.0.0.1:8095/readyz >/dev/null || { "${COMPOSE[@]}" logs --tail=80 api migrate storage-init; die "API did not become ready"; }
+curl -fsS http://127.0.0.1:${MCCP_API_PORT}/readyz >/dev/null || { "${COMPOSE[@]}" logs --tail=80 api migrate storage-init; die "API did not become ready"; }
 
 # ---- first tenant (idempotent) ---------------------------------------------------
 if ! "${COMPOSE[@]}" exec -T postgres psql -U postgres -d mccp -tAc "SELECT 1 FROM tenants WHERE idp_tenant_id='whyaidata'" | grep -q 1; then
@@ -103,8 +120,8 @@ if [[ -f "$CADDYFILE" ]] && command -v caddy >/dev/null; then
     log "Caddy route /mccp already present"
   elif grep -qE "^${CADDY_SITE//./\\.}[[:space:]]*\{" "$CADDYFILE"; then
     cp "$CADDYFILE" "$CADDYFILE.bak.mccp.$(date +%s)"
-    awk -v site="$CADDY_SITE" '
-      $0 ~ "^"site"[[:space:]]*\\{" && !done { print; print "    handle_path /mccp/* {"; print "        reverse_proxy 127.0.0.1:8095"; print "    }"; done=1; next }
+    awk -v site="$CADDY_SITE" -v port="$MCCP_API_PORT" '
+      $0 ~ "^"site"[[:space:]]*\\{" && !done { print; print "    handle_path /mccp/* {"; print "        reverse_proxy 127.0.0.1:"port; print "    }"; done=1; next }
       { print }' "$CADDYFILE" >"$CADDYFILE.new"
     if caddy validate --config "$CADDYFILE.new" --adapter caddyfile >/dev/null 2>&1; then
       mv "$CADDYFILE.new" "$CADDYFILE" && systemctl reload caddy && log "Caddy: https://$CADDY_SITE/mccp/ -> MCCP API"
@@ -112,7 +129,7 @@ if [[ -f "$CADDYFILE" ]] && command -v caddy >/dev/null; then
       rm -f "$CADDYFILE.new"; log "Caddy config did not validate with the route; left unchanged"
     fi
   else
-    log "Caddy site $CADDY_SITE not found in $CADDYFILE; API is on 127.0.0.1:8095 only"
+    log "Caddy site $CADDY_SITE not found in $CADDYFILE; API is on 127.0.0.1:${MCCP_API_PORT} only"
   fi
 fi
 
@@ -126,7 +143,7 @@ umask 077
 } >"$VPS/tokens.env"
 
 log "done."
-log "  API (local):  http://127.0.0.1:8095/docs"
+log "  API (local):  http://127.0.0.1:${MCCP_API_PORT}/docs"
 log "  Tokens (24h): $VPS/tokens.env   (submitter and approver are different users by design)"
 log "  Status:       docker compose -f $VPS/compose.vps.yaml --env-file $ENV_FILE ps"
 log "  GPU host:     needs MCCP_APP_DB_PASSWORD, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD from $ENV_FILE"
