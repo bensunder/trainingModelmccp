@@ -222,3 +222,25 @@ class TestStats:
         assert bootstrap_mean_ci([])["n"] == 0
         assert cohen_kappa(["A", "B", "A"], ["A", "B", "A"]) == 1.0
         assert cohen_kappa(["A", "A", "B", "B"], ["B", "B", "A", "A"]) < 0
+
+
+def test_golden_items_use_openai_wire_format():
+    """vLLM rejects tool calls without `id`, non-string `arguments` and tool
+    results without `tool_call_id` (found in the first real GPU pilot)."""
+    from mccp.evals.layers import golden_items
+    from mccp.examples.invoices import generate
+
+    items = golden_items(generate(2, seed=3), limit=10)
+    assert items
+    for it in items:
+        ids: list[str] = []
+        for m in it.messages:
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    assert tc["id"] and isinstance(tc["function"]["arguments"], str)
+                    ids.append(tc["id"])
+            if m["role"] == "tool":
+                assert m["tool_call_id"] == ids.pop(0)
+    # Deterministic: identical requests on every evaluation run.
+    again = golden_items(generate(2, seed=3), limit=10)
+    assert [i.messages for i in again] == [i.messages for i in items]

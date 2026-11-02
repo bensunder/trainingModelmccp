@@ -43,10 +43,38 @@ class Item:
         return "tool_call" if self.expected.get("tool_calls") else "final"
 
 
+def to_openai_messages(messages: list[dict[str, Any]], *, record: int = 0) -> list[dict[str, Any]]:
+    """Convert stored conversations (HF/Qwen training shape) to the strict
+    OpenAI chat wire format that vLLM validates: every assistant tool call has
+    an `id` and JSON-string `arguments`, and every tool result carries the
+    matching `tool_call_id` (answered in call order). Rendering is unchanged:
+    vLLM parses the arguments back to an object before applying the template.
+    Ids are deterministic so repeated evaluations send identical requests."""
+    out: list[dict[str, Any]] = []
+    pending: list[str] = []
+    for ti, m in enumerate(messages):
+        m = dict(m)
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            calls = []
+            for ci, tc in enumerate(m["tool_calls"]):
+                fn = dict(tc["function"])
+                if not isinstance(fn.get("arguments"), str):
+                    fn["arguments"] = json.dumps(fn.get("arguments") or {}, ensure_ascii=False)
+                call_id = tc.get("id") or f"call_{record}_{ti}_{ci}"
+                calls.append({"id": call_id, "type": tc.get("type", "function"), "function": fn})
+                pending.append(call_id)
+            m["tool_calls"] = calls
+            m["content"] = m.get("content") or ""
+        elif m["role"] == "tool" and not m.get("tool_call_id"):
+            m["tool_call_id"] = pending.pop(0) if pending else f"call_{record}_{ti}_orphan"
+        out.append(m)
+    return out
+
+
 def golden_items(records: list[dict[str, Any]], limit: int) -> list[Item]:
     items: list[Item] = []
     for ri, rec in enumerate(records):
-        msgs = rec["messages"]
+        msgs = to_openai_messages(rec["messages"], record=ri)
         for i, m in enumerate(msgs):
             if m["role"] == "assistant":
                 items.append(Item(ri, msgs[:i], rec.get("tools"), m))
