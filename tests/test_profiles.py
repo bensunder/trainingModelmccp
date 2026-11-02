@@ -62,7 +62,7 @@ class TestRegistry:
     def test_shipped_profiles_load_with_expected_status(self, reg):
         assert {p.ref for p in reg.all()} == {QWEN, GRANITE}
         assert reg.get(QWEN).status == "validated"
-        assert reg.get(GRANITE).status == "draft"  # until `mccp profile validate`
+        assert reg.get(GRANITE).status == "validated"  # mccp profile validate, 2026-11-02
         assert reg.get(GRANITE).base.origin_country == "US"
 
     def test_qwen_profile_is_byte_identical_to_the_gpu_validated_rendering(self, reg):
@@ -108,13 +108,17 @@ class TestResolution:
             _job(str(recipe.ref)).resolve(recipe)
 
     def test_draft_profile_refused_unless_allowed(self, reg):
-        g = reg.get(GRANITE)
+        g = reg.get(GRANITE).model_copy(update={"validation": None})
+        assert g.status == "draft"
         recipe = _example_recipe(
             profile=GRANITE,
             base_model={**RECIPE["base_model"], "id": g.base.hf_id, "architecture": "granite"},
             dims=g.dims.model_dump(),
             serving={"tool_call_parser": "granite", "reasoning_parser": "granite", "min_vllm_version": "0.29.0"},
             chat_template_sha256="*",
+        )
+        recipe = recipe.model_copy(
+            update={"base_model": recipe.base_model.model_copy(update={"revision": g.base.revision})}
         )
         with pytest.raises(ValidationFailed, match="draft"):
             _job(str(recipe.ref)).resolve(recipe, g)
@@ -308,7 +312,7 @@ def test_validate_pins_profile_and_records_evidence(tmp_path):
     assert report["status"] == "validated"
     p = ProfileRegistry.load(tmp_path).get(GRANITE)
     assert p.base.revision == "e" * 40 and p.base.chat_template_sha256 == "f" * 64
-    assert "# DRAFT" in (tmp_path / f"{GRANITE}.yaml").read_text()  # comments preserved
+    assert "# IBM Granite" in (tmp_path / f"{GRANITE}.yaml").read_text()  # comments preserved
 
 
 def test_failed_validation_changes_nothing(tmp_path):

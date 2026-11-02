@@ -1,14 +1,14 @@
 # IBM Granite 3.3 8B Instruct (dense, Llama-like), US origin, Apache-2.0.
-# DRAFT: the tool-rendering strategy below is the expected Granite format but
-# has NOT been proven against the tokenizer. Run `mccp profile validate
-# granite-3.3-8b-instruct@v1` (CPU only, tokenizer download): it pins the
-# revision and template hash, checks dims against config.json, and proves the
-# rendering token-identical to the native template, or reports the diff.
+# Validated 2026-11-02 with `mccp profile validate` on the real tokenizer
+# (validations/granite-3.3-8b-instruct@v1.json): tool rendering token-identical
+# to the native template on 24 fixtures, string args 24/24, dims = config.json.
 id: granite-3.3-8b-instruct
 version: 1
 display_name: IBM Granite 3.3 8B Instruct
 base:
   hf_id: ibm-granite/granite-3.3-8b-instruct
+  chat_template_sha256: 0bea7711316005a1c37c9941a7ee2a26311d223c979abee416aab0a402fc5b56
+  revision: 51dd4bc2ade4059a6bd87649d68aa11e4fb2529b
   license: Apache-2.0
   origin_country: US
   publisher: IBM

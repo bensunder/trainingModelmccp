@@ -1,0 +1,10 @@
+{
+  "validated_at": "2026-11-02T18:07:10+00:00",
+  "method": "mccp profile validate (trainer/profile_check.py, real tokenizer, CPU) on the GridShare RTX 4000 Ada box",
+  "revision": "51dd4bc2ade4059a6bd87649d68aa11e4fb2529b",
+  "chat_template_sha256": "0bea7711316005a1c37c9941a7ee2a26311d223c979abee416aab0a402fc5b56",
+  "rendering_sha256": "9cddec3c9c7bc7e6df3708bd46e229a9b20d5da382a4907d20de73fa0bfd4afa",
+  "tool_render_checks": 24,
+  "string_argument_checks": 24,
+  "evidence": "config architectures: ['GraniteForCausalLM']; dims_mismatch: {}; first run (per-tool JSON) failed and was corrected to json_mode: list"
+}

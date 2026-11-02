@@ -20,7 +20,7 @@ Shipped profiles:
 | Profile | Origin | License | Status |
 |---|---|---|---|
 | `qwen3-8b@v1` | CN | Apache-2.0 | validated (GPU run 2026-11-01; byte-identical to the rendering that run proved) |
-| `granite-3.3-8b-instruct@v1` | US | Apache-2.0 | draft until validated (expected Granite tool format; not yet proven on its tokenizer) |
+| `granite-3.3-8b-instruct@v1` | US | Apache-2.0 | validated 2026-11-02 (`mccp profile validate` on the real tokenizer; the first run caught a per-tool vs list JSON difference, fixed before any GPU time) |
 
 ## Validate a profile (CPU only, no weights, no GPU spend)
 

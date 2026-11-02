@@ -167,7 +167,7 @@ The pilot found and fixed two bugs the fakes could not: eval requests vLLM rejec
 
 ## Model profiles
 
-Base models are switchable: a recipe names a profile (`profiles/<id>@v<N>.yaml`) that holds the model's tool rendering, reasoning switch, vLLM parsers, LoRA modules, license and country of origin. `qwen3-8b@v1` is validated; `granite-3.3-8b-instruct@v1` (US origin) is a draft until `mccp profile validate` proves its rendering on the real tokenizer (CPU only). Tenants can restrict base-model origins (`mccp tenant set-origins`), enforced by the promotion policy. See [docs/model-profiles.md](docs/model-profiles.md).
+Base models are switchable: a recipe names a profile (`profiles/<id>@v<N>.yaml`) that holds the model's tool rendering, reasoning switch, vLLM parsers, LoRA modules, license and country of origin. `qwen3-8b@v1` and `granite-3.3-8b-instruct@v1` (US origin) are validated; new profiles are drafts until `mccp profile validate` proves their rendering on the real tokenizer (CPU only). Tenants can restrict base-model origins (`mccp tenant set-origins`), enforced by the promotion policy. See [docs/model-profiles.md](docs/model-profiles.md).
 
 ## Benchmark kit
 
@@ -179,7 +179,7 @@ Base models are switchable: a recipe names a profile (`profiles/<id>@v<N>.yaml`)
 - **Decision accuracy at the recipe defaults.** The pilot used 1 epoch on 400 records; run the full 3,000-record, 2-epoch job before quoting accuracy.
 - **Dependency drift.** The Soup 0.72.4 extras pin `trl<0.25` and `transformers<5`. That is why the worker image keeps its trainer venv separate from the control plane. The trainer environment is hash-locked in `trainer/requirements.lock.txt`.
 - **LiteLLM behaviour.** Keeping the custom `model_info.id`, forwarding `extra_body`, model access groups, and `/key/generate` for `mccp gateway-key` all need confirming against a real LiteLLM.
-- **The Granite profile.** It is a draft until `mccp profile validate granite-3.3-8b-instruct@v1` passes, then needs one GPU batch.
+- **Granite on a GPU.** The profile is validated on its tokenizer; training and serving it needs one GPU batch (`PROFILE=granite-3.3-8b-instruct@v1`).
 - **L2-L6 layers on real hardware** (judge, lm-eval regression, Qwen3Guard safety, TTFT). The fleet allowlist for `qwen3_5` is a placeholder until M7.
 - **MinIO.** MinIO stopped publishing maintained community images in late 2025. Pin `MINIO_IMAGE` to a digest you have vetted, or use AWS S3 or another S3-compatible service.
 
