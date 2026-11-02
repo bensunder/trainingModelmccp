@@ -108,8 +108,49 @@ def preflight(run: dict[str, Any], ev: Events) -> dict[str, Any]:
             )
         checked += 1
 
+    train_rows = read_jsonl(run["train_path"])
+
+    # Tool-call arguments must be JSON strings: Arrow-backed loaders pad object
+    # arguments to one struct schema (e.g. `"vendor_id": null` on lookup_po) and
+    # the adapter learns the nulls. Prove the string form renders token-identical
+    # to the object form on the real template, or refuse to train.
+    args_checked = 0
+    for row in train_rows:
+        msgs = row["messages"]
+        calls = [tc for m in msgs for tc in (m.get("tool_calls") or [])]
+        if not calls:
+            continue
+        if any(not isinstance(tc["function"].get("arguments"), str) for tc in calls):
+            raise SystemExit(
+                _fail(
+                    ev,
+                    EXIT_PREFLIGHT,
+                    "tool-call arguments must be JSON strings in training data (rebuild the dataset)",
+                )
+            )
+        if args_checked < 20:
+            as_objects = [
+                {
+                    **m,
+                    "tool_calls": [
+                        {**tc, "function": {**tc["function"], "arguments": json.loads(tc["function"]["arguments"])}}
+                        for tc in m["tool_calls"]
+                    ],
+                }
+                if m.get("tool_calls")
+                else m
+                for m in msgs
+            ]
+            a = tok.apply_chat_template(msgs, tokenize=True, **kwargs)
+            b = tok.apply_chat_template(as_objects, tokenize=True, **kwargs)
+            if list(a) != list(b):
+                raise SystemExit(
+                    _fail(ev, EXIT_PREFLIGHT, "render-check failed: string tool arguments render differently")
+                )
+            args_checked += 1
+
     lengths = []
-    for row in read_jsonl(run["train_path"]):
+    for row in train_rows:
         lengths.append(len(tok.apply_chat_template(row["messages"], tokenize=True, **kwargs)))
     lengths.sort()
     p = lambda q: lengths[min(len(lengths) - 1, int(q * len(lengths)))]  # noqa: E731
@@ -128,6 +169,7 @@ def preflight(run: dict[str, Any], ev: Events) -> dict[str, Any]:
     result = {
         "chat_template_sha256": template_sha,
         "render_check_records": checked,
+        "tool_argument_render_checks": args_checked,
         "token_stats": stats,
         "trained_tokens": int(sum(lengths) * epochs),
         "token_count_method": "tokenizer.apply_chat_template",

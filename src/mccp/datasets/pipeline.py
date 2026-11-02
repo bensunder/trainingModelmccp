@@ -27,7 +27,7 @@ from mccp.domain.hashing import canonical_json, digest_of, sha256_hex
 
 from .pii import RedactionScope, Redactor, redact_value
 from .quality import contaminated, dedup, exact_key, group_split, input_text, record_text
-from .render import contains_think_tags, prerender_tools, split_per_assistant_turn
+from .render import contains_think_tags, prerender_tools, split_per_assistant_turn, stringify_tool_arguments
 from .schema import Record
 
 
@@ -155,7 +155,7 @@ def build_dataset(raw: bytes, redactor: Redactor, params: BuildParams = BuildPar
         rows = []
         for i in indices:
             d = redacted[i]
-            msgs = prerender_tools(d["messages"], d.get("tools"))
+            msgs = stringify_tool_arguments(prerender_tools(d["messages"], d.get("tools")))
             samples = split_per_assistant_turn(msgs) if params.split_turns else [msgs]
             rows.extend({"messages": s} for s in samples)
         return rows
@@ -175,7 +175,7 @@ def build_dataset(raw: bytes, redactor: Redactor, params: BuildParams = BuildPar
             "split_turns": params.split_turns,
             "enable_thinking": params.enable_thinking,
             "redactor": redactor.name,
-            "format": "soup-chatml/qwen3-hermes-prerendered",
+            "format": "soup-chatml/qwen3-hermes-prerendered/string-args",
         },
         "raw_sha256": sha256_hex(raw),
     }

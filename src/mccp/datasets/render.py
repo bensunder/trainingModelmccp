@@ -49,6 +49,31 @@ def prerender_tools(messages: list[dict[str, Any]], tools: list[dict[str, Any]] 
     return [{"role": "system", "content": block}, *messages]
 
 
+def stringify_tool_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Serialise every tool-call `arguments` object to a JSON string.
+
+    Training loaders build Arrow tables (`Dataset.from_list`), which force one
+    struct schema per column: `lookup_po`'s arguments then gain
+    `vendor_id: null` and vice versa, and the adapter learns to emit those
+    nulls. Strings are opaque to Arrow, and the Qwen3 template prints string
+    arguments verbatim, which is token-identical to `tojson` of the object
+    (`json.dumps(..., ensure_ascii=False)`); the trainer pre-flight proves that
+    on the real tokenizer before training."""
+    out = []
+    for m in messages:
+        if m.get("tool_calls"):
+            m = dict(m)
+            calls = []
+            for tc in m["tool_calls"]:
+                fn = dict(tc["function"])
+                if not isinstance(fn.get("arguments"), str):
+                    fn["arguments"] = _tojson(fn.get("arguments") or {})
+                calls.append({**tc, "function": fn})
+            m["tool_calls"] = calls
+        out.append(m)
+    return out
+
+
 def split_per_assistant_turn(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """One sample per assistant turn (history + that turn). Used with Soup's
     `mask_history: true` so each assistant turn is supervised exactly once and

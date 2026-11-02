@@ -190,3 +190,27 @@ def test_soup_val_split_lands_on_boundary(n_train, n_val):
 def test_soup_val_split_rejects_huge_val():
     with pytest.raises(ValueError):
         soup_val_split(1, 10)
+
+
+def test_soup_rows_carry_tool_arguments_as_json_strings():
+    """Arrow-backed loaders pad object arguments to one struct schema, so the
+    adapter learned `"vendor_id": null` on lookup_po (first real GPU pilot).
+    Exported training rows must carry arguments as JSON strings."""
+    import json as _json
+
+    from mccp.datasets.pii import PatternRedactor
+    from mccp.datasets.pipeline import BuildParams, build_dataset
+    from mccp.examples.invoices import generate
+
+    raw = b"".join(_json.dumps(r).encode() + b"\n" for r in generate(60, seed=5))
+    built = build_dataset(raw, PatternRedactor(), BuildParams(seed=5))
+    seen = 0
+    for name in ("train.jsonl", "val.jsonl"):
+        for line in built.files[name].decode().splitlines():
+            for m in _json.loads(line)["messages"]:
+                for tc in m.get("tool_calls") or []:
+                    args = tc["function"]["arguments"]
+                    assert isinstance(args, str)
+                    assert None not in _json.loads(args).values()
+                    seen += 1
+    assert seen > 0
