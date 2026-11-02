@@ -142,7 +142,7 @@ mccp audit-verify
 ## Tests
 
 ```bash
-uv run pytest                     # 117 tests; DB/OPA/S3 (moto) tests skip if unavailable
+uv run pytest                     # 133 tests; DB/OPA/S3 (moto) tests skip if unavailable
 MCCP_TEST_ADMIN_DSN=postgresql://postgres@127.0.0.1/postgres MCCP_TEST_OPA_BIN=$(which opa) uv run pytest
 MCCP_TEST_SOUP_PYTHON=/path/to/venv-with-soup/bin/python uv run pytest tests/test_soup_contract.py
 ```
@@ -164,6 +164,10 @@ The single-GPU pilot (`deploy/gpu/pilot.py`, `deploy/gpu/run_pilot.sh`) ran the 
 - **L0 publish guard and L1 evaluation on the served adapter.** After the two fixes below, the adapter scored task 0.89 (95% CI 0.84-0.94) vs 0.01 for the base, with 100% exact tool calls and 100% valid JSON.
 
 The pilot found and fixed two bugs the fakes could not: eval requests vLLM rejects (tool calls without ids) and padded `null` tool arguments in training data (Arrow struct unification). Both have regression tests.
+
+## Benchmark kit
+
+`deploy/gpu/run_batch.sh` runs a multi-seed batch and scores each adapter on the held-out split and an out-of-distribution set, against the base model and optionally a prompted frontier model, with latency and cost per 1,000 decisions. `deploy/gpu/bootstrap.sh` sets up a fresh GPU box in one command. See [docs/benchmark.md](docs/benchmark.md).
 
 ## Still not verified
 

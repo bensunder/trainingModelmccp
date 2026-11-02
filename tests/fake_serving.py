@@ -35,6 +35,22 @@ _INV = re.compile(
 )
 
 
+def _parse_invoice(user: str) -> dict[str, str] | None:
+    """Training phrasing via `_INV`; otherwise field-by-field (OOD phrasings)."""
+    m = _INV.search(user)
+    if m:
+        return m.groupdict()
+    inv, vendor, po = (re.search(p, user) for p in (r"INV-\d+", r"\bV-\d+", r"PO-\d+"))
+    price = re.search(r"\$([\d,]+\.\d+)", user)
+    if not (inv and vendor and po and price):
+        return None
+    rest = re.sub(r"<[^>]*>|\$[\d,]+\.\d+|INV-\d+|\bV-\d+|PO-\d+", " ", user)
+    qty = re.findall(r"(?<![-\w])\d+(?![-\w])", rest)
+    if len(qty) != 1:
+        return None
+    return {"inv": inv.group(0), "vendor": vendor.group(0), "po": po.group(0), "qty": qty[0], "price": price.group(1)}
+
+
 class FakeServing:
     def __init__(self) -> None:
         self.loaded: dict[str, str] = {}
@@ -62,7 +78,7 @@ class FakeServing:
             raise KeyError(model)
         is_adapter = model != BASE
         user = next((m["content"] for m in messages if m["role"] == "user"), "")
-        m = _INV.search(user)
+        m = _parse_invoice(user)
         if not m:
             return self._chitchat(user, is_adapter)
         if not is_adapter or self.adapter_mode == "same_as_base":

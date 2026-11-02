@@ -233,12 +233,12 @@ def final_answer(c: Case) -> dict[str, Any]:
     }
 
 
-def to_record(c: Case) -> dict[str, Any]:
+def to_record(c: Case, user_text: str | None = None, meta: dict[str, Any] | None = None) -> dict[str, Any]:
     po_result = c.po if c.po is not None else {"error": "not_found", "po_number": c.po_number}
     return {
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message(c)},
+            {"role": "user", "content": user_message(c) if user_text is None else user_text},
             {
                 "role": "assistant",
                 "content": "",
@@ -258,7 +258,7 @@ def to_record(c: Case) -> dict[str, Any]:
             {"role": "assistant", "content": json.dumps(final_answer(c))},
         ],
         "tools": TOOLS,
-        "meta": {"source_id": c.invoice_id, "license": "internal", "scenario": c.reason_code},
+        "meta": {"source_id": c.invoice_id, "license": "internal", "scenario": c.reason_code, **(meta or {})},
     }
 
 
@@ -280,3 +280,178 @@ def fixtures(n: int, seed: int = 7) -> dict[str, Any]:
         vendors[c.vendor_id] = c.vendor
         invoices.append({"invoice_id": c.invoice_id, "prompt": user_message(c), "expected": final_answer(c)})
     return {"purchase_orders": pos, "vendors": vendors, "invoices": invoices}
+
+
+# ---------------------------------------------------------------------------
+# Out-of-distribution (OOD) evaluation set.
+#
+# The training generator above is one distribution: six vendors, eight items,
+# one sentence template, and scenario values well away from the policy
+# thresholds. A held-out split of it measures memorisation of that
+# distribution as much as generalisation. The OOD set changes every surface
+# feature while keeping the same policy (`decide`), so a high score means the
+# adapter learned the rules rather than the generator:
+#
+# * disjoint vendor names, items and id ranges (nothing shared with training);
+# * eight new request phrasings (forwarded emails, terse queue entries, ...);
+# * cases within a fraction of a percent / a day / one unit of each threshold;
+# * rule-precedence collisions (duplicate + price variance, bank change + qty).
+#
+# Labels always come from `decide`, so they are correct by construction.
+# ---------------------------------------------------------------------------
+
+OOD_VENDORS = [
+    "Granite Peak Industrial",
+    "Bluewater Process Controls",
+    "Ironclad Fastener Co",
+    "Sterling Instrumentation",
+    "Cascade Electrical Supply",
+    "Redline Safety Products",
+    "Meridian Pipe & Valve",
+    "Northstar Lab Equipment",
+]
+OOD_ITEMS = [
+    "pressure gauges",
+    "torque wrenches",
+    "control valves",
+    "fiber patch cables",
+    "welding rods",
+    "server rack rails",
+    "gas detectors",
+    "bearing assemblies",
+]
+OOD_KINDS = [
+    "boundary_price_over",  # |variance| just above 2%      -> PRICE_VARIANCE
+    "boundary_price_under",  # |variance| just below 2%     -> WITHIN_TOLERANCE
+    "boundary_bank_recent",  # bank change 25-29 days ago   -> VENDOR_BANK_CHANGE
+    "boundary_bank_ok",  # bank change 30-34 days ago       -> not a bank flag
+    "boundary_qty_over",  # billed exactly one more than received
+    "partial_billing_ok",  # partial receipt, billed == received -> WITHIN_TOLERANCE
+    "precedence_dup_over_price",  # duplicate wins over price variance
+    "precedence_bank_over_qty",  # bank change wins over quantity mismatch
+    "missing_po",
+    "clean",
+]
+_OOD_TEMPLATES = [
+    "FW: Vendor invoice {inv} | {vendor} ({vid}) | {qty} units of {item} @ ${price} per unit | PO ref {po}. "
+    "Exception raised by 3-way match. Contact {email}. Please advise.",
+    "AP queue item: {vendor} [{vid}] submitted {inv} for {qty} {item}, unit price ${price}, citing {po}. "
+    "Needs a triage decision.",
+    "Can you check {inv}? It's from {vendor}, vendor id {vid}. They billed {qty} {item} at ${price} each "
+    "and referenced purchase order {po}.",
+    "Exception {inv}: supplier={vendor} ({vid}); qty={qty}; item={item}; unit_price=${price}; po={po}. "
+    "Reply with the decision.",
+    "{vendor} ({vid}) sent invoice {inv} referencing {po}: {qty} x {item} billed at ${price}/ea. "
+    "Their AP mailbox is {email}. Triage please.",
+    "Hi team - invoice {inv} came in from {vendor}, id {vid}, for {item} ({qty} units, ${price} each) "
+    "against {po}. The match failed; what should we do?",
+    "Triage request. Vendor: {vendor} / {vid}. Invoice: {inv}. PO: {po}. Line: {item}, quantity {qty}, "
+    "unit cost ${price}.",
+    "Please review invoice {inv} ({vendor}, {vid}) - {qty} {item} invoiced at ${price} each on {po}. "
+    "Questions to {email}.",
+]
+
+
+def _ood_variance(rng: random.Random, lo: float, hi: float) -> float:
+    return rng.choice([-1, 1]) * rng.uniform(lo, hi) / 100.0
+
+
+def make_ood_case(rng: random.Random, idx: int, kind: str) -> Case:
+    vendor_id = f"V-{900000 + idx}"
+    vendor_name = OOD_VENDORS[rng.randrange(len(OOD_VENDORS))]
+    invoice_id = f"INV-{900000 + idx}"
+    po_number = f"PO-46{rng.randrange(10000000, 99999999)}"
+    item = rng.choice(OOD_ITEMS)
+    ordered = rng.randrange(5, 400)
+    unit_price = _round(rng.uniform(5, 2500))
+    received = ordered
+    billed_qty = ordered
+    billed_price = unit_price
+    paid: list[str] = []
+    bank_days = rng.randrange(60, 3000)
+    missing = False
+
+    if kind == "boundary_price_over":
+        billed_price = _round(unit_price * (1 + _ood_variance(rng, 2.15, 2.9)))
+    elif kind == "boundary_price_under":
+        billed_price = _round(unit_price * (1 + _ood_variance(rng, 1.1, 1.85)))
+    elif kind == "boundary_bank_recent":
+        bank_days = rng.randrange(25, 30)
+    elif kind == "boundary_bank_ok":
+        bank_days = rng.randrange(30, 35)
+    elif kind == "boundary_qty_over":
+        received = max(1, ordered - rng.randrange(1, max(2, ordered // 3)))
+        billed_qty = received + 1
+    elif kind == "partial_billing_ok":
+        received = max(1, ordered - rng.randrange(1, max(2, ordered // 2)))
+        billed_qty = received
+    elif kind == "precedence_dup_over_price":
+        paid = [invoice_id]
+        billed_price = _round(unit_price * (1 + _ood_variance(rng, 4.0, 15.0)))
+    elif kind == "precedence_bank_over_qty":
+        bank_days = rng.randrange(1, 29)
+        received = max(1, ordered - rng.randrange(1, max(2, ordered // 2)))
+    elif kind == "missing_po":
+        missing = True
+    elif kind != "clean":
+        raise ValueError(f"unknown OOD kind {kind!r}")
+
+    vendor = {"vendor_id": vendor_id, "name": vendor_name, "status": "active", "days_since_bank_change": bank_days}
+    po = (
+        None
+        if missing
+        else {
+            "po_number": po_number,
+            "vendor_id": vendor_id,
+            "item": item,
+            "ordered_qty": ordered,
+            "received_qty": received,
+            "unit_price": unit_price,
+            "currency": "USD",
+            "paid_invoices": paid,
+        }
+    )
+    reason, variance = decide(po, vendor, invoice_id, billed_qty, billed_price)
+    slug = vendor_name.split()[0].lower()
+    return Case(
+        invoice_id=invoice_id,
+        vendor_id=vendor_id,
+        vendor_name=vendor_name,
+        contact_email=f"payables.{slug}{rng.randrange(1000)}@example.org",
+        po_number=po_number,
+        item=item,
+        billed_qty=billed_qty,
+        unit_price_billed=billed_price,
+        po=po,
+        vendor=vendor,
+        reason_code=reason,
+        variance_pct=variance,
+    )
+
+
+def ood_user_message(c: Case, template_idx: int) -> str:
+    return _OOD_TEMPLATES[template_idx % len(_OOD_TEMPLATES)].format(
+        inv=c.invoice_id,
+        vendor=c.vendor_name,
+        vid=c.vendor_id,
+        qty=c.billed_qty,
+        item=c.item,
+        price=f"{c.unit_price_billed:,.2f}",
+        po=c.po_number,
+        email=c.contact_email,
+    )
+
+
+def generate_ood(n: int, seed: int = 1009) -> list[dict[str, Any]]:
+    """`n` OOD records, kinds balanced round-robin, phrasings rotated
+    independently so kind and wording are not confounded."""
+    if n < 1:
+        raise ValueError("n must be >= 1")
+    rng = random.Random(seed)
+    out = []
+    for i in range(n):
+        kind = OOD_KINDS[i % len(OOD_KINDS)]
+        c = make_ood_case(rng, i, kind)
+        tmpl = (i // len(OOD_KINDS) + i) % len(_OOD_TEMPLATES)
+        out.append(to_record(c, ood_user_message(c, tmpl), {"split": "ood", "ood_kind": kind, "template": tmpl}))
+    return out
