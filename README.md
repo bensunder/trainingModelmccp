@@ -142,7 +142,7 @@ mccp audit-verify
 ## Tests
 
 ```bash
-uv run pytest                     # 115 tests; DB/OPA/S3 (moto) tests skip if unavailable
+uv run pytest                     # 117 tests; DB/OPA/S3 (moto) tests skip if unavailable
 MCCP_TEST_ADMIN_DSN=postgresql://postgres@127.0.0.1/postgres MCCP_TEST_OPA_BIN=$(which opa) uv run pytest
 MCCP_TEST_SOUP_PYTHON=/path/to/venv-with-soup/bin/python uv run pytest tests/test_soup_contract.py
 ```
@@ -155,17 +155,23 @@ The end-to-end tests run against real Postgres and a real OPA binary. vLLM, Lite
 - Cancel, idempotency under 20 concurrent submits, and cross-tenant isolation.
 - Problem+json errors.
 
-## Not verified in the build sandbox
+## Verified on a GPU (2026-11-01)
 
-The sandbox had no GPU and no Hugging Face access. Before relying on this, validate on your GPU host:
+The single-GPU pilot (`deploy/gpu/pilot.py`, `deploy/gpu/run_pilot.sh`) ran the real path on an RTX 4000 Ada (20 GB). Details, numbers and host notes are in [docs/gpu-pilot-2026-11-01.md](docs/gpu-pilot-2026-11-01.md).
 
-- **A real `soup train` run on Qwen3-8B.** The Soup config and data pass Soup 0.72.4's own schema and converters in the contract test, but no real training has run.
-- **The pre-flight render-check against the real Qwen3 tokenizer.** It is the gate for the tools pre-rendering decision.
-- **vLLM v0.29 image flags, runtime LoRA loading, and the hermes tool parser on your adapters.** The fleet allowlist for `qwen3_5` is a placeholder until M7.
-- **Container image tags in `deploy/compose.yaml`** (vLLM, MLflow, LiteLLM, OPA). These are pins to confirm, not tested builds.
+- **A real `soup train` QLoRA run on Qwen3-8B** at the pinned revision, including both pre-flight render-checks against the real Qwen3 tokenizer.
+- **vLLM v0.29 runtime LoRA loading, the hermes tool parser and `--default-chat-template-kwargs`** (pip install, not the container image).
+- **L0 publish guard and L1 evaluation on the served adapter.** After the two fixes below, the adapter scored task 0.89 (95% CI 0.84-0.94) vs 0.01 for the base, with 100% exact tool calls and 100% valid JSON.
+
+The pilot found and fixed two bugs the fakes could not: eval requests vLLM rejects (tool calls without ids) and padded `null` tool arguments in training data (Arrow struct unification). Both have regression tests.
+
+## Still not verified
+
+- **The Docker topologies** (`deploy/compose.yaml`, `deploy/gpu/compose.gpu.yaml`): container image tags (vLLM, MLflow, LiteLLM, OPA), the worker image build, and the 48 GB serving GPU they assume. The pilot ran from venvs, not images.
+- **Decision accuracy at the recipe defaults.** The pilot used 1 epoch on 400 records; run the full 3,000-record, 2-epoch job before quoting accuracy.
 - **Dependency drift.** The Soup 0.72.4 extras pin `trl<0.25` and `transformers<5`. That is why the worker image keeps its trainer venv separate from the control plane. The trainer environment is hash-locked in `trainer/requirements.lock.txt`.
-- **`--default-chat-template-kwargs`** (the server-side thinking-off default) must exist in the pinned vLLM. If it doesn't, vLLM fails to start, which is loud. In any case, the canary's gateway smoke test rejects any adapter that produces thinking output on the production path.
 - **LiteLLM behaviour.** Keeping the custom `model_info.id`, forwarding `extra_body`, model access groups, and `/key/generate` for `mccp gateway-key` all need confirming against a real LiteLLM.
+- **L2-L6 layers on real hardware** (judge, lm-eval regression, Qwen3Guard safety, TTFT). The fleet allowlist for `qwen3_5` is a placeholder until M7.
 - **MinIO.** MinIO stopped publishing maintained community images in late 2025. Pin `MINIO_IMAGE` to a digest you have vetted, or use AWS S3 or another S3-compatible service.
 
 ## Phase 2 (DPO, then GRPO)

@@ -6,7 +6,7 @@ ref: qwen3-8b-qlora-sft@v1.0.0+L40S
 trainer_image: ghcr.io/YOUR_ORG/mccp-trainer@sha256:REPLACE_WITH_DIGEST
 base_model:
   id: Qwen/Qwen3-8B
-  revision: REPLACE_WITH_40_CHAR_COMMIT_SHA
+  revision: b968826d9c46dd6066d109eabc6255188de91218   # validated on GPU 2026-11-01 (docs/gpu-pilot-2026-11-01.md)
   license: Apache-2.0
   architecture: qwen3
 dims:            # Qwen3-8B config.json
@@ -20,7 +20,7 @@ dims:            # Qwen3-8B config.json
 finetuning_types: [qlora]
 target_modules: all-linear
 enable_thinking: false
-chat_template_sha256: "*"
+chat_template_sha256: "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"   # trainer pre-flight measured, same revision
 engine:
   trl: "0.24.0"
   peft: "0.17.1"

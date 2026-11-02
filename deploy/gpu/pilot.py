@@ -70,7 +70,11 @@ def prepare(args: argparse.Namespace) -> int:
     if (workdir / "run.json").exists() and not args.force:
         print(f"{workdir}/run.json already exists; pass --force to rebuild", file=sys.stderr)
         return 2
-    revision = args.revision or resolve_revision(BASE_ID)
+    raw_recipe = yaml.safe_load((REPO / "examples/recipe-qwen3-8b-qlora-sft.yaml").read_text(encoding="utf-8"))
+    pinned = str(raw_recipe["base_model"].get("revision", ""))
+    # Prefer an explicit --revision, then the recipe's validated pin; only fall back
+    # to "whatever Hugging Face serves now" when the recipe has no real pin.
+    revision = args.revision or (pinned if len(pinned) == 40 else resolve_revision(BASE_ID))
 
     # 1. Dataset through the production pipeline (schema, PII, dedup, group split, decontam, export).
     raw = b"".join(json.dumps(r, ensure_ascii=False).encode() + b"\n" for r in generate(args.n, seed=args.seed))
@@ -87,7 +91,6 @@ def prepare(args: argparse.Namespace) -> int:
     test_rows = _jsonl(built.files["test.jsonl"])
 
     # 2. Recipe (pilot variant of the shipped one) and job resolution through the domain models.
-    raw_recipe = yaml.safe_load((REPO / "examples/recipe-qwen3-8b-qlora-sft.yaml").read_text(encoding="utf-8"))
     raw_recipe["ref"] = PILOT_RECIPE_REF
     raw_recipe["trainer_image"] = "local:gridshare-pilot"  # no image: trainer runs from a hash-locked venv
     raw_recipe["base_model"]["revision"] = revision
@@ -254,7 +257,7 @@ def main() -> int:
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-steps", type=int, default=20)
-    p.add_argument("--revision", help="pin a specific Qwen3-8B commit; default resolves the current one")
+    p.add_argument("--revision", help="Qwen3-8B commit; default is the recipe pin")
     p.add_argument("--gpu-hourly-usd", type=float, default=0.33)
     p.add_argument("--force", action="store_true")
 

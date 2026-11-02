@@ -122,7 +122,12 @@ EVAL_RC=${PIPESTATUS[0]}
 DEST=/workspace/mccp-pilot-results
 mkdir -p "$DEST"
 cp "$WORK"/output/adapter_config.json "$WORK"/output/adapter_model.safetensors "$DEST"/ 2>/dev/null
-cp "$WORK"/{events.jsonl,pilot.json,run.json,report.json,soup.yaml,train.log,vllm.log,pilot-run.log} "$DEST"/ 2>/dev/null
+cp "$WORK"/{events.jsonl,pilot.json,run.json,report.json,soup.yaml} "$DEST"/ 2>/dev/null
+# GridShare's /workspace autosave skips *.log, so keep the logs as .txt.
+for f in train vllm pilot-run trainer; do
+  [ -f "$WORK/$f.log" ] && cp "$WORK/$f.log" "$DEST/$f.log.txt"
+  [ -f "$WORK/$f.out" ] && cp "$WORK/$f.out" "$DEST/$f.out.txt"
+done
 say "results saved to $DEST: $(ls "$DEST" | tr '\n' ' ')"
 
 case "$EVAL_RC" in
