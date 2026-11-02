@@ -37,7 +37,16 @@ else
   uv pip install --python "$VENV/bin/python" vllm==0.29.0 >>"$LOG" 2>&1 \
     || die "vLLM install failed; see: tail -40 $LOG"
 fi
+# vLLM JIT-compiles some kernels at start-up and needs `ninja` on PATH (+ nvcc/gcc, which
+# the Ubuntu + CUDA devel template provides).
+if [ ! -x "$VENV/bin/ninja" ]; then
+  say "installing ninja (vLLM kernel build tool)"
+  uv pip install --python "$VENV/bin/python" ninja >>"$LOG" 2>&1 || die "could not install ninja"
+fi
+export PATH="$VENV/bin:$PATH"
+command -v nvcc >/dev/null || [ -x /usr/local/cuda/bin/nvcc ] && export PATH="$PATH:/usr/local/cuda/bin"
 "$VENV/bin/python" -c "import vllm; print('vllm', vllm.__version__)" 2>&1 | tee -a "$LOG"
+say "build tools: ninja=$(command -v ninja || echo MISSING) nvcc=$(command -v nvcc || echo MISSING) gcc=$(command -v gcc || echo MISSING)"
 [ -s "$KEYFILE" ] || (cd "$REPO" && uv run python deploy/gpu/pilot.py new-key > "$KEYFILE") \
   || die "could not create API key"
 KEY="$(cat "$KEYFILE")"
