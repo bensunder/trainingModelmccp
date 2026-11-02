@@ -168,8 +168,8 @@ class TestTrainerRendering:
         rec = generate(1)[0]
         out = entry.render_tools(rec["messages"], rec["tools"], spec)
         assert [m["role"] for m in out[:3]] == ["system", "available_tools", "user"]
-        assert out[1]["content"].startswith("{\n    ")  # indent=4 per tool
-        assert out[1]["content"].count("\n\n{") == len(rec["tools"]) - 1
+        assert json.loads(out[1]["content"]) == rec["tools"]  # one JSON list, as Granite's template writes
+        assert out[1]["content"].startswith("[\n    {\n        ")  # indent=4
         out2 = entry.render_tools(rec["messages"][1:], rec["tools"], spec)
         assert out2[0]["role"] == "available_tools"
 
@@ -237,8 +237,8 @@ HERMES_TEMPLATE = (
 ROLE_TEMPLATE = (
     "{% for m in messages %}{% if loop.first and m.role == 'system' %}"
     "<|start_of_role|>system<|end_of_role|>{{ m.content }}<|end_of_text|>{{ nl }}"
-    "{% if tools %}<|start_of_role|>available_tools<|end_of_role|>{% for t in tools %}{{ t | tojson(indent=4) }}"
-    "{% if not loop.last %}{{ nl }}{{ nl }}{% endif %}{% endfor %}<|end_of_text|>{{ nl }}{% endif %}"
+    "{% if tools %}<|start_of_role|>available_tools<|end_of_role|>{{ tools | tojson(indent=4) }}"
+    "<|end_of_text|>{{ nl }}{% endif %}"
     "{% else %}<|start_of_role|>{{ m.role }}<|end_of_role|>{% if m.tool_calls %}{% for tc in m.tool_calls %}"
     '<|tool_call|>{"name": "{{ tc.function.name }}", "arguments": ' + _ARGS + "}{% endfor %}"
     "{% else %}{{ m.content }}{% endif %}<|end_of_text|>{{ nl }}{% endif %}{% endfor %}"

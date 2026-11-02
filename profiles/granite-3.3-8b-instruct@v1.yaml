@@ -24,9 +24,8 @@ dims:
 tools:
   strategy: role_message
   role: available_tools
-  json_mode: per_tool
+  json_mode: list        # the native template writes the tools as one JSON list (found by profile validate)
   json_indent: 4
-  item_separator: "\n\n"
 reasoning:
   template_kwarg: thinking
   open_tag: "<think>"
