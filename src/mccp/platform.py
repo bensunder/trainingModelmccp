@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from mccp.db.engine import make_engine
+from mccp.domain.profile import ProfileRegistry
 from mccp.governance.evidence import OpaClient
 from mccp.registry.artifacts import Signer
 from mccp.registry.mlflow import MlflowMirror, NullMirror, RegistryMirror
@@ -23,6 +24,7 @@ class Platform:
     store: ObjectStore
     signer: Signer
     fleet: FleetProfile
+    profiles: ProfileRegistry
     vllm: VllmClient
     gateway: GatewayClient | NullGateway
     mirror: RegistryMirror
@@ -47,6 +49,7 @@ class Platform:
             store=open_store(s.object_store_url, s.s3_endpoint_url, s.s3_region),
             signer=Signer(s.signing_mode, s.signing_private_key_path, s.signing_public_key_path),
             fleet=FleetProfile.load(s.fleet_profile_path),
+            profiles=ProfileRegistry.load(s.profiles_dir),
             vllm=VllmClient(s.vllm_base_url, vllm_key, timeout=s.eval_request_timeout_s),
             gateway=gateway,
             mirror=MlflowMirror(s.mlflow_tracking_uri) if s.mlflow_tracking_uri else NullMirror(),

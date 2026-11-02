@@ -1,0 +1,46 @@
+# Qwen3-8B (dense), hermes-style tools in the system turn, switchable thinking.
+# Validated on GPU 2026-11-01: trainer pre-flight proved the rendering is
+# token-identical to the native chat template (validations/qwen3-8b@v1.json).
+id: qwen3-8b
+version: 1
+display_name: Qwen3-8B (Alibaba Qwen)
+base:
+  hf_id: Qwen/Qwen3-8B
+  revision: b968826d9c46dd6066d109eabc6255188de91218
+  license: Apache-2.0
+  origin_country: CN
+  publisher: Alibaba Cloud (Qwen team)
+  architecture: qwen3
+  chat_template_sha256: a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8
+dims:
+  parameters: 8190000000
+  hidden_size: 4096
+  intermediate_size: 12288
+  num_layers: 36
+  num_attention_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+tools:
+  strategy: system_append
+  header: "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>"
+  footer: "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>"
+  item_prefix: "\n"
+  item_separator: ""
+  join: "\n\n"
+reasoning:
+  template_kwarg: enable_thinking
+  open_tag: "<think>"
+  close_tag: "</think>"
+serving:
+  tool_call_parser: hermes
+  reasoning_parser: qwen3
+  lora_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  max_lora_rank: 64
+  min_vram_gb_bf16: 20
+training:
+  target_modules: all-linear
+  qlora_supported: true
+  min_vram_gb_qlora: 12
+notes: >-
+  Publisher is China-based; tenants restricted to US/EU-origin models should use
+  a US-origin profile (the governance gate enforces tenant origin allow-lists).

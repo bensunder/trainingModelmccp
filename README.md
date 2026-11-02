@@ -142,7 +142,7 @@ mccp audit-verify
 ## Tests
 
 ```bash
-uv run pytest                     # 133 tests; DB/OPA/S3 (moto) tests skip if unavailable
+uv run pytest                     # 162 tests; DB/OPA/S3 (moto) tests skip if unavailable
 MCCP_TEST_ADMIN_DSN=postgresql://postgres@127.0.0.1/postgres MCCP_TEST_OPA_BIN=$(which opa) uv run pytest
 MCCP_TEST_SOUP_PYTHON=/path/to/venv-with-soup/bin/python uv run pytest tests/test_soup_contract.py
 ```
@@ -165,6 +165,10 @@ The single-GPU pilot (`deploy/gpu/pilot.py`, `deploy/gpu/run_pilot.sh`) ran the 
 
 The pilot found and fixed two bugs the fakes could not: eval requests vLLM rejects (tool calls without ids) and padded `null` tool arguments in training data (Arrow struct unification). Both have regression tests.
 
+## Model profiles
+
+Base models are switchable: a recipe names a profile (`profiles/<id>@v<N>.yaml`) that holds the model's tool rendering, reasoning switch, vLLM parsers, LoRA modules, license and country of origin. `qwen3-8b@v1` is validated; `granite-3.3-8b-instruct@v1` (US origin) is a draft until `mccp profile validate` proves its rendering on the real tokenizer (CPU only). Tenants can restrict base-model origins (`mccp tenant set-origins`), enforced by the promotion policy. See [docs/model-profiles.md](docs/model-profiles.md).
+
 ## Benchmark kit
 
 `deploy/gpu/run_batch.sh` runs a multi-seed batch and scores each adapter on the held-out split and an out-of-distribution set, against the base model and optionally a prompted frontier model, with latency and cost per 1,000 decisions. `deploy/gpu/bootstrap.sh` sets up a fresh GPU box in one command. See [docs/benchmark.md](docs/benchmark.md).
@@ -175,6 +179,7 @@ The pilot found and fixed two bugs the fakes could not: eval requests vLLM rejec
 - **Decision accuracy at the recipe defaults.** The pilot used 1 epoch on 400 records; run the full 3,000-record, 2-epoch job before quoting accuracy.
 - **Dependency drift.** The Soup 0.72.4 extras pin `trl<0.25` and `transformers<5`. That is why the worker image keeps its trainer venv separate from the control plane. The trainer environment is hash-locked in `trainer/requirements.lock.txt`.
 - **LiteLLM behaviour.** Keeping the custom `model_info.id`, forwarding `extra_body`, model access groups, and `/key/generate` for `mccp gateway-key` all need confirming against a real LiteLLM.
+- **The Granite profile.** It is a draft until `mccp profile validate granite-3.3-8b-instruct@v1` passes, then needs one GPU batch.
 - **L2-L6 layers on real hardware** (judge, lm-eval regression, Qwen3Guard safety, TTFT). The fleet allowlist for `qwen3_5` is a placeholder until M7.
 - **MinIO.** MinIO stopped publishing maintained community images in late 2025. Pin `MINIO_IMAGE` to a digest you have vetted, or use AWS S3 or another S3-compatible service.
 

@@ -30,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ import yaml
 from mccp.datasets.pii import PatternRedactor, RedactionScope, redact_value
 from mccp.datasets.pipeline import BuildParams, DatasetBuildError, build_dataset
 from mccp.datasets.quality import contaminated, input_text
+from mccp.domain.profile import ModelProfile, ProfileRegistry
 from mccp.domain.recipe import Recipe
 from mccp.domain.spec import JobRequest
 from mccp.evals import layers
@@ -57,10 +59,7 @@ from mccp.serving.clients import FleetProfile, ServingError, VllmClient
 from mccp.training.backends import TrainContext, prepare_workdir
 
 REPO = Path(__file__).resolve().parents[2]
-BASE_ID = "Qwen/Qwen3-8B"
-BASE_SERVED = "qwen3-8b-base"
-PILOT_RECIPE_REF = "qwen3-8b-qlora-sft@v1.0.0+A5000"
-EXTRA_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
+DEFAULT_PROFILE = "qwen3-8b@v1"
 SET_FILES = {"in_dist": "golden.jsonl", "ood": "golden_ood.jsonl"}
 
 
@@ -97,6 +96,23 @@ def redact_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
     return out, total
 
 
+def load_profile(ref: str) -> ModelProfile:
+    return ProfileRegistry.load(REPO / "profiles").get(ref)
+
+
+def served_base_name(profile: ModelProfile) -> str:
+    return FleetProfile.load(REPO / "deploy/fleet.yaml").base_for(profile.base.hf_id).served_name
+
+
+def extra_body(profile: ModelProfile) -> dict[str, Any]:
+    kwargs = profile.chat_template_kwargs()
+    return {"chat_template_kwargs": kwargs} if kwargs else {}
+
+
+def pilot_recipe_ref(profile: ModelProfile) -> str:
+    return re.sub(r"[^a-z0-9-]+", "-", profile.id) + "-qlora-sft@v1.0.0+pilot"
+
+
 def adapter_serving_name(workdir: Path) -> str:
     slug = re.sub(r"[^a-z0-9-]+", "-", workdir.name.lower()).strip("-") or "run"
     return f"invoice-triage-{slug}"[:64]
@@ -108,11 +124,17 @@ def prepare(args: argparse.Namespace) -> int:
     if (workdir / "run.json").exists() and not args.force:
         print(f"{workdir}/run.json already exists; pass --force to rebuild", file=sys.stderr)
         return 2
-    raw_recipe = yaml.safe_load((REPO / "examples/recipe-qwen3-8b-qlora-sft.yaml").read_text(encoding="utf-8"))
-    pinned = str(raw_recipe["base_model"].get("revision", ""))
-    # Prefer an explicit --revision, then the recipe's validated pin; only fall back
-    # to "whatever Hugging Face serves now" when the recipe has no real pin.
-    revision = args.revision or (pinned if len(pinned) == 40 else resolve_revision(BASE_ID))
+    profile = load_profile(args.profile)
+    if profile.status != "validated" and not args.allow_draft:
+        print(
+            f"profile {profile.ref} is {profile.status}; run `uv run mccp profile validate {profile.ref} "
+            "--trainer-python /root/venvs/trainer/bin/python` first (CPU only)",
+            file=sys.stderr,
+        )
+        return 2
+    # Prefer an explicit --revision, then the profile's validated pin; only a draft
+    # profile (with --allow-draft) falls back to whatever Hugging Face serves now.
+    revision = args.revision or profile.base.revision or resolve_revision(profile.base.hf_id)
 
     # 1. Dataset through the production pipeline (schema, PII, dedup, group split, decontam, export).
     #    `--data-seed` fixes the data and the held-out split, so runs that differ only in
@@ -144,10 +166,26 @@ def prepare(args: argparse.Namespace) -> int:
         print(f"OOD set shares {overlap} non-boilerplate 13-grams with training inputs; refusing", file=sys.stderr)
         return 3
 
-    # 3. Recipe (pilot variant of the shipped one) and job resolution through the domain models.
-    raw_recipe["ref"] = PILOT_RECIPE_REF
+    # 3. Recipe (the shipped one, re-based on the chosen profile) and job resolution.
+    raw_recipe = yaml.safe_load((REPO / "examples/recipe-qwen3-8b-qlora-sft.yaml").read_text(encoding="utf-8"))
+    recipe_ref = pilot_recipe_ref(profile)
+    raw_recipe["ref"] = recipe_ref
     raw_recipe["trainer_image"] = "local:gridshare-pilot"  # no image: trainer runs from a hash-locked venv
-    raw_recipe["base_model"]["revision"] = revision
+    raw_recipe["profile"] = profile.ref
+    raw_recipe["base_model"] = {
+        "id": profile.base.hf_id,
+        "revision": revision,
+        "license": profile.base.license,
+        "architecture": profile.base.architecture,
+    }
+    raw_recipe["dims"] = profile.dims.model_dump()
+    raw_recipe["chat_template_sha256"] = profile.base.chat_template_sha256 or "*"
+    raw_recipe["enable_thinking"] = False
+    raw_recipe["serving"] = {
+        **raw_recipe["serving"],
+        "tool_call_parser": profile.serving.tool_call_parser,
+        "reasoning_parser": profile.serving.reasoning_parser,
+    }
     # 20-24 GB card: halve the micro-batch, keep the effective batch at 16.
     raw_recipe["defaults"]["per_device_batch_size"] = 2
     raw_recipe["defaults"]["gradient_accumulation_steps"] = 8
@@ -156,10 +194,10 @@ def prepare(args: argparse.Namespace) -> int:
     recipe = Recipe.model_validate(raw_recipe)
 
     raw_job = yaml.safe_load((REPO / "examples/job-invoice-triage.yaml").read_text(encoding="utf-8"))
-    raw_job["recipe"] = PILOT_RECIPE_REF
+    raw_job["recipe"] = recipe_ref
     raw_job["method"]["sft"]["hyperparameters"]["n_epochs"] = args.epochs
     raw_job["seed"] = args.seed
-    cfg = JobRequest.model_validate(raw_job).resolve(recipe)
+    cfg = JobRequest.model_validate(raw_job).resolve(recipe, profile, allow_draft_profile=args.allow_draft)
 
     # 4. Trainer workdir: data, golden sets, run.json (the trainer entrypoint's contract).
     (workdir / "data").mkdir(parents=True, exist_ok=True)
@@ -178,8 +216,10 @@ def prepare(args: argparse.Namespace) -> int:
         )
     )
     manifest = {
-        "base_model": {"id": BASE_ID, "revision": revision},
-        "recipe": PILOT_RECIPE_REF,
+        "base_model": {"id": profile.base.hf_id, "revision": revision},
+        "profile": profile.ref,
+        "profile_status": profile.status,
+        "recipe": recipe_ref,
         "config_hash": cfg.config_hash(),
         "seed": args.seed,
         "data_seed": args.data_seed,
@@ -195,6 +235,7 @@ def prepare(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "workdir": str(workdir),
+                "profile": f"{profile.ref} ({profile.status}, origin {profile.base.origin_country})",
                 "revision": revision,
                 "config_hash": manifest["config_hash"],
                 "seed": args.seed,
@@ -280,6 +321,10 @@ async def _evaluate(args: argparse.Namespace) -> int:
 
     adapter_dir = workdir / "output"
     adapter_name = args.adapter_name or adapter_serving_name(workdir)
+    pilot_meta = json.loads((workdir / "pilot.json").read_text(encoding="utf-8"))
+    profile = load_profile(pilot_meta.get("profile", DEFAULT_PROFILE))
+    base_served = served_base_name(profile)
+    xbody = extra_body(profile)
     suite = EvalSuite.model_validate(
         yaml.safe_load((REPO / "examples/suite-invoice-triage.yaml").read_text(encoding="utf-8"))
     )
@@ -288,8 +333,8 @@ async def _evaluate(args: argparse.Namespace) -> int:
     frontier = None
     loaded = False
     try:
-        if {"adapter", "base"} & set(wanted) and not await vllm.has_model(BASE_SERVED):
-            print(f"vLLM at {args.vllm_url} does not serve `{BASE_SERVED}`", file=sys.stderr)
+        if {"adapter", "base"} & set(wanted) and not await vllm.has_model(base_served):
+            print(f"vLLM at {args.vllm_url} does not serve `{base_served}`", file=sys.stderr)
             return 2
         targets: list[Target] = []
         if "adapter" in wanted:
@@ -298,7 +343,7 @@ async def _evaluate(args: argparse.Namespace) -> int:
                     print(f"missing {adapter_dir / f}: training has not produced an adapter", file=sys.stderr)
                     return 2
             static = static_guard(
-                adapter_dir, fleet=FleetProfile.load(REPO / "deploy/fleet.yaml"), base_model_id=BASE_ID
+                adapter_dir, fleet=FleetProfile.load(REPO / "deploy/fleet.yaml"), base_model_id=profile.base.hf_id
             )
             probe_items = layers.golden_items(sets["in_dist"], suite.effect_probes)
             probes = [{"messages": it.messages, **({"tools": it.tools} if it.tools else {})} for it in probe_items]
@@ -306,9 +351,9 @@ async def _evaluate(args: argparse.Namespace) -> int:
                 vllm,
                 serving_name=adapter_name,
                 lora_path=str(adapter_dir),
-                base_served_name=BASE_SERVED,
+                base_served_name=base_served,
                 probes=probes,
-                extra_body=EXTRA_BODY,
+                extra_body=xbody,
             )
             loaded = True
             targets.append(
@@ -317,7 +362,7 @@ async def _evaluate(args: argparse.Namespace) -> int:
                     "adapter",
                     adapter_name,
                     vllm.chat,
-                    EXTRA_BODY,
+                    xbody,
                     args.concurrency,
                     gpu_usd_per_hour=args.gpu_usd_per_hour,
                 )
@@ -327,9 +372,9 @@ async def _evaluate(args: argparse.Namespace) -> int:
                 Target(
                     "base",
                     "base",
-                    BASE_SERVED,
+                    base_served,
                     vllm.chat,
-                    EXTRA_BODY,
+                    xbody,
                     args.concurrency,
                     gpu_usd_per_hour=args.gpu_usd_per_hour,
                 )
@@ -354,7 +399,7 @@ async def _evaluate(args: argparse.Namespace) -> int:
 
     in_dist = bench["sets"]["in_dist"]
     report: dict[str, Any] = {
-        "pilot": json.loads((workdir / "pilot.json").read_text(encoding="utf-8")),
+        "pilot": pilot_meta,
         "adapter_serving_name": adapter_name if "adapter" in wanted else None,
         "static_guard": static,
         "live_guard": live,
@@ -393,6 +438,26 @@ async def _evaluate(args: argparse.Namespace) -> int:
     if "verdict" not in report:
         return 0 if not invalid else 1
     return 0 if report["verdict"]["pass"] and not invalid else 1
+
+
+# --------------------------------------------------------------- profile-env --
+def profile_env(args: argparse.Namespace) -> int:
+    """Shell exports for the batch scripts (eval "$(pilot.py profile-env ...)")."""
+    p = load_profile(args.profile)
+    exports = {
+        "PROFILE_REF": p.ref,
+        "PROFILE_ID": p.id,
+        "PROFILE_STATUS": p.status,
+        "PROFILE_ORIGIN": p.base.origin_country,
+        "HF_ID": p.base.hf_id,
+        "BASE_SERVED": served_base_name(p),
+        "TOOL_PARSER": p.serving.tool_call_parser,
+        "REASONING_PARSER": p.serving.reasoning_parser or "",
+        "THINKING_KWARG": p.reasoning.template_kwarg if p.reasoning else "",
+    }
+    for k, v in exports.items():
+        print(f"export {k}={shlex.quote(str(v))}")
+    return 0
 
 
 # ------------------------------------------------------------------- compare --
@@ -436,6 +501,8 @@ def main() -> int:
     p.add_argument("--revision", help="base model commit; default is the recipe pin")
     p.add_argument("--gpu-hourly-usd", type=float, default=0.35)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--profile", default=DEFAULT_PROFILE, help="model profile ref (profiles/<ref>.yaml)")
+    p.add_argument("--allow-draft", action="store_true", help="allow an unvalidated profile (not for evidence)")
 
     e = sub.add_parser("evaluate")
     e.add_argument("--workdir", required=True)
@@ -460,6 +527,9 @@ def main() -> int:
     c.add_argument("reports", nargs="+", help="report.json files")
     c.add_argument("--out", help="directory for comparison.json and comparison.md")
 
+    pe = sub.add_parser("profile-env", help="print shell exports for a profile")
+    pe.add_argument("--profile", default=DEFAULT_PROFILE)
+
     sub.add_parser("new-key", help="print a random vLLM API key")
 
     args = ap.parse_args()
@@ -469,6 +539,8 @@ def main() -> int:
         return asyncio.run(_evaluate(args))
     if args.cmd == "compare":
         return compare(args)
+    if args.cmd == "profile-env":
+        return profile_env(args)
     print(secrets.token_urlsafe(32))
     return 0
 

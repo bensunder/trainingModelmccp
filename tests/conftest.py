@@ -147,6 +147,7 @@ def settings(database, opa_url, fake_serving, keys, tmp_path) -> Settings:
         vllm_base_url=fake_serving.url,
         vllm_lora_root=tmp_path / "lora",
         fleet_profile_path=ROOT / "deploy/fleet.yaml",
+        profiles_dir=ROOT / "profiles",
         gateway_kind="litellm",
         litellm_base_url=fake_serving.url,
         litellm_vllm_api_base="http://vllm:8000",

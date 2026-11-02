@@ -86,6 +86,17 @@ deny contains msg if {
 	msg := sprintf("base model license %v is not allow-listed", [input.base_model.license])
 }
 
+# Tenant base-model origin allow-list (model profiles). A tenant with no list
+# is unrestricted; with a list, an unknown origin (pre-profile jobs) is denied.
+allowed_origins := object.get(object.get(input, "tenant_policy", {}), "allowed_base_model_origins", [])
+
+deny contains msg if {
+	count(allowed_origins) > 0
+	origin := object.get(input.base_model, "origin_country", null)
+	not origin in allowed_origins
+	msg := sprintf("base model origin %v (%v) is not allowed for this tenant; allowed: %v", [origin, input.base_model.id, allowed_origins])
+}
+
 deny contains msg if {
 	some d in input.datasets
 	some lic in d.licenses

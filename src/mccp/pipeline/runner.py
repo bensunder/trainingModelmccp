@@ -294,7 +294,8 @@ class PipelineRunner:
         return self.s.work_dir / "jobs" / job["id"]
 
     def _extra_body(self, cfg: ResolvedConfig) -> dict[str, Any]:
-        return {"chat_template_kwargs": {"enable_thinking": cfg.enable_thinking}}
+        kwargs = cfg.chat_template_kwargs()
+        return {"chat_template_kwargs": kwargs} if kwargs else {}
 
     async def _dataset(self, conn, ref: DatasetRef) -> dict[str, Any]:
         return await repo.get_dataset_version(conn, ref.project, ref.name, ref.version)
@@ -472,6 +473,7 @@ class PipelineRunner:
                     "chat_template_sha256", cfg.chat_template_sha256
                 ),
                 "enable_thinking": cfg.enable_thinking,
+                "profile": cfg.profile_ref,
                 "train": {"job_id": job["id"], "config_hash": job["config_hash"], "trainer": state.get("trainer")},
                 "manifest": art.manifest,
                 "artifact_prefix": art.key_prefix,
@@ -689,6 +691,13 @@ class PipelineRunner:
             "gpu_seconds": job["gpu_seconds"],
             "cost_usd": job["cost_usd"],
         }
+        async with tenant_tx(self.pf.engine, job["tenant_id"]) as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT base_model_policy FROM tenants WHERE id = CAST(:t AS uuid)"),
+                    {"t": str(job["tenant_id"])},
+                )
+            ).first()
         return evidence_bundle(
             job=job,
             resolved=job["resolved"],
@@ -697,6 +706,7 @@ class PipelineRunner:
             report=repo.as_obj(rep),
             guard=st.get("publish_guard", {}),
             compute=compute,
+            tenant_policy=repo.as_obj(row.base_model_policy) if row else {},
         )
 
     async def _record_decision(
@@ -898,6 +908,8 @@ class PipelineRunner:
             return {"status": "skipped", "reason": "no gateway configured"}
         probe = GatewayClient.probe_name(self._logical(job))
         items = layers.golden_items(golden, 10)
+        cfg = self._resolved(job)
+        think_tag = cfg.profile.reasoning.open_tag if cfg.profile and cfg.profile.reasoning else "<think>"
         thinking = 0
         scores = []
         for it in items:
@@ -909,7 +921,7 @@ class PipelineRunner:
             except Exception as e:  # noqa: BLE001 - recorded as a canary problem
                 return {"status": "error", "problems": [f"gateway smoke request failed: {e}"[:300]]}
             msg = resp["choices"][0]["message"]
-            if (msg.get("reasoning_content") or msg.get("reasoning")) or "<think>" in (msg.get("content") or ""):
+            if (msg.get("reasoning_content") or msg.get("reasoning")) or think_tag in (msg.get("content") or ""):
                 thinking += 1
             scores.append(layers.score_item(it, resp, suite.output_schema, suite.compare_fields))
         summary = layers.summarize_l1(scores)

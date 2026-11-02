@@ -88,6 +88,8 @@ def prepare_workdir(ctx: TrainContext) -> dict[str, Any]:
         "base_model": {"id": ctx.config.base_model.id, "revision": ctx.config.base_model.revision},
         "chat_template_sha256": ctx.config.chat_template_sha256,
         "enable_thinking": ctx.config.enable_thinking,
+        "chat": ctx.config.trainer_chat_spec(),
+        "chat_template_kwargs": ctx.config.chat_template_kwargs(),
         "train_path": "data/train.jsonl",
         "golden_path": os.path.relpath(ctx.golden_path, ctx.workdir),
         "soup_yaml": soup_yaml,

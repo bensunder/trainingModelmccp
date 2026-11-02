@@ -1,0 +1,10 @@
+{
+  "validated_at": "2026-11-02T07:12:00Z",
+  "method": "trainer pre-flight on GPU (real tokenizer), pilot run 2",
+  "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+  "chat_template_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+  "rendering_sha256": "d5a1d988b0482014447e9b27325ccd679af05b77f5a295c31ed2cada0ddc448a",
+  "tool_render_checks": 20,
+  "string_argument_checks": 20,
+  "evidence": "docs/gpu-pilot-2026-11-01.md; preflight event: render_check_records=20, tool_argument_render_checks=20; rendering byte-identical to the legacy constants that run validated (tests/test_profiles.py)"
+}

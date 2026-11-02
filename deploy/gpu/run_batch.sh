@@ -21,6 +21,7 @@
 #
 # Safe to re-run: finished prepares, trainings and evaluations are skipped.
 
+PROFILE="${PROFILE:-qwen3-8b@v1}"   # model profile (profiles/<ref>.yaml); swap it to swap the base model
 N="${N:-3000}"
 EPOCHS="${EPOCHS:-1}"
 SEEDS="${SEEDS:-42 7}"
@@ -28,15 +29,26 @@ OOD_N="${OOD_N:-200}"
 SAVE_STEPS="${SAVE_STEPS:-100}"
 GPU_USD_PER_HOUR="${GPU_USD_PER_HOUR:-0.35}"
 RUNS="${RUNS:-/root/mccp-runs}"
-MODEL_CACHE="${MODEL_CACHE:-/root/models/qwen3-8b}"
+REPO="${REPO:-/root/mccp}"
+export PATH="$HOME/.local/bin:$PATH"
+eval "$(cd "$REPO" && uv run python deploy/gpu/pilot.py profile-env --profile "$PROFILE")" \
+  || { echo "STOP: unknown model profile $PROFILE"; exit 1; }
+MODEL_CACHE="${MODEL_CACHE:-/root/models/$PROFILE_ID}"
 TAG="n${N}-e${EPOCHS}"
+[ "$PROFILE_REF" = "qwen3-8b@v1" ] || TAG="$PROFILE_ID-$TAG"
 LOG="$RUNS/batch-$TAG.log"
 DEST="/workspace/mccp-batch-$TAG"
 mkdir -p "$RUNS"
 # shellcheck source=deploy/gpu/lib.sh
 . "$(dirname "$0")/lib.sh"
 
-say "batch $TAG: seeds [$SEEDS], OOD $OOD_N records, runs in $RUNS"
+say "batch $TAG: profile $PROFILE_REF ($PROFILE_STATUS, origin $PROFILE_ORIGIN, $HF_ID), seeds [$SEEDS], OOD $OOD_N, runs in $RUNS"
+DRAFT_ARG=()
+if [ "$PROFILE_STATUS" != "validated" ]; then
+  [ "${ALLOW_DRAFT:-0}" = 1 ] || die "profile $PROFILE_REF is $PROFILE_STATUS: run 'cd $REPO && uv run mccp profile validate $PROFILE_REF --trainer-python $TRAINER_PY' first (CPU only), or ALLOW_DRAFT=1 for an exploratory run"
+  DRAFT_ARG=(--allow-draft)
+  say "WARNING: draft profile; results are exploratory, not evidence"
+fi
 command -v uv >/dev/null || die "uv not on PATH (run: source \$HOME/.local/bin/env)"
 [ -x "$TRAINER_PY" ] || die "trainer venv missing at $TRAINER_PY (see the pilot install steps)"
 check_network || die "this machine cannot reach the internet; Stop it and pick another GPU"
@@ -50,8 +62,8 @@ fi
 ensure_vllm_venv || die "vLLM install failed; see: tail -40 $LOG"
 ensure_key || die "could not create API key"
 
-# Reuse the base model already downloaded by the pilot (about 16 GB).
-if [ ! -d "$MODEL_CACHE" ] && [ -d /root/mccp-pilot/model ] && [ ! -L /root/mccp-pilot/model ]; then
+# Reuse the base model already downloaded by the Qwen pilot (about 16 GB).
+if [ "$PROFILE_REF" = "qwen3-8b@v1" ] && [ ! -d "$MODEL_CACHE" ] && [ -d /root/mccp-pilot/model ] && [ ! -L /root/mccp-pilot/model ]; then
   mkdir -p "$(dirname "$MODEL_CACHE")"
   mv /root/mccp-pilot/model "$MODEL_CACHE" && ln -s "$MODEL_CACHE" /root/mccp-pilot/model
   say "moved the pilot's base model to the shared cache $MODEL_CACHE"
@@ -67,7 +79,8 @@ for SEED in $SEEDS; do
   if [ ! -f "$W/run.json" ]; then
     say "preparing seed $SEED"
     (cd "$REPO" && uv run python deploy/gpu/pilot.py prepare --workdir "$W" --n "$N" --epochs "$EPOCHS" \
-      --seed "$SEED" --ood-n "$OOD_N" --save-steps "$SAVE_STEPS" --gpu-hourly-usd "$GPU_USD_PER_HOUR") 2>&1 | tee -a "$LOG"
+      --seed "$SEED" --ood-n "$OOD_N" --save-steps "$SAVE_STEPS" --gpu-hourly-usd "$GPU_USD_PER_HOUR" \
+      --profile "$PROFILE_REF" "${DRAFT_ARG[@]}") 2>&1 | tee -a "$LOG"
     [ "${PIPESTATUS[0]}" = 0 ] || die "prepare failed for seed $SEED"
   fi
   if grep -q '"type": "done"' "$W/events.jsonl" 2>/dev/null; then

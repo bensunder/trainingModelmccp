@@ -1,4 +1,11 @@
-"""Training-time rendering helpers for the training engine (Soup `chatml`).
+"""Dataset helpers shared by the build pipeline and tests.
+
+Since model profiles, tool definitions are rendered by the *trainer* with the
+job's profile (trainer/mccp_trainer_entry.py `render_tools`); datasets keep a
+`tools` column. `prerender_tools` below is the legacy Qwen3 hermes rendering,
+kept so tests can prove the Qwen profile is byte-identical to it.
+
+Original notes on the Qwen rendering:
 
 Soup's `chatml` format passes `messages` straight to the tokenizer chat
 template but does not forward a `tools` column. vLLM, at serving time, renders

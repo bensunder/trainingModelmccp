@@ -378,3 +378,28 @@ async def test_canary_gateway_smoke_catches_thinking_on_production_path(
     finally:
         fake_serving.server_thinking_default = False
         fake_serving.gateway_forwards_extra_body = True
+
+
+async def test_tenant_origin_allow_list_blocks_base_model(seeded, platform, fake_serving):
+    """A tenant restricted to US-origin base models cannot promote an adapter
+    built on Qwen (CN publisher); the deny is explicit evidence, not an error."""
+    from mccp.services.core import set_tenant_allowed_origins
+
+    api = seeded
+    assert await set_tenant_allowed_origins(platform, api.tenant_id, ["us", "FR"]) == {"allowed_origins": ["FR", "US"]}
+    job = await submit(api)
+    await PipelineRunner(platform).run_until_idle()
+    job = await get_job(api, job["id"])
+    assert job["lifecycle_status"] == "rejected", job["error"]
+    assert job["error"]["code"] == "policy_denied"
+    assert any(d.startswith("base model origin CN (Qwen/Qwen3-8B) is not allowed") for d in job["error"]["deny"])
+    async with api.client("alice@acme", SUBMIT) as c:
+        ev = (await c.get("/v1/adapters/finance-ops/invoice-triage/versions/1/evidence")).json()
+    assert ev["bundle"]["base_model"]["origin_country"] == "CN"
+    assert ev["bundle"]["tenant_policy"] == {"allowed_base_model_origins": ["FR", "US"]}
+
+    # Removing the restriction restores the previous behaviour for new jobs.
+    assert await set_tenant_allowed_origins(platform, api.tenant_id, []) == {}
+    job2 = await submit(api, job_body(seed=9))
+    await PipelineRunner(platform).run_until_idle()
+    assert (await get_job(api, job2["id"]))["lifecycle_status"] == "pending_approval"

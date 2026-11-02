@@ -99,6 +99,11 @@ class ServingProfile(Strict):
 class Recipe(Strict):
     ref: RecipeRefField
     trainer_image: str = Field(description="Immutable trainer image reference (digest)")
+    profile: str | None = Field(
+        default=None,
+        description="Model profile ref (`profiles/<id>@v<N>.yaml`). Omitted only by pre-profile recipes, "
+        "which resolve to the Qwen3 hermes behaviour they were written for.",
+    )
     base_model: BaseModelRef
     dims: ModelDims
     finetuning_types: list[Literal["qlora", "lora"]] = Field(min_length=1)

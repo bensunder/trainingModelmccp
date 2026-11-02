@@ -28,6 +28,7 @@ RUN uv sync --frozen --no-dev --python /usr/bin/python3.12
 COPY trainer ./trainer
 COPY policy ./policy
 COPY deploy/fleet.yaml ./deploy/fleet.yaml
+COPY profiles ./profiles
 
 # Volume mount points owned by the runtime user (copied into fresh named volumes).
 RUN useradd --uid 10001 --create-home mccp \

@@ -9,10 +9,17 @@ base_models:
   Qwen/Qwen3-8B:
     served_name: qwen3-8b-base
     architecture: qwen3
+  ibm-granite/granite-3.3-8b-instruct:
+    served_name: granite-3.3-8b-base
+    architecture: granite
 architectures:
   qwen3:
     # Dense Qwen3: vLLM packs q/k/v into qkv_proj and gate/up into
     # gate_up_proj internally and maps the unfused PEFT names onto them.
+    lora_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  granite:
+    # GraniteForCausalLM (Llama-like): vLLM maps the unfused PEFT names onto
+    # qkv_proj / gate_up_proj. Confirm with the publish guard on first serve.
     lora_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   qwen3_5:
     # Hybrid Gated-DeltaNet models. Only fused names are accepted; verify

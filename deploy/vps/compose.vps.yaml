@@ -19,6 +19,7 @@ x-cp-env: &cp-env
   AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
   AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
   MCCP_FLEET_PROFILE_PATH: /app/deploy/fleet.yaml
+  MCCP_PROFILES_DIR: /app/profiles
   MCCP_OPA_URL: http://opa:8181
   MCCP_MLFLOW_TRACKING_URI: http://mlflow:5000
   MCCP_GATEWAY_KIND: none

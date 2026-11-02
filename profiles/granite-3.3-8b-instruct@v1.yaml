@@ -1,0 +1,47 @@
+# IBM Granite 3.3 8B Instruct (dense, Llama-like), US origin, Apache-2.0.
+# DRAFT: the tool-rendering strategy below is the expected Granite format but
+# has NOT been proven against the tokenizer. Run `mccp profile validate
+# granite-3.3-8b-instruct@v1` (CPU only, tokenizer download): it pins the
+# revision and template hash, checks dims against config.json, and proves the
+# rendering token-identical to the native template, or reports the diff.
+id: granite-3.3-8b-instruct
+version: 1
+display_name: IBM Granite 3.3 8B Instruct
+base:
+  hf_id: ibm-granite/granite-3.3-8b-instruct
+  license: Apache-2.0
+  origin_country: US
+  publisher: IBM
+  architecture: granite
+dims:
+  parameters: 8170000000
+  hidden_size: 4096
+  intermediate_size: 12800
+  num_layers: 40
+  num_attention_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+tools:
+  strategy: role_message
+  role: available_tools
+  json_mode: per_tool
+  json_indent: 4
+  item_separator: "\n\n"
+reasoning:
+  template_kwarg: thinking
+  open_tag: "<think>"
+  close_tag: "</think>"
+serving:
+  tool_call_parser: granite
+  reasoning_parser: granite
+  lora_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  max_lora_rank: 64
+  min_vram_gb_bf16: 20
+training:
+  target_modules: all-linear
+  qlora_supported: true
+  min_vram_gb_qlora: 12
+notes: >-
+  If validation reports a rendering mismatch (e.g. the template injects a
+  default system prompt when tools are present), adjust `tools` and bump the
+  version; never edit a validated profile in place.

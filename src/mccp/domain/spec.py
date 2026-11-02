@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from .errors import MethodNotEnabled, ValidationFailed
 from .hashing import digest_of
+from .profile import QWEN3_HERMES_TOOLS, ModelProfile, legacy_profile
 from .recipe import BaseModelRef, Recipe, SftHyperparameters, SoupSettings
 from .refs import DatasetRefField, RecipeRefField, Split, SuiteRefField, is_slug
 
@@ -83,10 +84,13 @@ class JobRequest(BaseModel):
         if self.method.type == "sft" and (self.method.dpo is not None or self.method.grpo is not None):
             raise ValidationFailed("method", "only the `sft` section is allowed for type sft")
 
-    def resolve(self, recipe: Recipe) -> "ResolvedConfig":
+    def resolve(
+        self, recipe: Recipe, profile: ModelProfile | None = None, *, allow_draft_profile: bool = False
+    ) -> "ResolvedConfig":
         self.check_method_enabled()
         if recipe.ref != self.recipe:
             raise ValidationFailed("recipe", "recipe mismatch")
+        profile = resolve_profile(recipe, profile, allow_draft=allow_draft_profile)
         if self.finetuning_type not in recipe.finetuning_types:
             raise ValidationFailed("finetuning_type", f"recipe {recipe.ref} does not allow `{self.finetuning_type}`")
         overrides = self.method.sft.hyperparameters if self.method.sft else {}
@@ -123,7 +127,60 @@ class JobRequest(BaseModel):
             training_dataset=self.training_dataset,
             validation_dataset=self.validation_dataset,
             seed=self.seed,
+            profile=profile,
         )
+
+
+def resolve_profile(recipe: Recipe, profile: ModelProfile | None, *, allow_draft: bool) -> ModelProfile:
+    """The profile a job runs with, checked for consistency with the recipe."""
+    if recipe.profile is None:
+        if profile is not None:
+            raise ValidationFailed("profile", f"recipe {recipe.ref} names no profile but {profile.ref} was supplied")
+        return legacy_profile(
+            base_model=recipe.base_model,
+            dims=recipe.dims,
+            chat_template_sha256=recipe.chat_template_sha256,
+            tool_call_parser=recipe.serving.tool_call_parser,
+            reasoning_parser=recipe.serving.reasoning_parser,
+        )
+    if profile is None or profile.ref != recipe.profile:
+        raise ValidationFailed("profile", f"recipe {recipe.ref} requires profile {recipe.profile}")
+    if profile.status != "validated" and not allow_draft:
+        raise ValidationFailed(
+            "profile",
+            f"profile {profile.ref} is {profile.status}: run `mccp profile validate {profile.ref}` first",
+        )
+    b, pb = recipe.base_model, profile.base
+    problems = []
+    if b.id != pb.hf_id:
+        problems.append(f"base model {b.id} != profile {pb.hf_id}")
+    if pb.revision is not None and b.revision != pb.revision:
+        problems.append(f"revision {b.revision} != profile {pb.revision}")
+    if b.license != pb.license:
+        problems.append(f"license {b.license} != profile {pb.license}")
+    if b.architecture != pb.architecture:
+        problems.append(f"architecture {b.architecture} != profile {pb.architecture}")
+    if pb.chat_template_sha256 and recipe.chat_template_sha256 not in ("*", pb.chat_template_sha256):
+        problems.append("chat_template_sha256 differs from the profile")
+    if recipe.dims != profile.dims:
+        problems.append("dims differ from the profile")
+    if recipe.serving.tool_call_parser != profile.serving.tool_call_parser:
+        problems.append(
+            f"tool_call_parser {recipe.serving.tool_call_parser} != profile {profile.serving.tool_call_parser}"
+        )
+    if recipe.serving.reasoning_parser != profile.serving.reasoning_parser:
+        problems.append(
+            f"reasoning_parser {recipe.serving.reasoning_parser} != profile {profile.serving.reasoning_parser}"
+        )
+    if recipe.enable_thinking and profile.reasoning is None:
+        problems.append("recipe enables thinking but the profile has no reasoning mode")
+    if "qlora" in recipe.finetuning_types and not profile.training.qlora_supported:
+        problems.append("profile does not support QLoRA")
+    if problems:
+        raise ValidationFailed(
+            "profile", f"recipe {recipe.ref} is inconsistent with {profile.ref}: " + "; ".join(problems)
+        )
+    return profile
 
 
 class ResolvedConfig(BaseModel):
@@ -146,6 +203,27 @@ class ResolvedConfig(BaseModel):
     training_dataset: DatasetRefField
     validation_dataset: DatasetRefField
     seed: int
+    profile: ModelProfile | None = None  # snapshot; None only for jobs created before profiles
+
+    @property
+    def profile_ref(self) -> str:
+        return self.profile.ref if self.profile else "legacy-qwen3-hermes"
+
+    def chat_template_kwargs(self) -> dict[str, Any]:
+        """Request-side kwargs that keep reasoning in the trained state."""
+        if self.profile is None:
+            return {"enable_thinking": self.enable_thinking}
+        return self.profile.chat_template_kwargs(reasoning_enabled=self.enable_thinking)
+
+    def trainer_chat_spec(self) -> dict[str, Any]:
+        """What the trainer renders with (run.json `chat`)."""
+        if self.profile is None:
+            return {
+                "profile": "legacy-qwen3-hermes",
+                "tools": QWEN3_HERMES_TOOLS.model_dump(mode="json"),
+                "reasoning": {"template_kwarg": "enable_thinking", "open_tag": "<think>", "close_tag": "</think>"},
+            }
+        return self.profile.trainer_spec()
 
     def config_hash(self) -> str:
         return digest_of(self.model_dump(mode="json"))

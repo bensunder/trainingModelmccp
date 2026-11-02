@@ -17,7 +17,7 @@ from mccp.domain.errors import Conflict, Forbidden, NotFound, ValidationFailed
 from mccp.domain.hashing import digest_of, sha256_hex
 from mccp.domain.recipe import Recipe
 from mccp.domain.refs import new_id, new_job_id, require_slug
-from mccp.domain.spec import JobRequest
+from mccp.domain.spec import JobRequest, resolve_profile
 from mccp.domain.status import LifecycleStatus, is_cancellable, job_status
 from mccp.evals.suite import EvalSuite
 from mccp.platform import Platform
@@ -72,6 +72,11 @@ def job_view(job: dict[str, Any]) -> dict[str, Any]:
 async def put_recipe(pf: Platform, p: Principal, body: dict[str, Any]) -> dict[str, Any]:
     _require(p, Principal.ADMIN)
     recipe = Recipe.model_validate(body)
+    if recipe.profile:
+        # Fail at registration, not at first job submit: the profile must exist
+        # and agree with the recipe (status is checked per job, so a recipe can
+        # be registered against a draft profile that is validated later).
+        resolve_profile(recipe, pf.profiles.get(recipe.profile), allow_draft=True)
     canonical = recipe.model_dump(mode="json")
     sha = digest_of(canonical)
     async with tenant_tx(pf.engine, p.tenant_id) as conn:
@@ -219,7 +224,8 @@ async def submit_job(pf: Platform, p: Principal, req: JobRequest, idempotency_ke
         if existing:
             return _replay(existing, request_hash)
         recipe = Recipe.model_validate((await repo.get_recipe(conn, str(req.recipe)))["body"])
-        resolved = req.resolve(recipe)
+        profile = pf.profiles.get(recipe.profile) if recipe.profile else None
+        resolved = req.resolve(recipe, profile, allow_draft_profile=pf.settings.allow_draft_profiles)
         td = req.training_dataset
         await repo.get_dataset_version(conn, td.project, td.name, td.version)
         await repo.get_suite(conn, req.project, req.eval_suite.name, req.eval_suite.version)
@@ -613,6 +619,33 @@ async def create_tenant(pf: Platform, name: str, idp_tenant_id: str, region: str
             data={"name": name},
         )
     return tid
+
+
+async def set_tenant_allowed_origins(pf: Platform, tenant_id: uuid.UUID, origins: list[str]) -> dict[str, Any]:
+    """Restrict which base-model publisher countries a tenant may build on
+    (ISO 3166-1 alpha-2). An empty list removes the restriction."""
+    norm = sorted({o.strip().upper() for o in origins if o.strip()})
+    bad = [o for o in norm if len(o) != 2 or not o.isalpha()]
+    if bad:
+        raise ValidationFailed("origins", f"not ISO 3166-1 alpha-2 codes: {bad}")
+    policy = {"allowed_origins": norm} if norm else {}
+    async with tenant_tx(pf.engine, tenant_id) as conn:
+        r = await conn.execute(
+            text("UPDATE tenants SET base_model_policy = CAST(:p AS jsonb) WHERE id = CAST(:t AS uuid)"),
+            {"p": jsonb(policy), "t": str(tenant_id)},
+        )
+        if r.rowcount != 1:
+            raise NotFound(f"tenant {tenant_id} not found")
+        await append_event(
+            conn,
+            tenant_id,
+            actor="system:admin",
+            action="tenant.base_model_policy",
+            resource_type="tenant",
+            resource_id=str(tenant_id),
+            data=policy,
+        )
+    return policy
 
 
 def _now_ts() -> float:

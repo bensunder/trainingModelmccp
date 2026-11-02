@@ -74,7 +74,7 @@ def ml_bom(*, adapter: dict[str, Any], resolved: dict[str, Any], datasets: list[
                     "modelParameters": {
                         "approach": {"type": "supervised"},
                         "task": "text-generation",
-                        "architectureFamily": "qwen3",
+                        "architectureFamily": base.get("architecture", "unknown"),
                         "modelArchitecture": f"LoRA r={adapter['peft']['r']} on {base['id']}",
                     }
                 },
@@ -82,6 +82,41 @@ def ml_bom(*, adapter: dict[str, Any], resolved: dict[str, Any], datasets: list[
         },
         "components": components,
         "dependencies": [{"ref": adapter_ref, "dependsOn": [c["bom-ref"] for c in components]}],
+    }
+
+
+def _profile_ref(resolved: dict[str, Any]) -> str:
+    p = resolved.get("profile")
+    return f"{p['id']}@v{p['version']}" if p else "legacy-qwen3-hermes"
+
+
+def _serving(resolved: dict[str, Any]) -> dict[str, Any]:
+    p = resolved.get("profile")
+    if not p:
+        return {"tools_rendering": resolved.get("tools_rendering", "qwen3-hermes")}
+    return {"tool_call_parser": p["serving"]["tool_call_parser"], "reasoning_parser": p["serving"]["reasoning_parser"]}
+
+
+def _reasoning_limitation(resolved: dict[str, Any]) -> list[str]:
+    p = resolved.get("profile")
+    kwarg = p["reasoning"]["template_kwarg"] if p and p.get("reasoning") else ("enable_thinking" if not p else None)
+    if kwarg is None:
+        return []
+    state = "enabled" if resolved["enable_thinking"] else "disabled"
+    return [
+        f"Trained with reasoning {state}; serve with chat_template_kwargs.{kwarg}={str(resolved['enable_thinking']).lower()}."
+    ]
+
+
+def base_model_block(resolved: dict[str, Any]) -> dict[str, Any]:
+    """Base model identity for the gate, including publisher origin from the
+    profile snapshot (unknown for jobs created before profiles)."""
+    p = resolved.get("profile")
+    return {
+        **resolved["base_model"],
+        "profile": _profile_ref(resolved),
+        "origin_country": p["base"]["origin_country"] if p else None,
+        "publisher": p["base"]["publisher"] if p else None,
     }
 
 
@@ -103,9 +138,9 @@ def model_card(
             "tool_call_parse_rate": summary.get("tool_call_parse_rate"),
             "layers": summary.get("layers"),
         },
-        "serving": {"thinking": resolved["enable_thinking"], "tools_rendering": resolved["tools_rendering"]},
+        "serving": {"thinking": resolved["enable_thinking"], "profile": _profile_ref(resolved), **_serving(resolved)},
         "limitations": [
-            "Trained with thinking disabled; serve with chat_template_kwargs.enable_thinking=false.",
+            *_reasoning_limitation(resolved),
             "QLoRA adapter trained against an NF4 base and served on a bf16 base; scores are from the served artifact.",
             "Not a source of factual knowledge; document facts belong in retrieval.",
         ],
@@ -121,6 +156,7 @@ def evidence_bundle(
     report: dict[str, Any],
     guard: dict[str, Any],
     compute: dict[str, Any],
+    tenant_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Everything the gate decides on. Content-addressed; approvals and target
     are added per decision so one bundle backs staging and production."""
@@ -139,7 +175,8 @@ def evidence_bundle(
         "intended_use": job["request"]["intended_use"],
         "risk_tier": job["risk_tier"],
         "submitter": job["submitted_by"],
-        "base_model": resolved["base_model"],
+        "base_model": base_model_block(resolved),
+        "tenant_policy": {"allowed_base_model_origins": (tenant_policy or {}).get("allowed_origins", [])},
         "artifact": {
             "sha256": adapter["artifact_sha256"],
             "uri": adapter["artifact_uri"],

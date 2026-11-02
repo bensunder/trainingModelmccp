@@ -70,8 +70,11 @@ class TestPipeline:
         assert card["pii"]["passed"] and card["pii"]["placeholders_by_type"]["EMAIL"] == 300
         assert sum(card["split"]["records"].values()) == 300
         row = json.loads(a.files["train.jsonl"].splitlines()[0])
-        assert row["messages"][0]["role"] == "system" and "# Tools" in row["messages"][0]["content"]
+        # Tools stay unrendered (the trainer renders per model profile).
+        assert row["tools"] == TOOLS
+        assert row["messages"][0]["role"] == "system" and "# Tools" not in row["messages"][0]["content"]
         assert row["messages"][-1]["role"] == "assistant"
+        assert a.manifest["params"]["format"] == "chatml+tools/string-args/v2"
         golden = json.loads(a.files["test.jsonl"].splitlines()[0])
         assert golden["tools"] == TOOLS  # golden keeps native tools for eval
         assert "@example.com" not in a.files["test.jsonl"].decode()

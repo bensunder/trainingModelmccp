@@ -94,6 +94,7 @@ services:
       MCCP_VLLM_LORA_ROOT: /var/lib/mccp/lora
       MCCP_VLLM_LORA_ROOT_IN_SERVER: /adapters
       MCCP_FLEET_PROFILE_PATH: /app/deploy/fleet.yaml
+      MCCP_PROFILES_DIR: /app/profiles
       MCCP_LITELLM_BASE_URL: http://litellm:4000
       MCCP_LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       MCCP_LITELLM_VLLM_API_BASE: http://vllm:8000

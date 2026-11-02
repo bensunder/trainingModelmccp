@@ -23,11 +23,13 @@ tenant_app = typer.Typer(help="Tenant onboarding", no_args_is_help=True)
 keys_app = typer.Typer(help="Adapter signing keys", no_args_is_help=True)
 examples_app = typer.Typer(help="Demo data", no_args_is_help=True)
 job_app = typer.Typer(help="Customization jobs (API client)", no_args_is_help=True)
+profile_app = typer.Typer(help="Model profiles (switchable base models)", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 app.add_typer(tenant_app, name="tenant")
 app.add_typer(keys_app, name="keys")
 app.add_typer(examples_app, name="examples")
 app.add_typer(job_app, name="job")
+app.add_typer(profile_app, name="profile")
 
 
 def _settings():
@@ -96,6 +98,65 @@ def tenant_create(
             await pf.close()
 
     typer.echo(str(asyncio.run(run())))
+
+
+@tenant_app.command("set-origins")
+def tenant_set_origins(
+    tenant_id: Annotated[str, typer.Argument(help="Tenant UUID (printed by `tenant create`)")],
+    origins: Annotated[
+        list[str] | None, typer.Argument(help="ISO country codes, e.g. US FR; none = unrestricted")
+    ] = None,
+) -> None:
+    """Restrict which base-model publisher countries this tenant may build on."""
+    from mccp.platform import Platform
+    from mccp.services.core import set_tenant_allowed_origins
+
+    async def run() -> dict[str, Any]:
+        pf = Platform.from_settings(_settings())
+        try:
+            return await set_tenant_allowed_origins(pf, uuid.UUID(tenant_id), origins or [])
+        finally:
+            await pf.close()
+
+    typer.echo(json.dumps(asyncio.run(run())))
+
+
+@profile_app.command("list")
+def profile_list(profiles_dir: Path | None = None) -> None:
+    """Show model profiles with origin, license and validation status."""
+    from mccp.domain.profile import ProfileRegistry
+
+    reg = ProfileRegistry.load(profiles_dir or _settings().profiles_dir)
+    for p in reg.all():
+        typer.echo(
+            f"{p.ref:34} {p.status:9} {p.base.origin_country}  {p.base.license:12} {p.base.hf_id}"
+            f"  tools={p.tools.strategy} parser={p.serving.tool_call_parser}"
+        )
+
+
+@profile_app.command("validate")
+def profile_validate(
+    ref: str,
+    trainer_python: Annotated[
+        str | None, typer.Option(help="Python of the trainer env (transformers); default MCCP_TRAINER_PYTHON")
+    ] = None,
+    profiles_dir: Path | None = None,
+) -> None:
+    """Prove a profile's tool rendering on the real tokenizer (CPU, tokenizer
+    download only). On success pins revision + template hash and records the
+    evidence; on failure prints the first rendering difference."""
+    from mccp.services.profiles import validate_profile
+
+    s = _settings()
+    root = Path(__file__).resolve().parents[2]
+    report = validate_profile(
+        profiles_dir or s.profiles_dir,
+        ref,
+        trainer_python=trainer_python or s.trainer_python,
+        check_script=root / "trainer" / "profile_check.py",
+    )
+    typer.echo(json.dumps(report, indent=2))
+    raise typer.Exit(0 if report.get("ok") else 1)
 
 
 @app.command("storage-init")

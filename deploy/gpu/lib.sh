@@ -13,7 +13,8 @@ MAX_LEN="${MAX_LEN:-4096}"
 MAX_SEQS="${MAX_SEQS:-16}"     # vLLM's default (256) OOMs the warm-up next to a 16 GB bf16 model
 BASE_SERVED="${BASE_SERVED:-qwen3-8b-base}"
 TOOL_PARSER="${TOOL_PARSER:-hermes}"
-REASONING_PARSER="${REASONING_PARSER:-qwen3}"
+REASONING_PARSER="${REASONING_PARSER-qwen3}"   # empty = model has no reasoning parser
+THINKING_KWARG="${THINKING_KWARG-enable_thinking}"  # chat_template kwarg that switches reasoning; empty = none
 
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -65,7 +66,7 @@ stop_vllm() {
 
 _start_vllm() {  # $1 model dir, $2 vlog, $3 = with|without server-side thinking-off default
   local extra=()
-  [ "$3" = with ] && [ -n "$REASONING_PARSER" ] && extra=(--default-chat-template-kwargs '{"enable_thinking": false}')
+  [ "$3" = with ] && [ -n "$THINKING_KWARG" ] && extra=(--default-chat-template-kwargs "{\"$THINKING_KWARG\": false}")
   [ -n "$REASONING_PARSER" ] && extra+=(--reasoning-parser "$REASONING_PARSER")
   say "starting vLLM on $1 (mem=$VLLM_MEM max_len=$MAX_LEN max_seqs=$MAX_SEQS, thinking default: $3)"
   # FlashInfer's JIT sampling kernel fails to build against host CUDA 12 toolkits;

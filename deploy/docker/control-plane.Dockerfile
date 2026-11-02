@@ -23,6 +23,7 @@ WORKDIR /app
 COPY --from=build /app /app
 COPY policy ./policy
 COPY deploy/fleet.yaml ./deploy/fleet.yaml
+COPY profiles ./profiles
 COPY deploy/sql ./deploy/sql
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
 USER mccp

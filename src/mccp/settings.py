@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     vllm_lora_root_in_server: str | None = None
     """Same directory as seen from inside the vLLM container, if it differs."""
     fleet_profile_path: Path = Path("deploy/fleet.yaml")
+    # Model profiles (profiles/<id>@v<N>.yaml). Draft (unvalidated) profiles
+    # are refused for jobs unless explicitly allowed (dev / rehearsal only).
+    profiles_dir: Path = Path("profiles")
+    allow_draft_profiles: bool = False
 
     gateway_kind: Literal["litellm", "none"] = "litellm"
     litellm_base_url: str = "http://127.0.0.1:4000"
