@@ -79,6 +79,9 @@ start_vllm() {  # $1 = "with" | "without" the server-side thinking-off default
   local extra=()
   [ "$1" = with ] && extra=(--default-chat-template-kwargs '{"enable_thinking": false}')
   say "starting vLLM ($1 --default-chat-template-kwargs, mem=$VLLM_MEM, max_len=$MAX_LEN, max_seqs=$MAX_SEQS)"
+  # FlashInfer's JIT sampling kernel fails to build against the host's CUDA toolkit
+  # (toolkit != vLLM's CUDA); the PyTorch-native sampler gives identical outputs.
+  VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}" \
   VLLM_ALLOW_RUNTIME_LORA_UPDATING=True nohup "$VENV/bin/vllm" serve "$WORK/model" \
     --served-model-name qwen3-8b-base --dtype bfloat16 \
     --max-model-len "$MAX_LEN" --gpu-memory-utilization "$VLLM_MEM" --max-num-seqs "$MAX_SEQS" --enforce-eager \
@@ -104,7 +107,7 @@ else
       pkill -f "vllm serve" ; sleep 5
       start_vllm without || { tail -40 "$WORK/vllm.log" | tee -a "$LOG"; die "vLLM did not start (log above)"; }
     else
-      grep -E "Error|error:|out of memory" "$WORK/vllm.log" | grep -v 'File "' | tail -15 | tee -a "$LOG"
+      grep -E "Error|error:|out of memory|FAILED|error " "$WORK/vllm.log" | grep -v 'File "' | grep -v "Engine core initialization failed" | tail -15 | tee -a "$LOG"
       die "vLLM did not start (log above). If it says out of memory: VLLM_MEM=0.95 MAX_LEN=2048 MAX_SEQS=8 bash $0"
     fi
   fi
