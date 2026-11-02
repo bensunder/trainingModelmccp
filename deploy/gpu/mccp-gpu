@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+# mccp-gpu: one command to run MCCP training/benchmark batches on a GPU box.
+#
+# First time on a box (Ubuntu + CUDA, as root):
+#   curl -fsSL https://raw.githubusercontent.com/bensunder/trainingModelmccp/main/deploy/gpu/mccp-gpu | bash -s -- up
+# Afterwards (installed as /usr/local/bin/mccp-gpu):
+#   mccp-gpu up [--queue PROFILE...] [--no-baseline]   set up the box, start the queue runner
+#   mccp-gpu queue add PROFILE [--n N] [--epochs E] [--seeds "42 7"]
+#   mccp-gpu queue list | queue clear
+#   mccp-gpu status                 current run, progress, GPU, cost so far, queue, finished runs
+#   mccp-gpu results                comparison tables of finished runs
+#   mccp-gpu logs                   follow the runner log (Ctrl+C stops following, not the run)
+#   mccp-gpu baseline               (re)enter the frontier-baseline API key and model
+#   mccp-gpu stop [--yes]           stop the runner and free the GPU (queue is kept)
+#   mccp-gpu update                 refresh the code used by *future* runs
+#
+# Guarantees:
+#   * one runner per box (flock); runs execute one after another
+#   * every run executes from its own frozen copy of the code (a release directory
+#     per commit), so updating `main` never changes a run that is in progress
+#   * the API key is read once from the terminal, verified for free, stored
+#     root-only, and never appears on a command line
+#   * waits for GPU work it did not start (e.g. a manual run_batch.sh) to finish
+#   * results and logs land in /workspace (kept by GridShare after Stop)
+# No `set -e` on purpose: every step checks its own result.
+
+MCCP_HOME="${MCCP_HOME:-/root/.mccp}"
+SRC="${MCCP_SRC:-/root/mccp-src}"
+RELEASES="${MCCP_RELEASES:-/root/mccp-releases}"
+RUNS_ROOT="${MCCP_RUNS:-/root/mccp-runs}"
+WORKSPACE="${MCCP_WORKSPACE:-/workspace}"
+REPO_URL="${MCCP_REPO_URL:-https://github.com/bensunder/trainingModelmccp}"
+BRANCH="${MCCP_BRANCH:-main}"
+SESSION="${MCCP_SESSION:-mccp-gpu}"
+BIN_LINK="${MCCP_BIN_LINK:-/usr/local/bin/mccp-gpu}"
+QUEUE="$MCCP_HOME/queue.tsv"      # id <TAB> profile <TAB> n <TAB> epochs <TAB> seeds
+DONE="$MCCP_HOME/done.tsv"        # id <TAB> profile <TAB> rc <TAB> results_dir <TAB> ended_utc
+CURRENT="$MCCP_HOME/current.env"
+CONFIG="$MCCP_HOME/config.env"    # baseline URL/model, GPU rate (not secret)
+SECRETS="$MCCP_HOME/secrets.env"  # API key (0600)
+RUNNER_LOG="$MCCP_HOME/runner.log"
+DEFAULT_PROFILE="qwen3-8b@v1"
+# Process patterns, anchored to the start of the command line so they match the real
+# processes and not a shell or editor whose command text merely mentions them.
+P_BATCH='^(/usr/bin/|/bin/)?bash [^ ]*run_batch\.sh'
+P_TRAINER='^[^ ]*python[0-9.]* [^ ]*mccp_trainer_entry\.py'
+P_VLLM='^[^ ]*vllm serve '
+P_RUNNER='^(/usr/bin/|/bin/)?bash [^ ]*runner\.sh _run$'
+
+export PATH="$HOME/.local/bin:$PATH"
+umask 077
+mkdir -p "$MCCP_HOME"
+
+c_ok() { printf '\033[32m%s\033[0m\n' "$*"; }
+c_warn() { printf '\033[33m%s\033[0m\n' "$*"; }
+log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$RUNNER_LOG"; }
+fail() { printf '\033[31mSTOP: %s\033[0m\n' "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------------ source --
+ensure_src() {  # the tool-owned checkout that new releases are cut from
+  if [ -d "$SRC/.git" ]; then
+    git -C "$SRC" fetch -q origin "$BRANCH" 2>/dev/null || { c_warn "git fetch failed; using the local copy"; return 0; }
+    git -C "$SRC" checkout -q "$BRANCH" 2>/dev/null || git -C "$SRC" checkout -q -B "$BRANCH" "origin/$BRANCH"
+    git -C "$SRC" reset -q --hard "origin/$BRANCH"
+  else
+    git clone -q -b "$BRANCH" "$REPO_URL" "$SRC" || fail "could not clone $REPO_URL"
+  fi
+}
+
+install_link() {
+  local target="$SRC/deploy/gpu/mccp-gpu"
+  [ -w "$(dirname "$BIN_LINK")" ] || return 0
+  printf '#!/usr/bin/env bash\nexec bash %q "$@"\n' "$target" > "$BIN_LINK" && chmod 755 "$BIN_LINK"
+}
+
+# Piped from curl (or run from anywhere else): get the source, then re-exec from it.
+# (When piped, BASH_SOURCE is empty, so SELF is empty and never matches.)
+SELF="$(readlink -f "${BASH_SOURCE[0]:-/dev/stdin}" 2>/dev/null)"
+SRC_SELF="$(readlink -f "$SRC/deploy/gpu/mccp-gpu" 2>/dev/null)"
+if [ "${MCCP_GPU_REEXEC:-0}" != 1 ] && [ "${1:-}" != "_run" ] \
+   && { [ -z "$SRC_SELF" ] || [ ! -f "$SRC_SELF" ] || [ "$SELF" != "$SRC_SELF" ]; }; then
+  command -v git >/dev/null || fail "git is required"
+  ensure_src
+  install_link
+  MCCP_GPU_REEXEC=1 exec bash "$SRC/deploy/gpu/mccp-gpu" "$@"
+fi
+
+# ---------------------------------------------------------------- releases --
+release_for() {  # $1 commit -> prints a frozen, installed copy of that commit
+  local sha="$1" rel="$RELEASES/$1"
+  if [ ! -f "$rel/.ready" ]; then
+    rm -rf "$rel" && mkdir -p "$rel"
+    git -C "$SRC" archive "$sha" | tar -x -C "$rel" || return 1
+    touch "$rel/.ready"   # bootstrap.sh installs its environment (uv sync --frozen)
+  fi
+  prune_releases "$sha"
+  echo "$rel"
+}
+
+prune_releases() {  # keep the newest 3 releases plus $1 (never the one a run is using)
+  local keep="$1" in_use="" d
+  [ -f "$CURRENT" ] && in_use="$(grep -E '^RUN_RELEASE=' "$CURRENT" | cut -d= -f2)"
+  find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %f\n' 2>/dev/null | sort -rn | tail -n +4 \
+    | while read -r _ d; do
+        [ "$d" = "$keep" ] || [ "$d" = "$in_use" ] || rm -rf "${RELEASES:?}/$d"
+      done
+}
+
+# ------------------------------------------------------------------- queue --
+with_queue_lock() { (flock 8; "$@") 8>"$MCCP_HOME/queue.lock"; }
+
+_queue_add() {  # profile n epochs seeds
+  local id
+  id="$(date -u +%Y%m%d-%H%M%S)-$(printf '%s' "$1" | tr -c 'a-z0-9.-' '-' | sed 's/-*$//')"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$1" "$2" "$3" "$4" >> "$QUEUE"
+  echo "$id"
+}
+
+_queue_pop_if() {  # remove the first line only if it is still item $1
+  [ -s "$QUEUE" ] || return 0
+  if [ "$(head -1 "$QUEUE" | cut -f1)" = "$1" ]; then
+    tail -n +2 "$QUEUE" > "$QUEUE.tmp" && mv "$QUEUE.tmp" "$QUEUE"
+  fi
+}
+
+valid_profile() {  # profile must exist in the source checkout
+  [ -f "$SRC/profiles/$1.yaml" ] || fail "unknown profile $1 (available: $(find "$SRC/profiles" -maxdepth 1 -name '*.yaml' -printf '%f ' | sed 's/\.yaml//g'))"
+}
+
+cmd_queue() {
+  case "${1:-list}" in
+    add)
+      shift
+      local profile="${1:-}" n=3000 epochs=1 seeds="42 7"
+      [ -n "$profile" ] || fail "usage: mccp-gpu queue add PROFILE [--n N] [--epochs E] [--seeds \"42 7\"]"
+      shift
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --n) n="$2"; shift 2 ;;
+          --epochs) epochs="$2"; shift 2 ;;
+          --seeds) seeds="$2"; shift 2 ;;
+          *) fail "unknown option $1" ;;
+        esac
+      done
+      [[ "$n" =~ ^[0-9]+$ && "$epochs" =~ ^[0-9]+$ && "$seeds" =~ ^[0-9\ ]+$ ]] || fail "--n/--epochs must be numbers, --seeds space-separated numbers"
+      valid_profile "$profile"
+      local id
+      id="$(with_queue_lock _queue_add "$profile" "$n" "$epochs" "$seeds")"
+      c_ok "queued $id ($profile, $n records x $epochs epoch, seeds $seeds)"
+      runner_active || start_runner
+      ;;
+    list)
+      if [ -s "$QUEUE" ]; then
+        awk -F'\t' '{printf "  %d. %s  %s  n=%s e=%s seeds=[%s]\n", NR, $1, $2, $3, $4, $5}' "$QUEUE"
+      else
+        echo "  (queue empty)"
+      fi
+      ;;
+    clear) with_queue_lock bash -c ": > '$QUEUE'"; c_ok "queue cleared (a run in progress continues)" ;;
+    *) fail "usage: mccp-gpu queue add|list|clear" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- baseline --
+cmd_baseline() {
+  local url="${BASELINE_URL:-https://api.openai.com}" key models pick model
+  [ -r /dev/tty ] || fail "needs an interactive terminal"
+  while true; do
+    printf 'OpenAI API key for the frontier baseline (hidden; Enter alone = no baseline): '
+    IFS= read -rs key </dev/tty; echo
+    key="$(printf '%s' "$key" | tr -d '[:space:]')"
+    if [ -z "$key" ]; then
+      printf 'BASELINE_DISABLED=1\n' > "$CONFIG.base"
+      rm -f "$SECRETS"
+      c_warn "no frontier baseline: runs will compare adapter vs base only"
+      break
+    fi
+    local resp
+    resp="$(curl -s -m 20 "$url/v1/models" -H "Authorization: Bearer $key")"
+    if ! printf '%s' "$resp" | grep -q '"data"'; then
+      c_warn "key rejected: $(printf '%s' "$resp" | grep -o '"message": *"[^"]*"' | head -1)"
+      continue
+    fi
+    mapfile -t models < <(printf '%s' "$resp" | grep -o '"id": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' \
+      | grep -E '^(gpt-|o[0-9])' | grep -viE 'audio|realtime|transcribe|tts|image|search|embedding|instruct|codex' | sort)
+    [ "${#models[@]}" -gt 0 ] || { c_warn "this key lists no chat models"; continue; }
+    local default=""
+    for m in "${models[@]}"; do [ "$m" = "gpt-4.1" ] && default="gpt-4.1"; done
+    if [ -n "$default" ]; then
+      printf 'Key OK. Baseline model [Enter = gpt-4.1, or type another id]: '
+      IFS= read -r pick </dev/tty
+      model="${pick:-$default}"
+    else
+      echo "Key OK. Models:"; printf '  %s\n' "${models[@]}"
+      printf 'Type the model id to compare against: '
+      IFS= read -r model </dev/tty
+    fi
+    printf '%s\n' "${models[@]}" | grep -qx "$model" || { c_warn "$model is not in this key's model list"; continue; }
+    printf 'MCCP_BASELINE_API_KEY=%q\n' "$key" > "$SECRETS" && chmod 600 "$SECRETS"
+    printf 'BASELINE_URL=%q\nBASELINE_MODEL=%q\n' "$url" "$model" > "$CONFIG.base"
+    # USD per 1M tokens (in out), list prices; used only for the cost column. Unknown model = no cost figure.
+    local price=""
+    case "$model" in
+      gpt-4.1) price="2 8" ;; gpt-4.1-mini) price="0.4 1.6" ;; gpt-4.1-nano) price="0.1 0.4" ;;
+      gpt-4o) price="2.5 10" ;; gpt-4o-mini) price="0.15 0.6" ;;
+    esac
+    # shellcheck disable=SC2086  # two words on purpose
+    [ -n "$price" ] && printf 'BASELINE_PRICE_IN=%s\nBASELINE_PRICE_OUT=%s\n' ${price} >> "$CONFIG.base"
+    c_ok "frontier baseline: $model (key stored root-only in $SECRETS)"
+    break
+  done
+  { cat "$CONFIG.base"; grep -E '^GPU_RATE_INR=' "$CONFIG" 2>/dev/null || true; } > "$CONFIG.new" && mv "$CONFIG.new" "$CONFIG"
+  rm -f "$CONFIG.base"
+}
+
+# ------------------------------------------------------------------ runner --
+runner_active() {
+  [ -f "$MCCP_HOME/runner.lock" ] || return 1
+  ! flock -n "$MCCP_HOME/runner.lock" true 2>/dev/null
+}
+
+start_runner() {
+  local frozen="$MCCP_HOME/runner.sh"
+  cp "$SRC/deploy/gpu/mccp-gpu" "$frozen" && chmod 700 "$frozen"   # the loop never changes under itself
+  if command -v tmux >/dev/null && [ "${MCCP_GPU_NO_TMUX:-0}" != 1 ]; then
+    tmux has-session -t "$SESSION" 2>/dev/null && tmux kill-session -t "$SESSION"
+    tmux new-session -d -s "$SESSION" "MCCP_GPU_REEXEC=1 bash '$frozen' _run"
+  else
+    MCCP_GPU_REEXEC=1 nohup bash "$frozen" _run >> "$RUNNER_LOG" 2>&1 &
+  fi
+  sleep 1
+  c_ok "runner started (tmux session '$SESSION'); safe to disconnect. Check with: mccp-gpu status"
+}
+
+foreign_gpu_work() { pgrep -f "$P_BATCH" >/dev/null || pgrep -f "$P_TRAINER" >/dev/null; }
+
+cmd_run() {  # internal: the queue loop (exactly one per box)
+  exec 9>"$MCCP_HOME/runner.lock"
+  flock -n 9 || { echo "a runner is already active"; exit 0; }
+  log "runner up (pid $$)"
+  while true; do
+    local item
+    item="$(head -1 "$QUEUE" 2>/dev/null)"
+    if [ -z "$item" ]; then
+      rm -f "$CURRENT"; log "queue empty; runner exiting"; exit 0
+    fi
+    local id profile n epochs seeds
+    IFS=$'\t' read -r id profile n epochs seeds <<<"$item"
+    if foreign_gpu_work; then
+      log "waiting for GPU work started outside mccp-gpu to finish (checks every 60 s)"
+      while foreign_gpu_work; do sleep 60; done
+    fi
+    git -C "$SRC" fetch -q origin "$BRANCH" 2>/dev/null
+    local sha rel
+    sha="$(git -C "$SRC" rev-parse "origin/$BRANCH" 2>/dev/null || git -C "$SRC" rev-parse HEAD)"
+    log "run $id: $profile n=$n epochs=$epochs seeds=[$seeds] from commit ${sha:0:7}"
+    rel="$(release_for "$sha")" || { log "could not prepare release ${sha:0:7}"; break; }
+    if [ "${MCCP_GPU_SKIP_BOOTSTRAP:-0}" != 1 ]; then
+      if ! REPO="$rel" BOOTSTRAP_NO_GIT=1 LOG="$MCCP_HOME/bootstrap.log" bash "$rel/deploy/gpu/bootstrap.sh" >> "$RUNNER_LOG" 2>&1; then
+        log "bootstrap failed (see $MCCP_HOME/bootstrap.log); queue paused"; break
+      fi
+    fi
+    local runs="$RUNS_ROOT/$id" dest="$WORKSPACE/mccp-$id"
+    printf 'RUN_ID=%q\nRUN_PROFILE=%q\nRUN_RELEASE=%q\nRUN_STARTED=%q\nRUN_DIR=%q\nRUN_DEST=%q\n' \
+      "$id" "$profile" "$sha" "$(date +%s)" "$runs" "$dest" > "$CURRENT"
+    (
+      set -a
+      # shellcheck disable=SC1090
+      [ -f "$CONFIG" ] && . "$CONFIG"
+      # shellcheck disable=SC1090
+      [ -f "$SECRETS" ] && . "$SECRETS"
+      set +a
+      if [ "${BASELINE_DISABLED:-0}" = 1 ]; then unset BASELINE_URL BASELINE_MODEL MCCP_BASELINE_API_KEY; fi
+      PROFILE="$profile" N="$n" EPOCHS="$epochs" SEEDS="$seeds" RUNS="$runs" DEST="$dest" REPO="$rel" \
+        bash "${MCCP_GPU_BATCH_CMD:-$rel/deploy/gpu/run_batch.sh}"
+    ) >> "$RUNNER_LOG" 2>&1
+    local rc=$?
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$profile" "$rc" "$dest" "$(date -u +%FT%TZ)" >> "$DONE"
+    with_queue_lock _queue_pop_if "$id"
+    rm -f "$CURRENT"
+    if [ "$rc" != 0 ]; then
+      log "run $id FAILED (exit $rc); queue paused so no more GPU time is spent. See: mccp-gpu logs"
+      break
+    fi
+    log "run $id done: $dest/comparison.md"
+  done
+}
+
+# ------------------------------------------------------------------- status --
+cmd_status() {
+  local rate=30.5
+  [ -f "$CONFIG" ] && rate="$(grep -E '^GPU_RATE_INR=' "$CONFIG" | cut -d= -f2)" && rate="${rate:-30.5}"
+  if runner_active; then c_ok "runner: active"; else echo "runner: idle"; fi
+  if [ -f "$CURRENT" ]; then
+    # shellcheck disable=SC1090
+    . "$CURRENT"
+    local secs=$(( $(date +%s) - RUN_STARTED ))
+    printf 'current: %s  (%s, commit %s)\n' "$RUN_ID" "$RUN_PROFILE" "${RUN_RELEASE:0:7}"
+    printf 'elapsed: %dh%02dm   est. GPU cost so far: INR %s\n' $((secs / 3600)) $((secs % 3600 / 60)) \
+      "$(awk -v s="$secs" -v r="$rate" 'BEGIN{printf "%.0f", s/3600*r}')"
+    local tl
+    tl="$(find "$RUN_DIR" -mindepth 2 -maxdepth 2 -name train.log -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+    [ -n "$tl" ] && printf 'training: %s  %s\n' "$(basename "$(dirname "$tl")")" \
+      "$(tail -c 400 "$tl" | tr '\r' '\n' | grep -aE '[0-9]+/[0-9]+ \[' | tail -1 | sed 's/^ *//')"
+    printf 'last event: %s\n' "$(grep -aE '^\[' "$RUNNER_LOG" 2>/dev/null | tail -1)"
+  fi
+  if command -v nvidia-smi >/dev/null; then
+    printf 'GPU: %s\n' "$(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null)"
+  fi
+  if foreign_gpu_work && [ ! -f "$CURRENT" ]; then c_warn "GPU busy with a run started outside mccp-gpu"; fi
+  echo "queue:"; cmd_queue list
+  if [ -s "$DONE" ]; then
+    echo "finished:"
+    tail -5 "$DONE" | awk -F'\t' '{printf "  %s  %s  %s  %s\n", $1, $2, ($3=="0"?"ok":"FAILED rc=" $3), $4}'
+  fi
+}
+
+cmd_results() {
+  [ -s "$DONE" ] || { echo "no finished runs yet"; return 0; }
+  while IFS=$'\t' read -r id profile rc dest _; do
+    echo "=== $id ($profile) ==="
+    if [ "$rc" = 0 ] && [ -f "$dest/comparison.md" ]; then cat "$dest/comparison.md"; else echo "(no results: rc=$rc)"; fi
+    echo
+  done < "$DONE"
+}
+
+cmd_stop() {
+  if [ "${1:-}" != "--yes" ]; then
+    [ -r /dev/tty ] || fail "use: mccp-gpu stop --yes"
+    printf 'Stop the runner and any training/vLLM on this box? The queue is kept. [y/N] '
+    local a; IFS= read -r a </dev/tty; [ "$a" = y ] || [ "$a" = Y ] || { echo "cancelled"; return 0; }
+  fi
+  command -v tmux >/dev/null && tmux kill-session -t "$SESSION" 2>/dev/null
+  local p
+  for p in "$P_RUNNER" "$P_BATCH" "$P_TRAINER" "$P_VLLM"; do pkill -f "$p" 2>/dev/null; done
+  sleep 3
+  for p in "$P_RUNNER" "$P_BATCH" "$P_TRAINER" "$P_VLLM"; do pkill -9 -f "$p" 2>/dev/null; done
+  rm -f "$CURRENT"
+  c_ok "stopped; the interrupted run stays first in the queue. Resume with: mccp-gpu up (training continues from its last checkpoint)"
+}
+
+cmd_up() {
+  local queue_profiles=() no_baseline=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --queue) shift; while [ $# -gt 0 ] && [[ "$1" != --* ]]; do queue_profiles+=("$1"); shift; done ;;
+      --no-baseline) no_baseline=1; shift ;;
+      *) fail "unknown option $1 (see: mccp-gpu help)" ;;
+    esac
+  done
+  [ "$(id -u)" = 0 ] || [ "${MCCP_GPU_ALLOW_NONROOT:-0}" = 1 ] || fail "run as root"
+  echo "== MCCP GPU box setup =="
+  if [ "${MCCP_GPU_SKIP_BOOTSTRAP:-0}" != 1 ]; then
+    local sha rel
+    sha="$(git -C "$SRC" rev-parse HEAD)"
+    rel="$(release_for "$sha")" || fail "could not prepare release ${sha:0:7}"
+    REPO="$rel" BOOTSTRAP_NO_GIT=1 LOG="$MCCP_HOME/bootstrap.log" bash "$rel/deploy/gpu/bootstrap.sh" \
+      || fail "bootstrap failed (details above)"
+  fi
+  if [ "$no_baseline" = 1 ]; then
+    { echo BASELINE_DISABLED=1; grep -E '^GPU_RATE_INR=' "$CONFIG" 2>/dev/null || true; } > "$CONFIG.new" && mv "$CONFIG.new" "$CONFIG"
+    rm -f "$SECRETS"
+  elif [ ! -f "$CONFIG" ]; then
+    cmd_baseline
+  else
+    echo "baseline: $(grep -E '^BASELINE_(MODEL|DISABLED)=' "$CONFIG" | head -1)  (change with: mccp-gpu baseline)"
+  fi
+  local p
+  for p in "${queue_profiles[@]}"; do valid_profile "$p"; with_queue_lock _queue_add "$p" 3000 1 "42 7" >/dev/null; done
+  if [ ! -s "$QUEUE" ]; then
+    c_warn "queue is empty. Add a run, e.g.: mccp-gpu queue add $DEFAULT_PROFILE"
+    return 0
+  fi
+  runner_active && { c_ok "runner already active"; return 0; }
+  start_runner
+}
+
+case "${1:-help}" in
+  up) shift; cmd_up "$@" ;;
+  queue) shift; cmd_queue "$@" ;;
+  status) cmd_status ;;
+  results) cmd_results ;;
+  logs) tail -n 40 -f "$RUNNER_LOG" ;;
+  baseline) cmd_baseline ;;
+  stop) shift; cmd_stop "$@" ;;
+  update) ensure_src; install_link; c_ok "code updated to $(git -C "$SRC" log -1 --format='%h %s'); applies to future runs" ;;
+  _run) cmd_run ;;
+  help|-h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) fail "unknown command $1 (see: mccp-gpu help)" ;;
+esac

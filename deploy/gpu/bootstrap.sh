@@ -31,7 +31,9 @@ if ! command -v uv >/dev/null; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
-if [ -d "$REPO/.git" ]; then
+if [ "${BOOTSTRAP_NO_GIT:-0}" = 1 ]; then
+  say "using pinned release at $REPO (no git update)"
+elif [ -d "$REPO/.git" ]; then
   say "updating repo"
   git -C "$REPO" fetch -q origin "$BRANCH" || die "git fetch failed"
   if [ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]; then
@@ -42,7 +44,7 @@ if [ -d "$REPO/.git" ]; then
 else
   die "$REPO is not a git clone (git clone https://github.com/bensunder/trainingModelmccp $REPO)"
 fi
-say "repo at $(git -C "$REPO" log -1 --format='%h %s')"
+[ "${BOOTSTRAP_NO_GIT:-0}" = 1 ] || say "repo at $(git -C "$REPO" log -1 --format='%h %s')"
 
 say "control-plane environment (uv.lock)"
 (cd "$REPO" && uv sync --frozen --no-dev >>"$LOG" 2>&1) || die "uv sync failed; see $LOG"
@@ -58,4 +60,4 @@ uv pip install --python "$TRAINER_PY" --require-hashes -r "$REPO/trainer/require
 
 ensure_vllm_venv || die "vLLM install failed; see $LOG"
 ensure_key || die "could not create the vLLM API key"
-say "BOOTSTRAP OK. Next: bash $REPO/deploy/gpu/run_batch.sh   (inside tmux)"
+say "BOOTSTRAP OK"

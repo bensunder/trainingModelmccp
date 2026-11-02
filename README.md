@@ -171,7 +171,7 @@ Base models are switchable: a recipe names a profile (`profiles/<id>@v<N>.yaml`)
 
 ## Benchmark kit
 
-`deploy/gpu/run_batch.sh` runs a multi-seed batch and scores each adapter on the held-out split and an out-of-distribution set, against the base model and optionally a prompted frontier model, with latency and cost per 1,000 decisions. `deploy/gpu/bootstrap.sh` sets up a fresh GPU box in one command. See [docs/benchmark.md](docs/benchmark.md).
+`deploy/gpu/run_batch.sh` runs a multi-seed batch and scores each adapter on the held-out split and an out-of-distribution set, against the base model and optionally a prompted frontier model, with latency and cost per 1,000 decisions. On a GPU box, `mccp-gpu up --queue <profile>` (one `curl | bash` line) sets the box up, asks once for the baseline key, and runs queued batches in the background; `mccp-gpu status` / `results` show progress and tables. See [docs/benchmark.md](docs/benchmark.md).
 
 ## Still not verified
 

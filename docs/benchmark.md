@@ -9,7 +9,34 @@
 | Why not just prompt a frontier model? | The same teacher-forced items go to any OpenAI-compatible endpoint (OpenAI, Azure OpenAI, LiteLLM) with identical tools and system prompt. |
 | What does it cost and how fast is it? | Per target: p50/p95 latency, tokens, and USD per 1,000 triage decisions (token prices for hosted models; GPU $/h x eval wall time for self-hosted, an upper bound because eval concurrency is not tuned serving). |
 
-## Run it (GPU box, Ubuntu + CUDA, >= 20 GB VRAM)
+## Run it: one command (GPU box, Ubuntu + CUDA, >= 20 GB VRAM, as root)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bensunder/trainingModelmccp/main/deploy/gpu/mccp-gpu | bash -s -- up --queue qwen3-8b@v1
+```
+
+That one line: installs the `mccp-gpu` command, checks network/driver/disk, installs the environments, asks once for
+the OpenAI key (hidden; verified for free against `/v1/models`; Enter alone = no frontier baseline; Enter at the model
+prompt = `gpt-4.1`), and starts a background runner in tmux that works through the queue. You can close the terminal.
+
+| Command | What it does |
+|---|---|
+| `mccp-gpu status` | Runner state, current run, training step and ETA, GPU use, rupees spent so far, queue, finished runs |
+| `mccp-gpu queue add granite-3.3-8b-instruct@v1` | Queue another batch (options `--n 3000 --epochs 1 --seeds "42 7"`); runs after the current one |
+| `mccp-gpu results` | Prints each finished run's `comparison.md` |
+| `mccp-gpu logs` | Follows the runner log (Ctrl+C stops following, not the run) |
+| `mccp-gpu up` | Resumes the queue after a failure or `stop` (training continues from its last checkpoint) |
+| `mccp-gpu stop` | Stops the runner, training and vLLM so the box can be stopped; the queue is kept |
+| `mccp-gpu baseline` | Re-enter the key or change the baseline model |
+| `mccp-gpu update` | Refreshes the code used by future runs |
+
+Guarantees: one runner per box (lock), runs execute one after another, each run uses a frozen copy of the commit it
+started from (updating `main` never changes a run in progress), a failed run pauses the queue so no more GPU time is
+spent, GPU work started by hand is waited for, and results land in `/workspace/mccp-<run id>/` (kept by GridShare after
+Stop). The key is stored in `/root/.mccp/secrets.env` (mode 600) and never appears on a command line or in a log.
+State lives in `/root/.mccp` (queue, finished runs, runner log).
+
+## Run it by hand (advanced)
 
 ```bash
 git clone https://github.com/bensunder/trainingModelmccp /root/mccp     # first time only

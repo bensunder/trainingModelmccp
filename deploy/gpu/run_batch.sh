@@ -37,7 +37,7 @@ MODEL_CACHE="${MODEL_CACHE:-/root/models/$PROFILE_ID}"
 TAG="n${N}-e${EPOCHS}"
 [ "$PROFILE_REF" = "qwen3-8b@v1" ] || TAG="$PROFILE_ID-$TAG"
 LOG="$RUNS/batch-$TAG.log"
-DEST="/workspace/mccp-batch-$TAG"
+DEST="${DEST:-/workspace/mccp-batch-$TAG}"
 mkdir -p "$RUNS"
 # shellcheck source=deploy/gpu/lib.sh
 . "$(dirname "$0")/lib.sh"
