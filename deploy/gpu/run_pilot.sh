@@ -18,6 +18,7 @@ PORT=8000
 LOG="$WORK/pilot-run.log"
 VLLM_MEM="${VLLM_MEM:-0.92}"   # fraction of the 20 GB card; lower if vLLM OOMs at start
 MAX_LEN="${MAX_LEN:-4096}"
+MAX_SEQS="${MAX_SEQS:-16}"    # eval sends 4 at a time; vLLM default 256 OOMs the warm-up on 20 GB
 
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$WORK"
@@ -68,10 +69,10 @@ up() { curl -s -m 5 -H "Authorization: Bearer $KEY" "http://127.0.0.1:$PORT/v1/m
 start_vllm() {  # $1 = "with" | "without" the server-side thinking-off default
   local extra=()
   [ "$1" = with ] && extra=(--default-chat-template-kwargs '{"enable_thinking": false}')
-  say "starting vLLM ($1 --default-chat-template-kwargs, mem=$VLLM_MEM, max_len=$MAX_LEN)"
+  say "starting vLLM ($1 --default-chat-template-kwargs, mem=$VLLM_MEM, max_len=$MAX_LEN, max_seqs=$MAX_SEQS)"
   VLLM_ALLOW_RUNTIME_LORA_UPDATING=True nohup "$VENV/bin/vllm" serve "$WORK/model" \
     --served-model-name qwen3-8b-base --dtype bfloat16 \
-    --max-model-len "$MAX_LEN" --gpu-memory-utilization "$VLLM_MEM" --enforce-eager \
+    --max-model-len "$MAX_LEN" --gpu-memory-utilization "$VLLM_MEM" --max-num-seqs "$MAX_SEQS" --enforce-eager \
     --enable-lora --max-loras 1 --max-lora-rank 16 \
     --enable-auto-tool-choice --tool-call-parser hermes --reasoning-parser qwen3 \
     "${extra[@]}" --host 127.0.0.1 --port "$PORT" --api-key "$KEY" \
@@ -94,8 +95,8 @@ else
       pkill -f "vllm serve" ; sleep 5
       start_vllm without || { tail -40 "$WORK/vllm.log" | tee -a "$LOG"; die "vLLM did not start (log above)"; }
     else
-      tail -40 "$WORK/vllm.log" | tee -a "$LOG"
-      die "vLLM did not start (log above). If it says out of memory: VLLM_MEM=0.95 MAX_LEN=2048 bash $0"
+      grep -E "Error|error:|out of memory" "$WORK/vllm.log" | grep -v 'File "' | tail -15 | tee -a "$LOG"
+      die "vLLM did not start (log above). If it says out of memory: VLLM_MEM=0.95 MAX_LEN=2048 MAX_SEQS=8 bash $0"
     fi
   fi
 fi
