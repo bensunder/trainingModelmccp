@@ -180,13 +180,61 @@ class TestOpenAICompatClient:
             return httpx.Response(401, json={"error": {"message": "bad key"}})
 
         c = _client(handler, breaker_threshold=3)
-        for _ in range(3):
-            with pytest.raises(RuntimeError, match="HTTP 401"):
-                await c.chat({"model": "m", "messages": []})
-        assert calls["n"] == 3  # one attempt each: 401 is not retryable
+        with pytest.raises(RuntimeError, match="HTTP 401"):
+            await c.chat({"model": "m", "messages": []})
+        assert calls["n"] == 1  # a bad key is account-level: no retry, breaker opens at once
+        with pytest.raises(CircuitOpen, match="bad key"):
+            await c.chat({"model": "m", "messages": []})
+        assert calls["n"] == 1
+
+    async def test_no_credit_429_is_fatal_not_retried(self):
+        calls = {"n": 0}
+        body = {
+            "error": {
+                "message": "You have no credits remaining.",
+                "type": "insufficient_quota",
+                "code": "credit_balance_exhausted",
+            }
+        }
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(429, headers={"retry-after": "0"}, json=body)
+
+        c = _client(handler)
+        with pytest.raises(RuntimeError, match="HTTP 429"):
+            await c.chat({"model": "m", "messages": []})
+        assert calls["n"] == 1 and "credit_balance_exhausted" in (c.fatal_error or "")
         with pytest.raises(CircuitOpen):
             await c.chat({"model": "m", "messages": []})
-        assert calls["n"] == 3
+        assert calls["n"] == 1
+
+    async def test_rate_limit_429_still_retried(self):
+        calls = {"n": 0}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(429, headers={"retry-after": "0"}, json={"error": {"message": "Rate limit"}})
+            return httpx.Response(200, json=OK)
+
+        c = _client(handler)
+        await c.chat({"model": "m", "messages": []})
+        assert calls["n"] == 2 and c.fatal_error is None
+
+    async def test_drop_params_preapplied(self):
+        bodies = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(req.content))
+            return httpx.Response(200, json=OK)
+
+        c = _client(handler, drop_params=("temperature", "seed"))
+        await c.chat({"model": "m", "messages": [], "temperature": 0, "seed": 1, "max_tokens": 5})
+        assert len(bodies) == 1 and "temperature" not in bodies[0] and "seed" not in bodies[0]
+        assert bodies[0]["max_tokens"] == 5
+        with pytest.raises(ValueError):
+            OpenAICompatClient("http://x", "k", drop_params=("top_p",))
 
 
 # --------------------------------------------------------------- scoring --

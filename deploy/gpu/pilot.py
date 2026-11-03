@@ -279,22 +279,47 @@ def _frontier_target(args: argparse.Namespace) -> tuple[Target, OpenAICompatClie
     key = os.environ.get(args.baseline_key_env)
     if not key:
         raise SystemExit(f"set the frontier API key in ${args.baseline_key_env} (never on the command line)")
-    client = OpenAICompatClient(args.baseline_url, key, auth=args.baseline_auth, timeout=args.timeout)
+    drop = tuple(x.strip() for x in (args.baseline_drop or "").split(",") if x.strip())
+    try:
+        extra = json.loads(args.baseline_extra_body) if args.baseline_extra_body else {}
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"--baseline-extra-body is not valid JSON: {e}") from e
+    if not isinstance(extra, dict):
+        raise SystemExit("--baseline-extra-body must be a JSON object")
+    client = OpenAICompatClient(args.baseline_url, key, auth=args.baseline_auth, timeout=args.timeout, drop_params=drop)
 
     async def chat(payload: dict[str, Any]) -> dict[str, Any]:
-        return await client.chat({**payload, "parallel_tool_calls": False})
+        # One call per turn, like the adapter; only meaningful (and only allowed) with tools.
+        return await client.chat({**payload, "parallel_tool_calls": False} if payload.get("tools") else payload)
 
     target = Target(
         name="frontier",
         kind="frontier",
         model=args.baseline_model,
         chat=chat,
-        extra_body={},  # no vLLM-only fields (chat_template_kwargs) to a hosted API
+        extra_body=extra,  # provider fields only (e.g. Kimi `thinking`); never vLLM's chat_template_kwargs
         concurrency=args.baseline_concurrency,
         usd_per_m_input=args.baseline_price_in,
         usd_per_m_output=args.baseline_price_out,
     )
     return target, client
+
+
+async def _frontier_preflight(target: Target) -> str | None:
+    """One tiny call before hundreds of real ones. Returns why the frontier must be
+    skipped (bad key, no credit, unknown model), or None when it answered."""
+    try:
+        await target.chat(
+            {
+                "model": target.model,
+                "messages": [{"role": "user", "content": "Reply OK."}],
+                "max_tokens": 16,
+                **target.extra_body,
+            }
+        )
+    except Exception as e:  # noqa: BLE001 - reported, the run continues without the frontier row
+        return str(e)[:400]
+    return None
 
 
 async def _evaluate(args: argparse.Namespace) -> int:
@@ -331,6 +356,7 @@ async def _evaluate(args: argparse.Namespace) -> int:
     vllm = VllmClient(args.vllm_url, args.vllm_api_key, timeout=args.timeout)
     static = live = None
     frontier = None
+    frontier_skipped: str | None = None
     loaded = False
     try:
         if {"adapter", "base"} & set(wanted) and not await vllm.has_model(base_served):
@@ -382,8 +408,12 @@ async def _evaluate(args: argparse.Namespace) -> int:
         if "frontier" in wanted:
             ft = _frontier_target(args)
             if ft:
-                targets.append(ft[0])
                 frontier = ft[1]
+                frontier_skipped = await _frontier_preflight(ft[0])
+                if frontier_skipped:
+                    print(f"frontier baseline skipped: {frontier_skipped}", file=sys.stderr)
+                else:
+                    targets.append(ft[0])
         bench = await run_benchmark(sets=sets, targets=targets, suite=suite, max_items=args.max_items)
     except (ServingError, httpx.HTTPError) as e:
         print(f"vLLM error: {type(e).__name__}: {e}", file=sys.stderr)
@@ -405,6 +435,7 @@ async def _evaluate(args: argparse.Namespace) -> int:
         "live_guard": live,
         "benchmark": bench,
         "frontier_adaptations": frontier.adaptations if frontier else None,
+        "frontier_skipped": frontier_skipped,
     }
     if "adapter" in in_dist["targets"]:
         report["verdict"] = _verdict(static, live, in_dist)
@@ -522,6 +553,10 @@ def main() -> int:
     e.add_argument("--baseline-concurrency", type=int, default=8)
     e.add_argument("--baseline-price-in", type=float, help="USD per 1M input tokens")
     e.add_argument("--baseline-price-out", type=float, help="USD per 1M output tokens")
+    e.add_argument(
+        "--baseline-extra-body", help='JSON merged into every frontier request, e.g. {"thinking": {"type": "disabled"}}'
+    )
+    e.add_argument("--baseline-drop", help="comma list of params the provider rejects (temperature,seed,...)")
 
     c = sub.add_parser("compare")
     c.add_argument("reports", nargs="+", help="report.json files")

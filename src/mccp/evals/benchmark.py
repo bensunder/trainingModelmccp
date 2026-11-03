@@ -62,7 +62,25 @@ class OpenAICompatClient:
       are dropped. The adaptation is recorded in `self.adaptations`.
     * A circuit breaker opens after `breaker_threshold` consecutive failures so a
       bad key or dead endpoint fails fast instead of burning the whole run.
+    * Account-level failures (bad key, no credit/quota, suspended account) open
+      the breaker at once: retrying them cannot succeed. The provider's message
+      is kept in `self.fatal_error` for the report.
+    * `drop_params` pre-learns adaptations for providers known to reject a
+      parameter (e.g. Kimi rejects any `temperature` other than its fixed value).
     """
+
+    # Body markers of errors no retry can fix (OpenAI, Azure, Moonshot, LiteLLM wording).
+    _FATAL_MARKERS = (
+        "insufficient_quota",
+        "credit_balance",
+        "no credits",
+        "exceeded your current quota",
+        "billing",
+        "account is suspended",
+        "invalid_api_key",
+        "incorrect api key",
+        "invalid authentication",
+    )
 
     _ADAPTABLE = ("max_tokens", "temperature", "seed", "parallel_tool_calls")
 
@@ -76,6 +94,7 @@ class OpenAICompatClient:
         max_attempts: int = 4,
         breaker_threshold: int = 15,
         retry_after_cap_s: float = 30.0,
+        drop_params: tuple[str, ...] = (),
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.url = base_url.rstrip("/") + "/v1/chat/completions"
@@ -88,7 +107,11 @@ class OpenAICompatClient:
         self.max_attempts = max_attempts
         self.breaker_threshold = breaker_threshold
         self.retry_after_cap_s = retry_after_cap_s
-        self.adaptations: dict[str, str] = {}
+        unknown = set(drop_params) - set(self._ADAPTABLE)
+        if unknown:
+            raise ValueError(f"drop_params must be among {self._ADAPTABLE}; got {sorted(unknown)}")
+        self.adaptations: dict[str, str] = {p: "drop" for p in drop_params}
+        self.fatal_error: str | None = None
         self._consecutive_failures = 0
         self._lock = asyncio.Lock()
 
@@ -98,7 +121,14 @@ class OpenAICompatClient:
 
     @property
     def circuit_open(self) -> bool:
-        return self._consecutive_failures >= self.breaker_threshold
+        return self.fatal_error is not None or self._consecutive_failures >= self.breaker_threshold
+
+    @classmethod
+    def is_fatal(cls, status: int, body: str) -> bool:
+        if status in (401, 402, 403):
+            return True
+        text = body.lower()
+        return status in (400, 429) and any(m in text for m in cls._FATAL_MARKERS)
 
     def _apply_adaptations(self, payload: dict[str, Any]) -> dict[str, Any]:
         p = dict(payload)
@@ -133,6 +163,8 @@ class OpenAICompatClient:
 
     async def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.circuit_open:
+            if self.fatal_error:
+                raise CircuitOpen(f"endpoint refused the account: {self.fatal_error}")
             raise CircuitOpen(f"circuit open after {self._consecutive_failures} consecutive failures")
         last_err = "no attempt made"
         attempt = 0
@@ -149,6 +181,10 @@ class OpenAICompatClient:
                 self._consecutive_failures = 0
                 return r.json()
             last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+            if self.is_fatal(r.status_code, r.text):
+                self.fatal_error = last_err
+                log.error("frontier endpoint refused the account; skipping further calls: %s", last_err)
+                break
             if r.status_code == 400 and adapt_budget > 0 and await self._learn(r.text):
                 adapt_budget -= 1
                 attempt -= 1  # an adaptation retry does not consume a transport attempt
@@ -322,6 +358,7 @@ async def run_target_on_set(
         "l1": summary,
         "calls": stats.summary(),
         "cost": _cost(target, stats, n_decisions),
+        "first_error": next((sc["error"] for sc in scores if sc.get("error")), None),
         "_scores": scores,
     }
 

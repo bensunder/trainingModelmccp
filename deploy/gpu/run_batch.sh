@@ -17,7 +17,9 @@
 #   BASELINE_URL=https://api.openai.com BASELINE_MODEL=gpt-4.1 \
 #   BASELINE_PRICE_IN=2 BASELINE_PRICE_OUT=8 bash /root/mccp/deploy/gpu/run_batch.sh
 #   (Azure OpenAI: BASELINE_URL=https://<resource>.openai.azure.com/openai BASELINE_AUTH=api-key
-#    BASELINE_MODEL=<deployment>.  LiteLLM: BASELINE_URL=http://<host>:4000)
+#    BASELINE_MODEL=<deployment>.  LiteLLM: BASELINE_URL=http://<host>:4000.
+#    Moonshot Kimi: BASELINE_URL=https://api.moonshot.ai BASELINE_MODEL=kimi-k2.6 BASELINE_DROP=temperature
+#    BASELINE_EXTRA_BODY='{"thinking": {"type": "disabled"}}')
 #
 # Safe to re-run: finished prepares, trainings and evaluations are skipped.
 
@@ -123,6 +125,8 @@ for SEED in $SEEDS; do
     ARGS+=(--baseline-url "$BASELINE_URL" --baseline-model "$BASELINE_MODEL" --baseline-auth "${BASELINE_AUTH:-bearer}")
     [ -n "$BASELINE_PRICE_IN" ] && ARGS+=(--baseline-price-in "$BASELINE_PRICE_IN")
     [ -n "$BASELINE_PRICE_OUT" ] && ARGS+=(--baseline-price-out "$BASELINE_PRICE_OUT")
+    [ -n "$BASELINE_EXTRA_BODY" ] && ARGS+=(--baseline-extra-body "$BASELINE_EXTRA_BODY")
+    [ -n "$BASELINE_DROP" ] && ARGS+=(--baseline-drop "$BASELINE_DROP")
   fi
   (cd "$REPO" && uv run python deploy/gpu/pilot.py "${ARGS[@]}") 2>&1 | tee -a "$LOG"
   RC=${PIPESTATUS[0]}

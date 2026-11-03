@@ -16,8 +16,9 @@ curl -fsSL https://raw.githubusercontent.com/bensunder/trainingModelmccp/main/de
 ```
 
 That one line: installs the `mccp-gpu` command, checks network/driver/disk, installs the environments, asks once for
-the OpenAI key (hidden; verified for free against `/v1/models`; Enter alone = no frontier baseline; Enter at the model
-prompt = `gpt-4.1`), and starts a background runner in tmux that works through the queue. You can close the terminal.
+the frontier provider (OpenAI or Moonshot Kimi) and its key (hidden; checked against `/v1/models` plus one tiny test
+completion, a fraction of a cent, so an account without credit is caught at setup; Enter alone = no frontier baseline;
+default model `gpt-4.1` or `kimi-k2.6`), and starts a background runner in tmux that works through the queue. You can close the terminal.
 
 | Command | What it does |
 |---|---|
@@ -55,6 +56,13 @@ BASELINE_URL=https://api.openai.com BASELINE_MODEL=<model> BASELINE_PRICE_IN=<us
 
 - Azure OpenAI: `BASELINE_URL=https://<resource>.openai.azure.com/openai BASELINE_AUTH=api-key BASELINE_MODEL=<deployment>`.
 - LiteLLM: `BASELINE_URL=http://<host>:<port>`.
+- Moonshot Kimi: `BASELINE_URL=https://api.moonshot.ai` (mainland keys: `https://api.moonshot.cn`) `BASELINE_MODEL=kimi-k2.6`
+  `BASELINE_DROP=temperature` `BASELINE_EXTRA_BODY='{"thinking": {"type": "disabled"}}'`. Kimi fixes temperature itself
+  (other values are rejected), and thinking is switched off so it answers within the same token budget as the other
+  targets. `mccp-gpu baseline` sets all of this when you pick Kimi.
+- Account-level failures (bad key, no credit, suspended account) are not retried: one preflight call before the
+  benchmark detects them, the frontier row is skipped with the provider's message in `report.json`
+  (`frontier_skipped`), and the adapter/base evaluation continues.
 - The client retries 429/5xx with backoff, adapts once to providers that reject `max_tokens`, `temperature`, `seed` or `parallel_tool_calls`, and opens a circuit breaker after repeated failures. A target with more than 5% endpoint errors is marked `valid: false` and must not be quoted.
 
 Knobs (environment): `N` (3000), `EPOCHS` (1), `SEEDS` ("42 7"), `OOD_N` (200), `SAVE_STEPS` (100), `GPU_USD_PER_HOUR` (0.35), `VLLM_MEM`, `MAX_LEN`, `MAX_SEQS`.

@@ -162,32 +162,73 @@ cmd_queue() {
 }
 
 # ---------------------------------------------------------------- baseline --
+# Providers: name | base URL(s) to try | model filter | default model | params to drop
+# Kimi: temperature is fixed by the provider (any other value is a 400); thinking is
+# switched off so it answers in the same token budget as the other targets.
+provider_info() {
+  case "$1" in
+    openai) P_NAME="OpenAI"; P_URLS="https://api.openai.com"
+            P_FILTER='^(gpt-|o[0-9])'; P_DEFAULT="gpt-4.1"; P_DROP="" ;;
+    kimi)   P_NAME="Moonshot Kimi"; P_URLS="https://api.moonshot.ai https://api.moonshot.cn"
+            P_FILTER='^kimi-'; P_DEFAULT="kimi-k2.6"; P_DROP="temperature" ;;
+    *) return 1 ;;
+  esac
+}
+
+model_extra() {  # $1 provider $2 model -> request fields for that model
+  case "$1:$2" in
+    kimi:kimi-k2*) echo '{"thinking": {"type": "disabled"}}' ;;
+    kimi:kimi-k3*) echo '{"reasoning_effort": "low"}' ;;
+    *) echo "" ;;
+  esac
+}
+
+model_price() {  # $1 model -> "in out" USD per 1M tokens (list prices; cost column only)
+  case "$1" in
+    gpt-4.1) echo "2 8" ;; gpt-4.1-mini) echo "0.4 1.6" ;; gpt-4.1-nano) echo "0.1 0.4" ;;
+    gpt-4o) echo "2.5 10" ;; gpt-4o-mini) echo "0.15 0.6" ;;
+    kimi-k2.6) echo "0.95 4" ;; kimi-k3) echo "3 15" ;;
+    *) echo "" ;;
+  esac
+}
+
 cmd_baseline() {
-  local url="${BASELINE_URL:-https://api.openai.com}" key models pick model
+  local provider key models pick model url resp
   [ -r /dev/tty ] || fail "needs an interactive terminal"
-  while true; do
-    printf 'OpenAI API key for the frontier baseline (hidden; Enter alone = no baseline): '
+  printf 'Frontier baseline provider: 1) OpenAI  2) Moonshot Kimi  3) none   [1]: '
+  IFS= read -r pick </dev/tty
+  case "${pick:-1}" in 1) provider=openai ;; 2) provider=kimi ;; 3) provider=none ;; *) fail "pick 1, 2 or 3" ;; esac
+  if [ "$provider" = none ]; then
+    printf 'BASELINE_DISABLED=1\n' > "$CONFIG.base"; rm -f "$SECRETS"
+    c_warn "no frontier baseline: runs will compare adapter vs base only"
+  fi
+  [ "$provider" = none ] || provider_info "$provider"
+  while [ "$provider" != none ]; do
+    printf '%s API key (hidden; Enter alone = no baseline): ' "$P_NAME"
     IFS= read -rs key </dev/tty; echo
     key="$(printf '%s' "$key" | tr -d '[:space:]')"
     if [ -z "$key" ]; then
-      printf 'BASELINE_DISABLED=1\n' > "$CONFIG.base"
-      rm -f "$SECRETS"
+      printf 'BASELINE_DISABLED=1\n' > "$CONFIG.base"; rm -f "$SECRETS"
       c_warn "no frontier baseline: runs will compare adapter vs base only"
       break
     fi
-    local resp
-    resp="$(curl -s -m 20 "$url/v1/models" -H "Authorization: Bearer $key")"
-    if ! printf '%s' "$resp" | grep -q '"data"'; then
+    url=""; resp=""
+    local u
+    for u in $P_URLS; do   # Moonshot keys are region-locked: .ai (global) or .cn (mainland)
+      resp="$(curl -s -m 20 "$u/v1/models" -H "Authorization: Bearer $key")"
+      if printf '%s' "$resp" | grep -q '"data"'; then url="$u"; break; fi
+    done
+    if [ -z "$url" ]; then
       c_warn "key rejected: $(printf '%s' "$resp" | grep -o '"message": *"[^"]*"' | head -1)"
       continue
     fi
     mapfile -t models < <(printf '%s' "$resp" | grep -o '"id": *"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' \
-      | grep -E '^(gpt-|o[0-9])' | grep -viE 'audio|realtime|transcribe|tts|image|search|embedding|instruct|codex' | sort)
+      | grep -E "$P_FILTER" | grep -viE 'audio|realtime|transcribe|tts|image|search|embedding|instruct|codex|vision|-code' | sort)
     [ "${#models[@]}" -gt 0 ] || { c_warn "this key lists no chat models"; continue; }
     local default=""
-    for m in "${models[@]}"; do [ "$m" = "gpt-4.1" ] && default="gpt-4.1"; done
+    for m in "${models[@]}"; do [ "$m" = "$P_DEFAULT" ] && default="$P_DEFAULT"; done
     if [ -n "$default" ]; then
-      printf 'Key OK. Baseline model [Enter = gpt-4.1, or type another id]: '
+      printf 'Key OK. Baseline model [Enter = %s, or type another id]: ' "$default"
       IFS= read -r pick </dev/tty
       model="${pick:-$default}"
     else
@@ -196,17 +237,30 @@ cmd_baseline() {
       IFS= read -r model </dev/tty
     fi
     printf '%s\n' "${models[@]}" | grep -qx "$model" || { c_warn "$model is not in this key's model list"; continue; }
+    local extra; extra="$(model_extra "$provider" "$model")"
+    # A listed model is not a funded account: one tiny completion (a fraction of a cent)
+    # catches "no credit" now instead of hours later at evaluation.
+    local body code
+    body="$(printf '{"model": "%s", "messages": [{"role": "user", "content": "Reply OK."}], "max_completion_tokens": 16%s}' \
+      "$model" "${extra:+, ${extra:1:${#extra}-2}}")"
+    [ "$provider" = kimi ] && body="${body/max_completion_tokens/max_tokens}"
+    resp="$(curl -s -m 60 -o /dev/stdout -w '\n%{http_code}' "$url/v1/chat/completions" \
+      -H "Authorization: Bearer $key" -H 'Content-Type: application/json' -d "$body")"
+    code="$(printf '%s' "$resp" | tail -1)"
+    if [ "$code" != 200 ]; then
+      c_warn "test call failed (HTTP $code): $(printf '%s' "$resp" | grep -o '"message": *"[^"]*"' | head -1)"
+      c_warn "fix the account (credit/billing) and enter the key again, or press Enter alone to skip"
+      continue
+    fi
     printf 'MCCP_BASELINE_API_KEY=%q\n' "$key" > "$SECRETS" && chmod 600 "$SECRETS"
-    printf 'BASELINE_URL=%q\nBASELINE_MODEL=%q\n' "$url" "$model" > "$CONFIG.base"
-    # USD per 1M tokens (in out), list prices; used only for the cost column. Unknown model = no cost figure.
-    local price=""
-    case "$model" in
-      gpt-4.1) price="2 8" ;; gpt-4.1-mini) price="0.4 1.6" ;; gpt-4.1-nano) price="0.1 0.4" ;;
-      gpt-4o) price="2.5 10" ;; gpt-4o-mini) price="0.15 0.6" ;;
-    esac
-    # shellcheck disable=SC2086  # two words on purpose
-    [ -n "$price" ] && printf 'BASELINE_PRICE_IN=%s\nBASELINE_PRICE_OUT=%s\n' ${price} >> "$CONFIG.base"
-    c_ok "frontier baseline: $model (key stored root-only in $SECRETS)"
+    {
+      printf 'BASELINE_PROVIDER=%q\nBASELINE_URL=%q\nBASELINE_MODEL=%q\n' "$provider" "$url" "$model"
+      [ -n "$P_DROP" ] && printf 'BASELINE_DROP=%q\n' "$P_DROP"
+      [ -n "$extra" ] && printf 'BASELINE_EXTRA_BODY=%q\n' "$extra"
+      local price; price="$(model_price "$model")"
+      [ -n "$price" ] && printf 'BASELINE_PRICE_IN=%s\nBASELINE_PRICE_OUT=%s\n' "${price% *}" "${price#* }"
+    } > "$CONFIG.base"
+    c_ok "frontier baseline: $P_NAME $model at $url (test call OK; key stored root-only in $SECRETS)"
     break
   done
   { cat "$CONFIG.base"; grep -E '^GPU_RATE_INR=' "$CONFIG" 2>/dev/null || true; } > "$CONFIG.new" && mv "$CONFIG.new" "$CONFIG"
@@ -363,7 +417,7 @@ cmd_up() {
   elif [ ! -f "$CONFIG" ]; then
     cmd_baseline
   else
-    echo "baseline: $(grep -E '^BASELINE_(MODEL|DISABLED)=' "$CONFIG" | head -1)  (change with: mccp-gpu baseline)"
+    echo "baseline: $(grep -E '^BASELINE_(PROVIDER|MODEL|DISABLED)=' "$CONFIG" | tr '\n' ' ')  (change with: mccp-gpu baseline)"
   fi
   local p
   for p in "${queue_profiles[@]}"; do valid_profile "$p"; with_queue_lock _queue_add "$p" 3000 1 "42 7" >/dev/null; done
