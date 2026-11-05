@@ -11,6 +11,7 @@ PORT="${PORT:-8000}"
 VLLM_MEM="${VLLM_MEM:-0.92}"   # fraction of a 20-24 GB card; lower if vLLM OOMs at start
 MAX_LEN="${MAX_LEN:-4096}"
 MAX_SEQS="${MAX_SEQS:-16}"     # vLLM's default (256) OOMs the warm-up next to a 16 GB bf16 model
+EAGER="${EAGER:-1}"            # 1 = --enforce-eager (verified); 0 = CUDA graphs (faster decode, more memory, untested here)
 BASE_SERVED="${BASE_SERVED:-qwen3-8b-base}"
 TOOL_PARSER="${TOOL_PARSER:-hermes}"
 REASONING_PARSER="${REASONING_PARSER-qwen3}"   # empty = model has no reasoning parser
@@ -68,13 +69,14 @@ _start_vllm() {  # $1 model dir, $2 vlog, $3 = with|without server-side thinking
   local extra=()
   [ "$3" = with ] && [ -n "$THINKING_KWARG" ] && extra=(--default-chat-template-kwargs "{\"$THINKING_KWARG\": false}")
   [ -n "$REASONING_PARSER" ] && extra+=(--reasoning-parser "$REASONING_PARSER")
-  say "starting vLLM on $1 (mem=$VLLM_MEM max_len=$MAX_LEN max_seqs=$MAX_SEQS, thinking default: $3)"
+  [ "$EAGER" = 1 ] && extra+=(--enforce-eager)
+  say "starting vLLM on $1 (mem=$VLLM_MEM max_len=$MAX_LEN max_seqs=$MAX_SEQS eager=$EAGER, thinking default: $3)"
   # FlashInfer's JIT sampling kernel fails to build against host CUDA 12 toolkits;
   # the PyTorch-native sampler gives identical outputs.
   VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}" \
   VLLM_ALLOW_RUNTIME_LORA_UPDATING=True nohup "$VENV/bin/vllm" serve "$1" \
     --served-model-name "$BASE_SERVED" --dtype bfloat16 \
-    --max-model-len "$MAX_LEN" --gpu-memory-utilization "$VLLM_MEM" --max-num-seqs "$MAX_SEQS" --enforce-eager \
+    --max-model-len "$MAX_LEN" --gpu-memory-utilization "$VLLM_MEM" --max-num-seqs "$MAX_SEQS" \
     --enable-lora --max-loras 1 --max-lora-rank 16 \
     --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" \
     "${extra[@]}" --host 127.0.0.1 --port "$PORT" --api-key "$KEY" \

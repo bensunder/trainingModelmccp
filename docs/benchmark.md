@@ -83,3 +83,29 @@ Timing on an RTX 4000 Ada (20 GB): about 2.3 h of training per seed at 3,000 rec
 - **field_accuracy_lenient** strips markdown fences before parsing. Compare it with strict JSON validity: a frontier model that wraps valid JSON in fences is not wrong about the invoice, but it would break a strict integration.
 - **by_ood_kind** shows *where* errors are, e.g. `boundary_price_under` (1.1-1.85% variance must still be approved).
 - Items are teacher-forced (gold tool results are supplied), so the numbers measure each decision step, not a free-running agent loop.
+
+## Serving throughput and cost per 1M output tokens (one rented GPU)
+
+Before buying GPUs or committing to 24/7 rental, measure what one rented GPU can serve:
+
+```bash
+mccp-gpu bench --rate <your GridShare INR per hour>          # Qwen3-8B, concurrency 1,5,10, 120 s each
+mccp-gpu bench --adapter /workspace/<run>/  --rate 30.5        # measure a trained LoRA adapter instead of the base
+mccp-gpu bench --eager 0                                       # CUDA graphs instead of --enforce-eager (faster, untested here)
+mccp-gpu results                                               # prints throughput.md
+```
+
+For each concurrency level C the benchmark keeps exactly C requests in flight for the set time (closed loop), streams
+every response and records: output tokens/s across all requests, per-request decode speed, time to first token and
+latency (p50/p95), GPU utilization/memory/power (nvidia-smi, 0.5 s samples), vLLM KV-cache use, queued requests and
+preemptions (vLLM `/metrics`), hours and cost to generate 100M output tokens, and
+
+    cost per 1M output tokens = GPU cost per hour / (output tokens per second x 3600) x 1,000,000
+
+Prompts are real invoice-triage requests (system prompt, tool schemas, invoice text) from the same generator as the
+training data. Output length is fixed per request (vLLM `ignore_eos`) so every level does the same work. Results land in
+`/workspace/mccp-bench-<id>/` (`throughput.md`, `throughput.json`, `bench.log.txt`, `vllm.log.txt`). The command refuses
+to start while training runs, and the training queue waits for a running benchmark. No API calls; only GPU time.
+
+Reading it: GPU memory is mostly vLLM's pre-allocation (`gpu-memory-utilization`), so the KV-cache percentage is the real
+headroom signal; queued requests or preemptions mean the level is past what the GPU (or the 16-sequence limit) sustains.

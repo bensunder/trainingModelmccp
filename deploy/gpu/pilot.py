@@ -481,6 +481,7 @@ def profile_env(args: argparse.Namespace) -> int:
         "PROFILE_STATUS": p.status,
         "PROFILE_ORIGIN": p.base.origin_country,
         "HF_ID": p.base.hf_id,
+        "HF_REVISION": p.base.revision or "",
         "BASE_SERVED": served_base_name(p),
         "TOOL_PARSER": p.serving.tool_call_parser,
         "REASONING_PARSER": p.serving.reasoning_parser or "",

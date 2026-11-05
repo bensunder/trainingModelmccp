@@ -11,6 +11,9 @@
 #   mccp-gpu results                comparison tables of finished runs
 #   mccp-gpu logs                   follow the runner log (Ctrl+C stops following, not the run)
 #   mccp-gpu baseline               (re)enter the frontier-baseline API key and model
+#   mccp-gpu bench [--profile P] [--concurrency 1,5,10] [--duration 120] [--output-tokens 256]
+#                  [--adapter DIR] [--rate INR_PER_HOUR] [--eager 0|1]
+#                                   serving throughput + cost per 1M output tokens (no API calls)
 #   mccp-gpu stop [--yes]           stop the runner and free the GPU (queue is kept)
 #   mccp-gpu update                 refresh the code used by *future* runs
 #
@@ -46,6 +49,10 @@ P_BATCH='^(/usr/bin/|/bin/)?bash [^ ]*run_batch\.sh'
 P_TRAINER='^[^ ]*python[0-9.]* [^ ]*mccp_trainer_entry\.py'
 P_VLLM='^[^ ]*vllm serve '
 P_RUNNER='^(/usr/bin/|/bin/)?bash [^ ]*runner\.sh _run$'
+P_BENCH='^(/usr/bin/|/bin/)?bash [^ ]*bench\.sh$'
+BENCH_SESSION="${MCCP_BENCH_SESSION:-mccp-bench}"
+DEFAULT_GPU_RATE_INR=30.5     # RTX 4000 Ada on GridShare when last checked; override with --rate
+DEFAULT_USD_PER_INR=0.0105    # about INR 95 per USD (Nov 2026); only for the $ column
 
 export PATH="$HOME/.local/bin:$PATH"
 umask 077
@@ -300,9 +307,9 @@ cmd_run() {  # internal: the queue loop (exactly one per box)
     fi
     local id profile n epochs seeds
     IFS=$'\t' read -r id profile n epochs seeds <<<"$item"
-    if foreign_gpu_work; then
-      log "waiting for GPU work started outside mccp-gpu to finish (checks every 60 s)"
-      while foreign_gpu_work; do sleep 60; done
+    if foreign_gpu_work || bench_active; then
+      log "waiting for other GPU work (a benchmark or a manual run) to finish (checks every 60 s)"
+      while foreign_gpu_work || bench_active; do sleep 60; done
     fi
     git -C "$SRC" fetch -q origin "$BRANCH" 2>/dev/null
     local sha rel
@@ -342,8 +349,7 @@ cmd_run() {  # internal: the queue loop (exactly one per box)
 
 # ------------------------------------------------------------------- status --
 cmd_status() {
-  local rate=30.5
-  [ -f "$CONFIG" ] && rate="$(grep -E '^GPU_RATE_INR=' "$CONFIG" | cut -d= -f2)" && rate="${rate:-30.5}"
+  local rate; rate="$(gpu_rate)"
   if runner_active; then c_ok "runner: active"; else echo "runner: idle"; fi
   if [ -f "$CURRENT" ]; then
     # shellcheck disable=SC1090
@@ -361,6 +367,15 @@ cmd_status() {
   if command -v nvidia-smi >/dev/null; then
     printf 'GPU: %s\n' "$(nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null)"
   fi
+  if bench_active; then
+    local bd; bd="$(cat "$MCCP_HOME/bench.last" 2>/dev/null)"
+    c_ok "benchmark: running ($bd)"
+    printf '  last: %s\n' "$(grep -aE '^\[|concurrency|tok/s' "$bd/console.txt" 2>/dev/null | tail -1)"
+  elif [ -f "$MCCP_HOME/bench.last" ]; then
+    local bd; bd="$(cat "$MCCP_HOME/bench.last")"
+    if [ -f "$bd/throughput.md" ]; then echo "last benchmark: done ($bd/throughput.md; mccp-gpu results)"
+    else c_warn "last benchmark ended without results: tail -30 $bd/console.txt"; fi
+  fi
   if foreign_gpu_work && [ ! -f "$CURRENT" ]; then c_warn "GPU busy with a run started outside mccp-gpu"; fi
   echo "queue:"; cmd_queue list
   if [ -s "$DONE" ]; then
@@ -370,27 +385,102 @@ cmd_status() {
 }
 
 cmd_results() {
-  [ -s "$DONE" ] || { echo "no finished runs yet"; return 0; }
-  while IFS=$'\t' read -r id profile rc dest _; do
-    echo "=== $id ($profile) ==="
-    if [ "$rc" = 0 ] && [ -f "$dest/comparison.md" ]; then cat "$dest/comparison.md"; else echo "(no results: rc=$rc)"; fi
-    echo
-  done < "$DONE"
+  local any=0 f
+  if [ -s "$DONE" ]; then
+    any=1
+    while IFS=$'\t' read -r id profile rc dest _; do
+      echo "=== $id ($profile) ==="
+      if [ "$rc" = 0 ] && [ -f "$dest/comparison.md" ]; then cat "$dest/comparison.md"; else echo "(no results: rc=$rc)"; fi
+      echo
+    done < "$DONE"
+  fi
+  for f in "$WORKSPACE"/mccp-bench-*/throughput.md; do
+    [ -f "$f" ] || continue
+    any=1; echo "=== benchmark $(basename "$(dirname "$f")") ==="; cat "$f"; echo
+  done
+  [ "$any" = 1 ] || echo "no finished runs or benchmarks yet"
 }
 
 cmd_stop() {
   if [ "${1:-}" != "--yes" ]; then
     [ -r /dev/tty ] || fail "use: mccp-gpu stop --yes"
-    printf 'Stop the runner and any training/vLLM on this box? The queue is kept. [y/N] '
+    printf 'Stop the runner, any benchmark and any training/vLLM on this box? The queue is kept. [y/N] '
     local a; IFS= read -r a </dev/tty; [ "$a" = y ] || [ "$a" = Y ] || { echo "cancelled"; return 0; }
   fi
-  command -v tmux >/dev/null && tmux kill-session -t "$SESSION" 2>/dev/null
+  command -v tmux >/dev/null && { tmux kill-session -t "$SESSION" 2>/dev/null; tmux kill-session -t "$BENCH_SESSION" 2>/dev/null; }
   local p
-  for p in "$P_RUNNER" "$P_BATCH" "$P_TRAINER" "$P_VLLM"; do pkill -f "$p" 2>/dev/null; done
+  for p in "$P_RUNNER" "$P_BATCH" "$P_BENCH" "$P_TRAINER" "$P_VLLM"; do pkill -f "$p" 2>/dev/null; done
   sleep 3
-  for p in "$P_RUNNER" "$P_BATCH" "$P_TRAINER" "$P_VLLM"; do pkill -9 -f "$p" 2>/dev/null; done
+  for p in "$P_RUNNER" "$P_BATCH" "$P_BENCH" "$P_TRAINER" "$P_VLLM"; do pkill -9 -f "$p" 2>/dev/null; done
   rm -f "$CURRENT"
   c_ok "stopped; the interrupted run stays first in the queue. Resume with: mccp-gpu up (training continues from its last checkpoint)"
+}
+
+gpu_rate() {  # INR per hour: --rate value, else config, else default
+  local r=""
+  [ -f "$CONFIG" ] && r="$(grep -E '^GPU_RATE_INR=' "$CONFIG" | tail -1 | cut -d= -f2)"
+  echo "${r:-$DEFAULT_GPU_RATE_INR}"
+}
+
+set_config() {  # key value: replace or add one line in config.env
+  touch "$CONFIG"
+  { grep -vE "^$1=" "$CONFIG"; printf '%s=%s\n' "$1" "$2"; } > "$CONFIG.new" && mv "$CONFIG.new" "$CONFIG"
+}
+
+bench_active() { { command -v tmux >/dev/null && tmux has-session -t "$BENCH_SESSION" 2>/dev/null; } || pgrep -f "$P_BENCH" >/dev/null; }
+
+cmd_bench() {
+  local profile="$DEFAULT_PROFILE" conc="1,5,10" dur=120 out=256 adapter="" rate="" eager=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile) profile="$2"; shift 2 ;;
+      --concurrency) conc="$2"; shift 2 ;;
+      --duration) dur="$2"; shift 2 ;;
+      --output-tokens) out="$2"; shift 2 ;;
+      --adapter) adapter="$2"; shift 2 ;;
+      --rate) rate="$2"; shift 2 ;;
+      --eager) eager="$2"; shift 2 ;;
+      *) fail "unknown option $1 (see: mccp-gpu help)" ;;
+    esac
+  done
+  [[ "$conc" =~ ^[0-9]+(,[0-9]+)*$ && "$dur" =~ ^[0-9]+$ && "$out" =~ ^[0-9]+$ && "$eager" =~ ^[01]$ ]] \
+    || fail "--concurrency 1,5,10  --duration seconds  --output-tokens N  --eager 0|1"
+  local c; for c in ${conc//,/ }; do [ "$c" -ge 1 ] && [ "$c" -le 16 ] || fail "concurrency $c: allowed 1-16 (vLLM is started with 16 sequences)"; done
+  [ -z "$rate" ] || [[ "$rate" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "--rate must be a number (INR per hour)"
+  [ -z "$adapter" ] || [ -f "$adapter/adapter_config.json" ] || fail "no LoRA adapter at $adapter"
+  valid_profile "$profile"
+  runner_active && fail "the training runner is active; wait for it (mccp-gpu status) or mccp-gpu stop"
+  bench_active && fail "a benchmark is already running (tmux attach -t $BENCH_SESSION)"
+  foreign_gpu_work && fail "GPU busy with work started outside mccp-gpu"
+  [ -n "$rate" ] && set_config GPU_RATE_INR "$rate"
+  rate="$(gpu_rate)"
+  [ "$rate" = "$DEFAULT_GPU_RATE_INR" ] && c_warn "using GPU price INR $rate/h; pass --rate <your GridShare INR/h> if it differs"
+  local sha rel
+  sha="$(git -C "$SRC" rev-parse HEAD)"
+  rel="$(release_for "$sha")" || fail "could not prepare release ${sha:0:7}"
+  if [ "${MCCP_GPU_SKIP_BOOTSTRAP:-0}" != 1 ]; then
+    REPO="$rel" BOOTSTRAP_NO_GIT=1 LOG="$MCCP_HOME/bootstrap.log" bash "$rel/deploy/gpu/bootstrap.sh" \
+      || fail "bootstrap failed (details above)"
+  fi
+  local id dest levels
+  id="$(date -u +%Y%m%d-%H%M%S)-$(printf '%s' "$profile" | tr -c 'a-z0-9.-' '-' | sed 's/-*$//')"
+  dest="$WORKSPACE/mccp-bench-$id"
+  mkdir -p "$dest"
+  levels=$(( $(tr -cd ',' <<<"$conc" | wc -c) + 1 ))
+  local envs
+  envs="$(printf 'REPO=%q DEST=%q PROFILE=%q CONCURRENCY=%q DURATION=%q OUTPUT_TOKENS=%q ADAPTER_DIR=%q GPU_RATE_INR=%q USD_PER_INR=%q EAGER=%q' \
+    "$rel" "$dest" "$profile" "$conc" "$dur" "$out" "$adapter" "$rate" "$DEFAULT_USD_PER_INR" "$eager")"
+  local cmd="$envs bash ${MCCP_GPU_BENCH_CMD:-$rel/deploy/gpu/bench.sh}"
+  if command -v tmux >/dev/null && [ "${MCCP_GPU_NO_TMUX:-0}" != 1 ]; then
+    tmux new-session -d -s "$BENCH_SESSION" "$cmd > '$dest/console.txt' 2>&1"
+  else
+    nohup bash -c "$cmd" > "$dest/console.txt" 2>&1 &
+  fi
+  printf '%s\n' "$dest" > "$MCCP_HOME/bench.last"
+  c_ok "benchmark started: $profile, concurrency [$conc], ${dur}s per level, ${out} output tokens per request"
+  echo "  about $(( (levels * (dur + 30) + 300) / 60 )) min including vLLM start-up (model download adds ~5 min if missing)"
+  echo "  about INR $(awk -v l="$levels" -v d="$dur" -v r="$rate" 'BEGIN{printf "%.0f", (l*(d+30)+300)/3600*r}') of GPU time; no API calls"
+  echo "  results: $dest/throughput.md   check with: mccp-gpu status"
 }
 
 cmd_up() {
@@ -435,10 +525,11 @@ case "${1:-help}" in
   status) cmd_status ;;
   results) cmd_results ;;
   logs) tail -n 40 -f "$RUNNER_LOG" ;;
+  bench) shift; cmd_bench "$@" ;;
   baseline) cmd_baseline ;;
   stop) shift; cmd_stop "$@" ;;
   update) ensure_src; install_link; c_ok "code updated to $(git -C "$SRC" log -1 --format='%h %s'); applies to future runs" ;;
   _run) cmd_run ;;
-  help|-h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) fail "unknown command $1 (see: mccp-gpu help)" ;;
 esac
