@@ -49,7 +49,7 @@ DEFAULT_PROFILE="qwen3-8b@v1"
 # processes and not a shell or editor whose command text merely mentions them.
 P_BATCH='^(/usr/bin/|/bin/)?bash [^ ]*run_batch\.sh'
 P_TRAINER='^[^ ]*python[0-9.]* [^ ]*mccp_trainer_entry\.py'
-P_VLLM='^[^ ]*vllm serve '
+P_VLLM='^[^ ]*(python[0-9.]* +)?[^ ]*vllm serve '
 P_RUNNER='^(/usr/bin/|/bin/)?bash [^ ]*runner\.sh _run$'
 P_BENCH='^(/usr/bin/|/bin/)?bash [^ ]*bench\.sh$'
 BENCH_SESSION="${MCCP_BENCH_SESSION:-mccp-bench}"
