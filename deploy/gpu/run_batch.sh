@@ -48,6 +48,9 @@ METHODS="${METHODS:-sft}"
 TEST_N="${TEST_N:-}"
 TEST_SEED="${TEST_SEED:-7777}"
 RGT_ATTEMPTS="${RGT_ATTEMPTS:-1}"
+MESSY_N="${MESSY_N:-300}"        # messy-invoice eval records (OCR noise, emails, tables, distractors); 0 = off
+EVAL_SETS="in_dist,ood"
+[ "$MESSY_N" -gt 0 ] && EVAL_SETS="in_dist,ood,messy"
 read -r -a SIZE_LIST <<<"${SIZES//,/ }"
 read -r -a METHOD_LIST <<<"${METHODS//,/ }"
 read -r -a SEED_LIST <<<"${SEEDS//,/ }"
@@ -130,6 +133,7 @@ for V in "${VARIANTS[@]}"; do
   PARGS=(prepare --workdir "$W" --n "$S" --epochs "$EPOCHS" --seed "$SEED" --ood-n "$OOD_N"
          --save-steps "$SAVE_STEPS" --gpu-hourly-usd "$GPU_USD_PER_HOUR" --profile "$PROFILE_REF" --method "$M")
   [ -n "$TEST_N" ] && PARGS+=(--test-n "$TEST_N" --test-seed "$TEST_SEED")
+  [ "$MESSY_N" -gt 0 ] && PARGS+=(--messy-n "$MESSY_N")
   if [ "$M" = rgt ] && [ "$RGT_ATTEMPTS" = 1 ]; then
     PARGS+=(--attempts-url "http://127.0.0.1:$PORT" --attempts-key "$KEY" --attempts-model "$BASE_SERVED"
             --attempts-cache "$RUNS/rgt-attempts-$PROFILE_ID.jsonl")
@@ -178,13 +182,16 @@ for V in "${VARIANTS[@]}"; do
     FIRST=0
     continue
   fi
+  if [ "$MESSY_N" -gt 0 ] && [ ! -f "$W/data/golden_messy.jsonl" ]; then  # workdir prepared by older code
+    (cd "$REPO" && uv run python deploy/gpu/pilot.py add-messy --workdir "$W" --n "$MESSY_N") 2>&1 | tee -a "$LOG"
+  fi
   TARGETS=adapter
   if [ "$FIRST" = 1 ]; then
     TARGETS=adapter,base
     [ -n "$BASELINE_URL" ] && TARGETS=adapter,base,frontier
   fi
-  say "evaluating $M n=$S seed $SEED ($TARGETS on in_dist + ood)"
-  ARGS=(evaluate --workdir "$W" --vllm-api-key "$KEY" --targets "$TARGETS" --sets "in_dist,ood"
+  say "evaluating $M n=$S seed $SEED ($TARGETS on $EVAL_SETS)"
+  ARGS=(evaluate --workdir "$W" --vllm-api-key "$KEY" --targets "$TARGETS" --sets "$EVAL_SETS"
         --gpu-usd-per-hour "$GPU_USD_PER_HOUR")
   if [ -n "$BASELINE_URL" ]; then
     ARGS+=(--baseline-url "$BASELINE_URL" --baseline-model "$BASELINE_MODEL" --baseline-auth "${BASELINE_AUTH:-bearer}")

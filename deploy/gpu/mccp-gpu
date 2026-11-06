@@ -16,6 +16,8 @@
 #   mccp-gpu bench [--profile P] [--concurrency 1,5,10] [--duration 120] [--output-tokens 256]
 #                  [--adapter DIR] [--rate INR_PER_HOUR] [--eager 0|1]
 #                                   serving throughput + cost per 1M output tokens (no API calls)
+#   mccp-gpu eval-messy [RUN_ID] [--n 300]
+#                                   score a finished run's adapters on messy invoices (no retraining)
 #   mccp-gpu stop [--yes]           stop the runner and free the GPU (queue is kept)
 #   mccp-gpu update                 refresh the code used by *future* runs
 #
@@ -368,9 +370,10 @@ cmd_status() {
   local rate; rate="$(gpu_rate)"
   if runner_active; then c_ok "runner: active"; else echo "runner: idle"; fi
   if [ -f "$CURRENT" ]; then
-    # shellcheck disable=SC1090
+    # shellcheck disable=SC1090,SC2153  # RUN_* come from this file
     . "$CURRENT"
     local secs=$(( $(date +%s) - RUN_STARTED ))
+    # shellcheck disable=SC2153  # RUN_ID is set by sourcing $CURRENT
     printf 'current: %s  (%s, commit %s)\n' "$RUN_ID" "$RUN_PROFILE" "${RUN_RELEASE:0:7}"
     printf 'elapsed: %dh%02dm   est. GPU cost so far: INR %s\n' $((secs / 3600)) $((secs % 3600 / 60)) \
       "$(awk -v s="$secs" -v r="$rate" 'BEGIN{printf "%.0f", s/3600*r}')"
@@ -501,6 +504,51 @@ cmd_bench() {
   echo "  results: $dest/throughput.md   check with: mccp-gpu status"
 }
 
+cmd_eval_messy() {
+  local run_id="" n=300
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --n) n="$2"; shift 2 ;;
+      -*) fail "unknown option $1" ;;
+      *) run_id="$1"; shift ;;
+    esac
+  done
+  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ] || fail "--n must be a positive number"
+  [ -s "$DONE" ] || fail "no finished runs"
+  local line
+  if [ -n "$run_id" ]; then line="$(awk -F'\t' -v id="$run_id" '$1==id' "$DONE" | tail -1)"
+  else line="$(awk -F'\t' '$3=="0"' "$DONE" | tail -1)"; fi
+  [ -n "$line" ] || fail "no successful finished run${run_id:+ with id $run_id}"
+  local id profile rc dest
+  IFS=$'\t' read -r id profile rc dest _ <<<"$line"
+  [ "$rc" = 0 ] || fail "run $id did not finish successfully (rc=$rc)"
+  [ -d "$RUNS_ROOT/$id" ] || fail "$RUNS_ROOT/$id is gone (machine was stopped?); adapters must still be on this box"
+  runner_active && fail "the training runner is active; wait for it (mccp-gpu status)"
+  bench_active && fail "a benchmark is running"
+  { command -v tmux >/dev/null && tmux has-session -t mccp-messy 2>/dev/null; } && fail "a messy eval is already running (tmux attach -t mccp-messy)"
+  foreign_gpu_work && fail "GPU busy with work started outside mccp-gpu"
+  local sha rel
+  sha="$(git -C "$SRC" rev-parse HEAD)"
+  rel="$(release_for "$sha")" || fail "could not prepare release ${sha:0:7}"
+  if [ "${MCCP_GPU_SKIP_BOOTSTRAP:-0}" != 1 ]; then
+    REPO="$rel" BOOTSTRAP_NO_GIT=1 LOG="$MCCP_HOME/bootstrap.log" bash "$rel/deploy/gpu/bootstrap.sh" \
+      || fail "bootstrap failed (details above)"
+  fi
+  local cmd
+  cmd="$(printf 'RUN_DIR=%q DEST=%q PROFILE=%q MESSY_N=%q REPO=%q' "$RUNS_ROOT/$id" "$dest" "$profile" "$n" "$rel") bash ${MCCP_GPU_MESSY_CMD:-$rel/deploy/gpu/eval_messy.sh}"
+  mkdir -p "$dest"
+  if command -v tmux >/dev/null && [ "${MCCP_GPU_NO_TMUX:-0}" != 1 ]; then
+    tmux new-session -d -s mccp-messy "$cmd > '$dest/eval-messy.console.txt' 2>&1"
+  else
+    nohup bash -c "$cmd" > "$dest/eval-messy.console.txt" 2>&1 &
+  fi
+  local adapters
+  adapters="$(find "$RUNS_ROOT/$id" -mindepth 2 -maxdepth 2 -name report.json | wc -l)"
+  c_ok "messy-invoice eval started for $id ($adapters adapters, $n records each)"
+  echo "  about $(( (adapters * 4) + 3 )) min; about INR $(awk -v a="$adapters" -v r="$(gpu_rate)" 'BEGIN{printf "%.0f", (a*4+3)/60*r}') of GPU time; no API calls"
+  echo "  progress: tail -f $dest/eval-messy.console.txt   results: mccp-gpu results"
+}
+
 cmd_up() {
   local queue_profiles=() no_baseline=0
   while [ $# -gt 0 ]; do
@@ -544,10 +592,11 @@ case "${1:-help}" in
   results) cmd_results ;;
   logs) tail -n 40 -f "$RUNNER_LOG" ;;
   bench) shift; cmd_bench "$@" ;;
+  eval-messy) shift; cmd_eval_messy "$@" ;;
   baseline) cmd_baseline ;;
   stop) shift; cmd_stop "$@" ;;
   update) ensure_src; install_link; c_ok "code updated to $(git -C "$SRC" log -1 --format='%h %s'); applies to future runs" ;;
   _run) cmd_run ;;
-  help|-h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) fail "unknown command $1 (see: mccp-gpu help)" ;;
 esac

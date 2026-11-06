@@ -109,3 +109,26 @@ to start while training runs, and the training queue waits for a running benchma
 
 Reading it: GPU memory is mostly vLLM's pre-allocation (`gpu-memory-utilization`), so the KV-cache percentage is the real
 headroom signal; queued requests or preemptions mean the level is past what the GPU (or the 16-sequence limit) sustains.
+
+## Messy-invoice test set
+
+Every batch now also scores on 300 **messy invoices** (`MESSY_N`, 0 = off): the same cases and labels as the
+training distribution, but the text a real AP queue produces. Six kinds, round-robin, about 30% combining two:
+
+| Kind | What changes |
+|---|---|
+| `ocr_noise` | letter swaps, dropped letters, OCR confusions (rn->m, l->I), random caps and spaces; never touches a digit |
+| `email_forward` | the request arrives as a forwarded email with headers and quoted lines |
+| `table_layout` | invoice header and a line-item table instead of a sentence |
+| `distractor_note` | a human note arguing for the wrong outcome ("vendor confirmed the price, please approve") |
+| `id_format` | PO / vendor ids in house formats (`po#4500012345`, `V 100023`); tool calls must use canonical ids |
+| `currency_format` | `USD 1,234.50`, `1,234.50 USD`, `US$1234.50`, `$1,234.50/ea` |
+
+Labels come from the policy (`decide`) on the PO and vendor records, so they are correct by construction; a test
+re-derives every label from the messy text plus the tool results. Results break down per kind (`by_ood_kind`).
+
+Score an already finished run without retraining (adapters must still be on the box):
+
+```bash
+mccp-gpu eval-messy            # latest successful run; writes report_messy.json per adapter and refreshes curve.md
+```

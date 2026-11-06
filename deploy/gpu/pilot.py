@@ -55,6 +55,7 @@ from mccp.evals.benchmark import (
 from mccp.evals.guard import live_guard, static_guard
 from mccp.evals.suite import EvalSuite
 from mccp.examples.invoices import generate, generate_ood
+from mccp.examples.messy import generate_messy
 from mccp.rgt import Attempt, build_rgt_rows, final_turn_prompt, hinge_rows
 from mccp.rgt.invoices import InvoiceRuleGrader, InvoiceTemplateDistiller
 from mccp.rgt.pairs import prompt_key
@@ -63,7 +64,7 @@ from mccp.training.backends import TrainContext, prepare_workdir
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_PROFILE = "qwen3-8b@v1"
-SET_FILES = {"in_dist": "golden.jsonl", "ood": "golden_ood.jsonl"}
+SET_FILES = {"in_dist": "golden.jsonl", "ood": "golden_ood.jsonl", "messy": "golden_messy.jsonl"}
 
 
 def _jsonl(b: bytes) -> list[dict[str, Any]]:
@@ -342,6 +343,11 @@ def prepare(args: argparse.Namespace) -> int:
     if strategies:
         _write_jsonl(workdir / "data" / "rgt_strategies.jsonl", strategies)
     _write_jsonl(workdir / "data" / SET_FILES["ood"], ood_rows)
+    messy_meta = None
+    if args.messy_n:
+        messy_rows, messy_pii = redact_records(generate_messy(args.messy_n, seed=args.messy_seed))
+        _write_jsonl(workdir / "data" / SET_FILES["messy"], messy_rows)
+        messy_meta = {"records": len(messy_rows), "seed": args.messy_seed, "pii_placeholders": messy_pii}
     run = prepare_workdir(
         TrainContext(
             job_id="pilot",
@@ -373,6 +379,7 @@ def prepare(args: argparse.Namespace) -> int:
         },
         "dataset": {"manifest_sha256": built.manifest_sha256, "card": built.card},
         "ood": {"records": len(ood_rows), "seed": args.ood_seed, "pii_placeholders": ood_pii, "train_overlap": 0},
+        "messy": messy_meta,
         "samples": {"train": len(train_rows), "val": len(val_rows), "golden_records": len(test_rows)},
         "soup_yaml": run["soup_yaml"],
     }
@@ -490,9 +497,14 @@ async def _evaluate(args: argparse.Namespace) -> int:
             print(f"test set `{s}` not found at {path} (re-run prepare)", file=sys.stderr)
             return 2
         sets[s] = _jsonl(path.read_bytes())
-    if "in_dist" not in sets:
-        print("--sets must include in_dist (the verdict is computed on it)", file=sys.stderr)
+    if "in_dist" not in sets and args.report_name == "report.json":
+        print(
+            "--sets must include in_dist for the main report (the verdict is computed on it); "
+            "use --report-name for an additional set",
+            file=sys.stderr,
+        )
         return 2
+    probe_records = sets.get("in_dist") or _jsonl((workdir / "data" / SET_FILES["in_dist"]).read_bytes())
 
     adapter_dir = workdir / "output"
     adapter_name = args.adapter_name or adapter_serving_name(workdir)
@@ -521,7 +533,7 @@ async def _evaluate(args: argparse.Namespace) -> int:
             static = static_guard(
                 adapter_dir, fleet=FleetProfile.load(REPO / "deploy/fleet.yaml"), base_model_id=profile.base.hf_id
             )
-            probe_items = layers.golden_items(sets["in_dist"], suite.effect_probes)
+            probe_items = layers.golden_items(probe_records, suite.effect_probes)
             probes = [{"messages": it.messages, **({"tools": it.tools} if it.tools else {})} for it in probe_items]
             live = await live_guard(
                 vllm,
@@ -577,7 +589,7 @@ async def _evaluate(args: argparse.Namespace) -> int:
         if frontier:
             await frontier.aclose()
 
-    in_dist = bench["sets"]["in_dist"]
+    in_dist = bench["sets"].get("in_dist")
     report: dict[str, Any] = {
         "pilot": pilot_meta,
         "adapter_serving_name": adapter_name if "adapter" in wanted else None,
@@ -587,13 +599,14 @@ async def _evaluate(args: argparse.Namespace) -> int:
         "frontier_adaptations": frontier.adaptations if frontier else None,
         "frontier_skipped": frontier_skipped,
     }
-    if "adapter" in in_dist["targets"]:
+    if in_dist and "adapter" in in_dist["targets"]:
         report["verdict"] = _verdict(static, live, in_dist)
         # Legacy shape (in-distribution adapter vs base), kept for older tooling.
         report["l1"] = {k: v["l1"] for k, v in in_dist["targets"].items() if k in ("adapter", "base")}
-    (workdir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    report_path = workdir / args.report_name
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    summary: dict[str, Any] = {"verdict": report.get("verdict"), "report": str(workdir / "report.json")}
+    summary: dict[str, Any] = {"verdict": report.get("verdict"), "report": str(report_path)}
     for s, body in bench["sets"].items():
         summary[s] = {
             name: {
@@ -713,6 +726,10 @@ def curve_rows(paths: list[Path]) -> list[dict[str, Any]]:
         if ind is None:
             continue
         stages = _stage_seconds(path.parent)
+        messy_path = path.parent / "report_messy.json"
+        messy = json.loads(messy_path.read_text(encoding="utf-8")) if messy_path.exists() else {}
+        m_ad = _l1(messy, "messy", "adapter") or _l1(data, "messy", "adapter")
+        m_base = _l1(messy, "messy", "base") or _l1(data, "messy", "base")
         rgt = meta.get("rgt") or {}
         rows.append(
             {
@@ -729,6 +746,9 @@ def curve_rows(paths: list[Path]) -> list[dict[str, Any]]:
                 "tool_call_in_dist": ind.get("tool_call_accuracy"),
                 "json_validity_in_dist": ind.get("json_validity"),
                 "decision_ood": _mean(ood.get("decision_accuracy")) if ood else None,
+                "decision_messy": _mean(m_ad.get("decision_accuracy")) if m_ad else None,
+                "tool_call_messy": m_ad.get("tool_call_accuracy") if m_ad else None,
+                "base_decision_messy": _mean(m_base.get("decision_accuracy")) if m_base else None,
                 "base_decision_in_dist": _mean((_l1(data, "in_dist", "base") or {}).get("decision_accuracy")),
                 "prepare_s": stages.get("prepare"),
                 "train_s": stages.get("train"),
@@ -773,18 +793,25 @@ def curve_markdown(rows: list[dict[str, Any]], summary: dict[str, Any]) -> str:
         "# Learning curve: standard SFT vs Rationale-Guided Training (RGT)",
         "",
         "| Method | Records | Train samples | Prepare min | Train min | Minutes to adapter | Decision acc (in-dist) "
-        "| Task score | Decision acc (OOD) | Tool-call acc | Base attempts correct |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Task score | Decision acc (OOD) | Decision acc (messy) | Tool-call acc (messy) | Tool-call acc "
+        "| Base attempts correct |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         lines.append(
             f"| {r['method'].upper()} | {r['records']} | {r['train_samples']} | {mins(r['prepare_s'])} | "
             f"{mins(r['train_s'])} | {mins(r['prepare_s'], r['train_s'])} | {pct(r['decision_in_dist'])} | "
-            f"{pct(r['task_score_in_dist'])} | {pct(r['decision_ood'])} | {pct(r['tool_call_in_dist'])} | "
+            f"{pct(r['task_score_in_dist'])} | {pct(r['decision_ood'])} | {pct(r['decision_messy'])} | "
+            f"{pct(r['tool_call_messy'])} | {pct(r['tool_call_in_dist'])} | "
             f"{pct(r['rgt_attempt_pass_rate'])} |"
         )
     base = next((r["base_decision_in_dist"] for r in rows if r["base_decision_in_dist"] is not None), None)
-    lines += ["", f"Base model, no fine-tuning: {pct(base)} decision accuracy (in-dist)."]
+    base_m = next((r["base_decision_messy"] for r in rows if r["base_decision_messy"] is not None), None)
+    lines += [
+        "",
+        f"Base model, no fine-tuning: {pct(base)} decision accuracy (in-dist)"
+        + (f", {pct(base_m)} (messy)." if base_m is not None else "."),
+    ]
     th = summary["threshold"]
     for m, hit in summary["methods"].items():
         lines.append(
@@ -826,6 +853,18 @@ def curve(args: argparse.Namespace) -> int:
     return 0
 
 
+def add_messy(args: argparse.Namespace) -> int:
+    """Write the messy-invoice set into an existing workdir (no retraining needed)."""
+    workdir = Path(args.workdir).resolve()
+    if not (workdir / "pilot.json").exists():
+        print(f"{workdir} is not a prepared workdir", file=sys.stderr)
+        return 2
+    rows, pii = redact_records(generate_messy(args.n, seed=args.seed))
+    _write_jsonl(workdir / "data" / SET_FILES["messy"], rows)
+    print(json.dumps({"workdir": str(workdir), "messy_records": len(rows), "seed": args.seed, "pii_placeholders": pii}))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -845,6 +884,8 @@ def main() -> int:
     p.add_argument("--profile", default=DEFAULT_PROFILE, help="model profile ref (profiles/<ref>.yaml)")
     p.add_argument("--allow-draft", action="store_true", help="allow an unvalidated profile (not for evidence)")
     p.add_argument("--method", choices=["sft", "rgt"], default="sft", help="rgt = Rationale-Guided Training data")
+    p.add_argument("--messy-n", type=int, default=0, help="messy-invoice evaluation records (0 = none)")
+    p.add_argument("--messy-seed", type=int, default=4242)
     p.add_argument("--test-n", type=int, default=0, help="fixed, separately generated test set size (0 = split)")
     p.add_argument("--test-seed", type=int, default=7777)
     p.add_argument("--attempts-url", help="vLLM URL serving the base model, for on-policy RGT attempts")
@@ -858,7 +899,12 @@ def main() -> int:
     e.add_argument("--vllm-url", default="http://127.0.0.1:8000")
     e.add_argument("--vllm-api-key", required=True)
     e.add_argument("--targets", default="adapter,base", help="comma list: adapter,base,frontier")
-    e.add_argument("--sets", default="in_dist,ood", help="comma list of test sets: in_dist,ood")
+    e.add_argument("--sets", default="in_dist,ood", help="comma list of test sets: in_dist,ood,messy")
+    e.add_argument(
+        "--report-name",
+        default="report.json",
+        help="file name in the workdir; use another name to score an extra set without touching report.json",
+    )
     e.add_argument("--adapter-name", help="vLLM serving name; default derived from the workdir")
     e.add_argument("--max-items", type=int, default=None, help="cap items per set (default: all)")
     e.add_argument("--concurrency", type=int, default=8)
@@ -880,6 +926,11 @@ def main() -> int:
     c.add_argument("reports", nargs="+", help="report.json files")
     c.add_argument("--out", help="directory for comparison.json and comparison.md")
 
+    am = sub.add_parser("add-messy", help="add the messy-invoice set to an existing workdir")
+    am.add_argument("--workdir", required=True)
+    am.add_argument("--n", type=int, default=300)
+    am.add_argument("--seed", type=int, default=4242)
+
     cv = sub.add_parser("curve", help="learning curve across methods and training sizes")
     cv.add_argument("reports", nargs="+", help="report.json files")
     cv.add_argument("--threshold", type=float, default=0.95, help="in-dist decision accuracy to reach")
@@ -899,6 +950,8 @@ def main() -> int:
         return compare(args)
     if args.cmd == "curve":
         return curve(args)
+    if args.cmd == "add-messy":
+        return add_messy(args)
     if args.cmd == "profile-env":
         return profile_env(args)
     print(secrets.token_urlsafe(32))
