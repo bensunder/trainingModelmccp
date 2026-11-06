@@ -48,6 +48,7 @@ METHODS="${METHODS:-sft}"
 TEST_N="${TEST_N:-}"
 TEST_SEED="${TEST_SEED:-7777}"
 RGT_ATTEMPTS="${RGT_ATTEMPTS:-1}"
+TRAIN_MIX="${TRAIN_MIX:-standard}"   # standard | boundary (near-threshold cases + rule collisions)
 MESSY_N="${MESSY_N:-300}"        # messy-invoice eval records (OCR noise, emails, tables, distractors); 0 = off
 EVAL_SETS="in_dist,ood"
 [ "$MESSY_N" -gt 0 ] && EVAL_SETS="in_dist,ood,messy"
@@ -58,6 +59,7 @@ CURVE=0
 [ "${#SIZE_LIST[@]}" -gt 1 ] || [ "$METHODS" != sft ] && CURVE=1
 TAG="n${N}-e${EPOCHS}"
 [ "$CURVE" = 1 ] && TAG="curve-e${EPOCHS}"
+[ "$TRAIN_MIX" = standard ] || TAG="$TRAIN_MIX-$TAG"
 [ "$PROFILE_REF" = "qwen3-8b@v1" ] || TAG="$PROFILE_ID-$TAG"
 LOG="$RUNS/batch-$TAG.log"
 DEST="${DEST:-/workspace/mccp-batch-$TAG}"
@@ -65,7 +67,7 @@ mkdir -p "$RUNS"
 # shellcheck source=deploy/gpu/lib.sh
 . "$(dirname "$0")/lib.sh"
 
-say "batch $TAG: profile $PROFILE_REF ($PROFILE_STATUS, origin $PROFILE_ORIGIN, $HF_ID), methods [${METHOD_LIST[*]}], sizes [${SIZE_LIST[*]}], seeds [${SEED_LIST[*]}], test ${TEST_N:-split}, OOD $OOD_N, runs in $RUNS"
+say "batch $TAG (training mix: $TRAIN_MIX): profile $PROFILE_REF ($PROFILE_STATUS, origin $PROFILE_ORIGIN, $HF_ID), methods [${METHOD_LIST[*]}], sizes [${SIZE_LIST[*]}], seeds [${SEED_LIST[*]}], test ${TEST_N:-split}, OOD $OOD_N, runs in $RUNS"
 for M in "${METHOD_LIST[@]}"; do [ "$M" = sft ] || [ "$M" = rgt ] || die "unknown method $M (sft|rgt)"; done
 for S in "${SIZE_LIST[@]}"; do [[ "$S" =~ ^[0-9]+$ ]] || die "size $S is not a number"; done
 [ "${#SIZE_LIST[@]}" -le 1 ] || [ -n "$TEST_N" ] || die "several SIZES need TEST_N (one fixed test set), or the sizes are scored on different data"
@@ -105,6 +107,7 @@ for M in "${METHOD_LIST[@]}"; do for S in "${SIZE_LIST[@]}"; do for SEED in "${S
 done; done; done
 wdir() {  # method size seed
   if [ "$CURVE" = 0 ]; then echo "$RUNS/$TAG-s$3"; else echo "$RUNS/${TAG%curve-e*}$1-n$2-e$EPOCHS-s$3"; fi
+  # (TAG carries the profile and a non-standard TRAIN_MIX, so mixes never share a workdir)
 }
 timed() {  # workdir stage start_epoch: append the stage's wall time
   printf '{"stage": "%s", "seconds": %s}\n' "$2" "$(( $(date +%s) - $3 ))" >> "$1/timing.jsonl"
@@ -131,7 +134,8 @@ for V in "${VARIANTS[@]}"; do
   [ -f "$W/run.json" ] && continue
   say "preparing $M n=$S seed $SEED"
   PARGS=(prepare --workdir "$W" --n "$S" --epochs "$EPOCHS" --seed "$SEED" --ood-n "$OOD_N"
-         --save-steps "$SAVE_STEPS" --gpu-hourly-usd "$GPU_USD_PER_HOUR" --profile "$PROFILE_REF" --method "$M")
+         --save-steps "$SAVE_STEPS" --gpu-hourly-usd "$GPU_USD_PER_HOUR" --profile "$PROFILE_REF" --method "$M"
+         --train-mix "$TRAIN_MIX")
   [ -n "$TEST_N" ] && PARGS+=(--test-n "$TEST_N" --test-seed "$TEST_SEED")
   [ "$MESSY_N" -gt 0 ] && PARGS+=(--messy-n "$MESSY_N")
   if [ "$M" = rgt ] && [ "$RGT_ATTEMPTS" = 1 ]; then

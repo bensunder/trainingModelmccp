@@ -6,7 +6,7 @@
 # Afterwards (installed as /usr/local/bin/mccp-gpu):
 #   mccp-gpu up [--queue PROFILE...] [--no-baseline]   set up the box, start the queue runner
 #   mccp-gpu queue add PROFILE [--n N] [--epochs E] [--seeds "42 7"]
-#   mccp-gpu queue add PROFILE --n 100,300,1000 --methods sft,rgt --seeds 42 --test-n 300
+#   mccp-gpu queue add PROFILE --n 100,300,1000 --methods sft,rgt --seeds 42 --test-n 300 [--mix boundary]
 #                                   learning curve: standard fine-tuning vs Rationale-Guided Training
 #   mccp-gpu queue list | queue clear
 #   mccp-gpu status                 current run, progress, GPU, cost so far, queue, finished runs
@@ -40,7 +40,7 @@ REPO_URL="${MCCP_REPO_URL:-https://github.com/bensunder/trainingModelmccp}"
 BRANCH="${MCCP_BRANCH:-main}"
 SESSION="${MCCP_SESSION:-mccp-gpu}"
 BIN_LINK="${MCCP_BIN_LINK:-/usr/local/bin/mccp-gpu}"
-QUEUE="$MCCP_HOME/queue.tsv"      # id <TAB> profile <TAB> sizes <TAB> epochs <TAB> seeds <TAB> methods <TAB> test_n
+QUEUE="$MCCP_HOME/queue.tsv"      # id profile sizes epochs seeds methods test_n mix (tab-separated)
 DONE="$MCCP_HOME/done.tsv"        # id <TAB> profile <TAB> rc <TAB> results_dir <TAB> ended_utc
 CURRENT="$MCCP_HOME/current.env"
 CONFIG="$MCCP_HOME/config.env"    # baseline URL/model, GPU rate (not secret)
@@ -120,10 +120,11 @@ prune_releases() {  # keep the newest 3 releases plus $1 (never the one a run is
 # ------------------------------------------------------------------- queue --
 with_queue_lock() { (flock 8; "$@") 8>"$MCCP_HOME/queue.lock"; }
 
-_queue_add() {  # profile sizes epochs seeds [methods] [test_n]
+_queue_add() {  # profile sizes epochs seeds [methods] [test_n] [mix]
   local id
   id="$(date -u +%Y%m%d-%H%M%S)-$(printf '%s' "$1" | tr -c 'a-z0-9.-' '-' | sed 's/-*$//')"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$1" "$2" "$3" "$4" "${5:-sft}" "${6:-}" >> "$QUEUE"
+  # test_n is written as "-" when unset: bash `read` collapses empty tab-separated fields.
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$1" "$2" "$3" "$4" "${5:-sft}" "${6:--}" "${7:-standard}" >> "$QUEUE"
   echo "$id"
 }
 
@@ -142,7 +143,7 @@ cmd_queue() {
   case "${1:-list}" in
     add)
       shift
-      local profile="${1:-}" n=3000 epochs=1 seeds="42 7" methods=sft test_n=""
+      local profile="${1:-}" n=3000 epochs=1 seeds="42 7" methods=sft test_n="" mix=standard
       [ -n "$profile" ] || fail "usage: mccp-gpu queue add PROFILE [--n N[,N...]] [--epochs E] [--seeds \"42 7\"] [--methods sft,rgt] [--test-n N]"
       shift
       while [ $# -gt 0 ]; do
@@ -152,6 +153,7 @@ cmd_queue() {
           --seeds) seeds="$2"; shift 2 ;;
           --methods) methods="$2"; shift 2 ;;
           --test-n) test_n="$2"; shift 2 ;;
+          --mix) mix="$2"; shift 2 ;;
           *) fail "unknown option $1" ;;
         esac
       done
@@ -159,16 +161,17 @@ cmd_queue() {
         || fail "--n numbers (comma list for a curve), --epochs a number, --seeds numbers"
       [[ "$methods" =~ ^(sft|rgt)(,(sft|rgt))*$ ]] || fail "--methods must be sft, rgt or sft,rgt"
       [ -z "$test_n" ] || [[ "$test_n" =~ ^[0-9]+$ ]] || fail "--test-n must be a number"
+      [[ "$mix" =~ ^(standard|boundary)$ ]] || fail "--mix must be standard or boundary"
       [[ "$n" != *,* ]] || [ -n "$test_n" ] || fail "several --n sizes need --test-n (one fixed test set for every size)"
       valid_profile "$profile"
       local id
-      id="$(with_queue_lock _queue_add "$profile" "$n" "$epochs" "$seeds" "$methods" "$test_n")"
-      c_ok "queued $id ($profile, methods $methods, records $n x $epochs epoch, seeds $seeds${test_n:+, fixed test $test_n})"
+      id="$(with_queue_lock _queue_add "$profile" "$n" "$epochs" "$seeds" "$methods" "$test_n" "$mix")"
+      c_ok "queued $id ($profile, methods $methods, records $n x $epochs epoch, seeds $seeds${test_n:+, fixed test $test_n}, training mix $mix)"
       runner_active || start_runner
       ;;
     list)
       if [ -s "$QUEUE" ]; then
-        awk -F'\t' '{printf "  %d. %s  %s  %s n=%s e=%s seeds=[%s]%s\n", NR, $1, $2, ($6==""?"sft":$6), $3, $4, $5, ($7==""?"":" test=" $7)}' "$QUEUE"
+        awk -F'\t' '{printf "  %d. %s  %s  %s n=%s e=%s seeds=[%s]%s%s\n", NR, $1, $2, ($6==""?"sft":$6), $3, $4, $5, (($7==""||$7=="-")?"":" test=" $7), (($8==""||$8=="standard")?"":" mix=" $8)}' "$QUEUE"
       else
         echo "  (queue empty)"
       fi
@@ -322,8 +325,9 @@ cmd_run() {  # internal: the queue loop (exactly one per box)
       rm -f "$CURRENT"; log "queue empty; runner exiting"; exit 0
     fi
     local id profile n epochs seeds
-    local methods test_n
-    IFS=$'\t' read -r id profile n epochs seeds methods test_n <<<"$item"
+    local methods test_n mix
+    IFS=$'\t' read -r id profile n epochs seeds methods test_n mix <<<"$item"
+    [ "$test_n" = "-" ] && test_n=""
     if foreign_gpu_work || bench_active; then
       log "waiting for other GPU work (a benchmark or a manual run) to finish (checks every 60 s)"
       while foreign_gpu_work || bench_active; do sleep 60; done
@@ -331,7 +335,7 @@ cmd_run() {  # internal: the queue loop (exactly one per box)
     git -C "$SRC" fetch -q origin "$BRANCH" 2>/dev/null
     local sha rel
     sha="$(git -C "$SRC" rev-parse "origin/$BRANCH" 2>/dev/null || git -C "$SRC" rev-parse HEAD)"
-    log "run $id: $profile methods=${methods:-sft} n=$n epochs=$epochs seeds=[$seeds]${test_n:+ test=$test_n} from commit ${sha:0:7}"
+    log "run $id: $profile methods=${methods:-sft} mix=${mix:-standard} n=$n epochs=$epochs seeds=[$seeds]${test_n:+ test=$test_n} from commit ${sha:0:7}"
     rel="$(release_for "$sha")" || { log "could not prepare release ${sha:0:7}"; break; }
     if [ "${MCCP_GPU_SKIP_BOOTSTRAP:-0}" != 1 ]; then
       if ! REPO="$rel" BOOTSTRAP_NO_GIT=1 LOG="$MCCP_HOME/bootstrap.log" bash "$rel/deploy/gpu/bootstrap.sh" >> "$RUNNER_LOG" 2>&1; then
@@ -350,6 +354,7 @@ cmd_run() {  # internal: the queue loop (exactly one per box)
       set +a
       if [ "${BASELINE_DISABLED:-0}" = 1 ]; then unset BASELINE_URL BASELINE_MODEL MCCP_BASELINE_API_KEY; fi
       PROFILE="$profile" N="${n%%,*}" SIZES="${n//,/ }" METHODS="${methods:-sft}" TEST_N="${test_n:-}" \
+        TRAIN_MIX="${mix:-standard}" \
         EPOCHS="$epochs" SEEDS="${seeds//,/ }" RUNS="$runs" DEST="$dest" REPO="$rel" \
         bash "${MCCP_GPU_BATCH_CMD:-$rel/deploy/gpu/run_batch.sh}" 9>&-
     ) >> "$RUNNER_LOG" 2>&1   # 9>&-: the batch (and the vLLM it starts) must not inherit the runner lock

@@ -133,7 +133,41 @@ def _round(x: float) -> float:
     return round(x + 0.0, 2)
 
 
-def make_case(rng: random.Random, idx: int) -> Case:
+# Training mixes. `standard` is the original distribution and must stay bit-identical
+# (old datasets reproduce from their seed). `boundary` keeps the standard scenarios at
+# lower weight and adds the cases the Nov 2026 OOD breakdown showed the model never
+# saw: values right at the 30-day and 2% thresholds, clean and partial-billing
+# approvals, and rule collisions where precedence decides the outcome.
+_MIXES: dict[str, tuple[list[str], list[int]]] = {
+    "standard": (["ok", "price", "qty", "missing", "dup", "bank"], [30, 20, 15, 10, 10, 15]),
+    "boundary": (
+        [
+            "ok",
+            "price",
+            "qty",
+            "missing",
+            "dup",
+            "bank",
+            "bank_edge_recent",  # bank change 25-29 days ago        -> VENDOR_BANK_CHANGE
+            "bank_edge_ok",  # bank change 30-35 days ago            -> not a bank flag
+            "price_edge_over",  # |variance| 2.05-3.0%               -> PRICE_VARIANCE
+            "price_edge_under",  # |variance| 1.5-1.95%              -> WITHIN_TOLERANCE
+            "clean",  # nothing wrong, variance within +/-0.5%       -> WITHIN_TOLERANCE
+            "partial_billing",  # billed = received < ordered        -> WITHIN_TOLERANCE
+            "collision_bank_qty",  # recent bank change + billed > received -> VENDOR_BANK_CHANGE
+            "collision_dup_price",  # already paid + price variance  -> DUPLICATE_INVOICE
+        ],
+        [10, 8, 8, 6, 6, 6, 8, 8, 8, 8, 6, 8, 6, 4],
+    ),
+}
+TRAIN_MIXES = tuple(_MIXES)
+
+
+def _signed(rng: random.Random, lo: float, hi: float) -> float:
+    return rng.choice([-1, 1]) * rng.uniform(lo, hi)
+
+
+def make_case(rng: random.Random, idx: int, mix: str = "standard") -> Case:
     vendor_idx = rng.randrange(len(_VENDORS))
     # One vendor record per case keeps tool fixtures consistent with labels.
     vendor_id = f"V-{100000 + idx}"
@@ -148,12 +182,16 @@ def make_case(rng: random.Random, idx: int) -> Case:
     )
     vendor = {"vendor_id": vendor_id, "name": vendor_name, "status": "active", "days_since_bank_change": bank_days}
 
-    scenario = rng.choices(["ok", "price", "qty", "missing", "dup", "bank"], weights=[30, 20, 15, 10, 10, 15])[0]
+    if mix not in _MIXES:
+        raise ValueError(f"unknown training mix {mix!r}; choose from {', '.join(_MIXES)}")
+    names, weights = _MIXES[mix]
+    scenario = rng.choices(names, weights=weights)[0]
     received = ordered
     billed_qty = ordered
     billed_price = unit_price
     paid: list[str] = []
     po: dict[str, Any] | None
+    # Standard scenarios: unchanged code path and random-draw order (reproducibility).
     if scenario == "price":
         billed_price = _round(unit_price * (1 + rng.choice([-1, 1]) * rng.uniform(0.03, 0.25)))
     elif scenario == "ok":
@@ -162,8 +200,28 @@ def make_case(rng: random.Random, idx: int) -> Case:
         received = max(1, ordered - rng.randrange(1, max(2, ordered // 2)))
     elif scenario == "dup":
         paid = [invoice_id]
-    if scenario == "bank":
+    # Boundary scenarios (only drawn by the `boundary` mix).
+    elif scenario == "price_edge_over":
+        billed_price = _round(unit_price * (1 + _signed(rng, 0.0205, 0.030)))
+    elif scenario == "price_edge_under":
+        billed_price = _round(unit_price * (1 + _signed(rng, 0.015, 0.0195)))
+    elif scenario in ("clean", "bank_edge_ok", "bank_edge_recent"):
+        billed_price = _round(unit_price * (1 + rng.uniform(-0.005, 0.005)))
+    elif scenario == "partial_billing":
+        received = max(1, ordered - rng.randrange(1, max(2, ordered // 2)))
+        billed_qty = received
+        billed_price = _round(unit_price * (1 + rng.uniform(-0.01, 0.01)))
+    elif scenario == "collision_bank_qty":
+        received = max(1, ordered - rng.randrange(1, max(2, ordered // 2)))
+    elif scenario == "collision_dup_price":
+        paid = [invoice_id]
+        billed_price = _round(unit_price * (1 + _signed(rng, 0.04, 0.15)))
+    if scenario in ("bank", "collision_bank_qty"):
         vendor["days_since_bank_change"] = rng.randrange(1, 29)
+    elif scenario == "bank_edge_recent":
+        vendor["days_since_bank_change"] = rng.randrange(25, 30)
+    elif scenario == "bank_edge_ok":
+        vendor["days_since_bank_change"] = rng.randrange(30, 36)
     elif bank_days < 30:
         vendor["days_since_bank_change"] = rng.randrange(30, 2000)
 
@@ -262,11 +320,13 @@ def to_record(c: Case, user_text: str | None = None, meta: dict[str, Any] | None
     }
 
 
-def generate(n: int, seed: int = 7, id_offset: int = 0) -> list[dict[str, Any]]:
+def generate(n: int, seed: int = 7, id_offset: int = 0, mix: str = "standard") -> list[dict[str, Any]]:
     """`id_offset` moves invoice/vendor ids into a disjoint range, so a separately
-    generated test set can never share a `source_id` with training data."""
+    generated test set can never share a `source_id` with training data.
+    `mix` picks the scenario distribution (`standard` or `boundary`, see `_MIXES`);
+    labels always come from `decide`, so every mix is correct by construction."""
     rng = random.Random(seed)
-    return [to_record(make_case(rng, i + id_offset)) for i in range(n)]
+    return [to_record(make_case(rng, i + id_offset, mix)) for i in range(n)]
 
 
 def fixtures(n: int, seed: int = 7) -> dict[str, Any]:

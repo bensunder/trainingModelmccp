@@ -54,7 +54,7 @@ from mccp.evals.benchmark import (
 )
 from mccp.evals.guard import live_guard, static_guard
 from mccp.evals.suite import EvalSuite
-from mccp.examples.invoices import generate, generate_ood
+from mccp.examples.invoices import TRAIN_MIXES, generate, generate_ood
 from mccp.examples.messy import generate_messy
 from mccp.rgt import Attempt, build_rgt_rows, final_turn_prompt, hinge_rows
 from mccp.rgt.invoices import InvoiceRuleGrader, InvoiceTemplateDistiller
@@ -213,7 +213,12 @@ def prepare(args: argparse.Namespace) -> int:
     #    With `--test-n` the test set is generated separately (own seed, disjoint ids)
     #    and is identical for every training size, so learning curves compare like
     #    with like; all `--n` records go to train/val.
-    raw = b"".join(json.dumps(r, ensure_ascii=False).encode() + b"\n" for r in generate(args.n, seed=args.data_seed))
+    #    `--train-mix` changes only the training scenarios; the fixed test, OOD and
+    #    messy sets are always generated from their own seeds and stay identical.
+    raw = b"".join(
+        json.dumps(r, ensure_ascii=False).encode() + b"\n"
+        for r in generate(args.n, seed=args.data_seed, mix=args.train_mix)
+    )
     params = BuildParams(seed=args.data_seed)
     test_dropped = 0
     if args.test_n:
@@ -369,6 +374,7 @@ def prepare(args: argparse.Namespace) -> int:
         "data_seed": args.data_seed,
         "epochs": args.epochs,
         "method": args.method,
+        "train_mix": args.train_mix,
         "records": args.n,
         "rgt": rgt_provenance,
         "test_set": {
@@ -394,6 +400,7 @@ def prepare(args: argparse.Namespace) -> int:
                 "config_hash": manifest["config_hash"],
                 "seed": args.seed,
                 "method": args.method,
+                "train_mix": args.train_mix,
                 "rgt_b_rows": rgt_provenance["b_rows"] if rgt_provenance else 0,
                 "rgt_attempt_pass_rate": rgt_provenance["attempts"]["pass_rate"] if rgt_provenance else None,
                 "train_samples": len(train_rows),
@@ -734,7 +741,8 @@ def curve_rows(paths: list[Path]) -> list[dict[str, Any]]:
         rows.append(
             {
                 "run": path.parent.name,
-                "method": meta.get("method", "sft"),
+                "method": meta.get("method", "sft")
+                + ("" if meta.get("train_mix", "standard") == "standard" else f"+{meta['train_mix']}"),
                 "records": meta.get("records"),
                 "seed": meta.get("seed"),
                 "train_samples": meta.get("samples", {}).get("train"),
@@ -884,6 +892,12 @@ def main() -> int:
     p.add_argument("--profile", default=DEFAULT_PROFILE, help="model profile ref (profiles/<ref>.yaml)")
     p.add_argument("--allow-draft", action="store_true", help="allow an unvalidated profile (not for evidence)")
     p.add_argument("--method", choices=["sft", "rgt"], default="sft", help="rgt = Rationale-Guided Training data")
+    p.add_argument(
+        "--train-mix",
+        choices=list(TRAIN_MIXES),
+        default="standard",
+        help="training scenario mix; boundary adds near-threshold cases and rule collisions",
+    )
     p.add_argument("--messy-n", type=int, default=0, help="messy-invoice evaluation records (0 = none)")
     p.add_argument("--messy-seed", type=int, default=4242)
     p.add_argument("--test-n", type=int, default=0, help="fixed, separately generated test set size (0 = split)")

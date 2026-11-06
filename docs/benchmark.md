@@ -132,3 +132,24 @@ Score an already finished run without retraining (adapters must still be on the 
 ```bash
 mccp-gpu eval-messy            # latest successful run; writes report_messy.json per adapter and refreshes curve.md
 ```
+
+## Training mix: `standard` vs `boundary`
+
+The Nov 2026 OOD breakdown showed the model failing exactly where the standard generator has no data: it had 2 of
+1,000 invoices with a price variance between 1.5% and 3.0%, and bank changes only at 1-28 or 30+ days (mostly far
+from 30). The model learned "small number of days -> flag" instead of the 30-day rule, never approved clean or
+partially billed unfamiliar invoices, and missed the bank-fraud escalation when a quantity problem was also present.
+
+`--mix boundary` (queue) / `TRAIN_MIX=boundary` (batch) / `--train-mix boundary` (prepare) keeps the standard
+scenarios at lower weight and adds: bank changes 25-35 days (both sides of 30, including 29 and 30), price variances
+1.5-1.95% and 2.05-3.0%, clean invoices, partial billing (billed = received < ordered), and rule collisions (recent bank
+change + quantity over receipt -> escalate; already paid + price variance -> reject). Per 1,000 records: about 170
+invoices at 25-35 bank days and 150 at 1.5-3.0% variance. Labels come from `decide`, so they are correct by construction.
+
+The fixed test, OOD and messy sets do not depend on the training mix, so a boundary run is scored on exactly the same
+items as a standard run. Caveat: the OOD boundary categories now resemble training scenarios (their vendors, items and
+wording are still unseen); the messy set remains the cleaner check of robustness to new surface text.
+
+```bash
+mccp-gpu queue add qwen3-8b@v1 --n 1000 --seeds 42 --test-n 300 --mix boundary
+```
