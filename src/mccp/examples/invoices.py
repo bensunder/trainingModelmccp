@@ -262,9 +262,11 @@ def to_record(c: Case, user_text: str | None = None, meta: dict[str, Any] | None
     }
 
 
-def generate(n: int, seed: int = 7) -> list[dict[str, Any]]:
+def generate(n: int, seed: int = 7, id_offset: int = 0) -> list[dict[str, Any]]:
+    """`id_offset` moves invoice/vendor ids into a disjoint range, so a separately
+    generated test set can never share a `source_id` with training data."""
     rng = random.Random(seed)
-    return [to_record(make_case(rng, i)) for i in range(n)]
+    return [to_record(make_case(rng, i + id_offset)) for i in range(n)]
 
 
 def fixtures(n: int, seed: int = 7) -> dict[str, Any]:

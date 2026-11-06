@@ -55,6 +55,9 @@ from mccp.evals.benchmark import (
 from mccp.evals.guard import live_guard, static_guard
 from mccp.evals.suite import EvalSuite
 from mccp.examples.invoices import generate, generate_ood
+from mccp.rgt import Attempt, build_rgt_rows, final_turn_prompt, hinge_rows
+from mccp.rgt.invoices import InvoiceRuleGrader, InvoiceTemplateDistiller
+from mccp.rgt.pairs import prompt_key
 from mccp.serving.clients import FleetProfile, ServingError, VllmClient
 from mccp.training.backends import TrainContext, prepare_workdir
 
@@ -118,11 +121,78 @@ def adapter_serving_name(workdir: Path) -> str:
     return f"invoice-triage-{slug}"[:64]
 
 
+TEST_ID_OFFSET = 1_000_000
+
+
+async def collect_attempts(
+    samples: list[dict[str, Any]],
+    *,
+    url: str,
+    key: str | None,
+    model: str,
+    extra_body: dict[str, Any],
+    cache: Path | None,
+    concurrency: int = 8,
+) -> dict[str, Attempt]:
+    """The served model's own answer to each decision prompt (on-policy, greedy).
+
+    Cached by prompt hash in `cache` (JSONL), so nested training sizes built
+    from the same data seed never ask twice. A failed request is recorded as an
+    error attempt (the sample still gets its rule strategy, without a mistake)."""
+    have: dict[str, Attempt] = {}
+    if cache and cache.exists():
+        for line in cache.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                a = Attempt.model_validate_json(line)
+                if a.model == model and not a.error:
+                    have[a.key] = a
+    todo = {prompt_key(s): s for s in samples if prompt_key(s) not in have}
+    client = VllmClient(url, key, timeout=120.0)
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one(k: str, sample: dict[str, Any]) -> Attempt:
+        p = final_turn_prompt(sample)
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": layers.to_openai_messages(p["messages"]),
+            "temperature": 0.0,
+            "max_tokens": 256,
+            **extra_body,
+        }
+        if p.get("tools"):
+            payload["tools"] = p["tools"]
+        err = None
+        async with sem:
+            for _ in range(3):
+                try:
+                    resp = await client.chat(payload)
+                    msg = resp["choices"][0]["message"]
+                    return Attempt(key=k, content=msg.get("content") or "", model=model)
+                except (ServingError, httpx.HTTPError, KeyError) as e:
+                    err = f"{type(e).__name__}: {e}"[:300]
+                    await asyncio.sleep(1)
+        return Attempt(key=k, content=None, model=model, error=err)
+
+    fresh = await asyncio.gather(*(one(k, s) for k, s in todo.items()))
+    if cache:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        with cache.open("a", encoding="utf-8") as f:
+            for a in fresh:
+                f.write(a.model_dump_json() + "\n")
+    have.update({a.key: a for a in fresh})
+    errors = sum(1 for a in fresh if a.error)
+    print(f"attempts: {len(samples)} prompts, {len(fresh)} new, {errors} errors", file=sys.stderr)
+    return have
+
+
 # ------------------------------------------------------------------- prepare --
 def prepare(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).resolve()
     if (workdir / "run.json").exists() and not args.force:
         print(f"{workdir}/run.json already exists; pass --force to rebuild", file=sys.stderr)
+        return 2
+    if args.attempts_url and (args.method != "rgt" or not args.attempts_model):
+        print("--attempts-url needs --method rgt and --attempts-model", file=sys.stderr)
         return 2
     profile = load_profile(args.profile)
     if profile.status != "validated" and not args.allow_draft:
@@ -139,9 +209,15 @@ def prepare(args: argparse.Namespace) -> int:
     # 1. Dataset through the production pipeline (schema, PII, dedup, group split, decontam, export).
     #    `--data-seed` fixes the data and the held-out split, so runs that differ only in
     #    `--seed` (training data order / LoRA init) are scored on identical test items.
+    #    With `--test-n` the test set is generated separately (own seed, disjoint ids)
+    #    and is identical for every training size, so learning curves compare like
+    #    with like; all `--n` records go to train/val.
     raw = b"".join(json.dumps(r, ensure_ascii=False).encode() + b"\n" for r in generate(args.n, seed=args.data_seed))
+    params = BuildParams(seed=args.data_seed)
+    if args.test_n:
+        params = BuildParams(seed=args.data_seed, ratios=(0.9, 0.1, 0.0), min_records={"train": 1, "val": 1, "test": 0})
     try:
-        built = build_dataset(raw, PatternRedactor(), BuildParams(seed=args.data_seed))
+        built = build_dataset(raw, PatternRedactor(), params)
     except DatasetBuildError as e:
         print(f"dataset build failed: {e}\n{json.dumps(e.report, indent=2)[:2000]}", file=sys.stderr)
         return 3
@@ -150,7 +226,56 @@ def prepare(args: argparse.Namespace) -> int:
         return 3
     train_rows = _jsonl(built.files["train.jsonl"])
     val_rows = _jsonl(built.files["val.jsonl"])
-    test_rows = _jsonl(built.files["test.jsonl"])
+    if args.test_n:
+        test_rows, _ = redact_records(generate(args.test_n, seed=args.test_seed, id_offset=TEST_ID_OFFSET))
+        test_overlap = sum(
+            contaminated(
+                [input_text(r["messages"]) for r in train_rows + val_rows],
+                [input_text(r["messages"]) for r in test_rows],
+                n=13,
+            )
+        )
+        if test_overlap:
+            print(f"{test_overlap} train/val samples share 13-grams with the fixed test set; refusing", file=sys.stderr)
+            return 3
+        golden_bytes = b"".join(json.dumps(r, ensure_ascii=False).encode() + b"\n" for r in test_rows)
+    else:
+        test_rows = _jsonl(built.files["test.jsonl"])
+        golden_bytes = built.files["test.jsonl"]
+
+    # 1b. Rationale-Guided Training: add a strategy-explicit copy of every decision
+    #     sample. Optional on-policy attempts (the base model answering the same
+    #     prompts) let the strategy name the mistake the model actually makes.
+    rgt_provenance: dict[str, Any] | None = None
+    strategies: list[dict[str, Any]] = []
+    if args.method == "rgt":
+        attempts = None
+        if args.attempts_url:
+            attempts = asyncio.run(
+                collect_attempts(
+                    [train_rows[i] for i in hinge_rows(train_rows)],
+                    url=args.attempts_url,
+                    key=args.attempts_key,
+                    model=args.attempts_model,
+                    extra_body=extra_body(profile),
+                    cache=Path(args.attempts_cache) if args.attempts_cache else None,
+                    concurrency=args.attempts_concurrency,
+                )
+            )
+        try:
+            rgt = build_rgt_rows(
+                train_rows,
+                grader=InvoiceRuleGrader(),
+                distiller=InvoiceTemplateDistiller(),
+                reasoning=profile.reasoning.model_dump() if profile.reasoning else None,
+                attempts=attempts,
+            )
+        except ValueError as e:
+            print(f"RGT: {e}", file=sys.stderr)
+            return 2
+        train_rows = rgt.rows
+        rgt_provenance = {**rgt.provenance, "attempts_model": args.attempts_model if attempts is not None else None}
+        strategies = [r["rgt"] for r in train_rows if r.get("rgt", {}).get("pair") == "B"]
 
     # 2. OOD set: fixed seed (independent of the training seed) so every run is
     #    scored on identical OOD records; redacted like the golden split.
@@ -202,7 +327,9 @@ def prepare(args: argparse.Namespace) -> int:
     # 4. Trainer workdir: data, golden sets, run.json (the trainer entrypoint's contract).
     (workdir / "data").mkdir(parents=True, exist_ok=True)
     golden = workdir / "data" / SET_FILES["in_dist"]
-    golden.write_bytes(built.files["test.jsonl"])
+    golden.write_bytes(golden_bytes)
+    if strategies:
+        _write_jsonl(workdir / "data" / "rgt_strategies.jsonl", strategies)
     _write_jsonl(workdir / "data" / SET_FILES["ood"], ood_rows)
     run = prepare_workdir(
         TrainContext(
@@ -224,6 +351,14 @@ def prepare(args: argparse.Namespace) -> int:
         "seed": args.seed,
         "data_seed": args.data_seed,
         "epochs": args.epochs,
+        "method": args.method,
+        "records": args.n,
+        "rgt": rgt_provenance,
+        "test_set": {
+            "fixed": bool(args.test_n),
+            "records": len(test_rows),
+            "seed": args.test_seed if args.test_n else args.data_seed,
+        },
         "dataset": {"manifest_sha256": built.manifest_sha256, "card": built.card},
         "ood": {"records": len(ood_rows), "seed": args.ood_seed, "pii_placeholders": ood_pii, "train_overlap": 0},
         "samples": {"train": len(train_rows), "val": len(val_rows), "golden_records": len(test_rows)},
@@ -239,6 +374,9 @@ def prepare(args: argparse.Namespace) -> int:
                 "revision": revision,
                 "config_hash": manifest["config_hash"],
                 "seed": args.seed,
+                "method": args.method,
+                "rgt_b_rows": rgt_provenance["b_rows"] if rgt_provenance else 0,
+                "rgt_attempt_pass_rate": rgt_provenance["attempts"]["pass_rate"] if rgt_provenance else None,
                 "train_samples": len(train_rows),
                 "val_samples": len(val_rows),
                 "golden_records": len(test_rows),
@@ -517,6 +655,165 @@ def compare(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------------- curve --
+def _stage_seconds(workdir: Path) -> dict[str, float]:
+    """Stage wall times recorded by run_batch.sh (timing.jsonl) and the trainer (events)."""
+    out: dict[str, float] = {}
+    t = workdir / "timing.jsonl"
+    if t.exists():
+        for line in t.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                e = json.loads(line)
+                out[e["stage"]] = out.get(e["stage"], 0.0) + float(e["seconds"])
+    ev = workdir / "events.jsonl"
+    if ev.exists() and "train" not in out:
+        started = done = None
+        for line in ev.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            e = json.loads(line)
+            if e.get("type") == "started" and started is None:
+                started = e["ts"]
+            if e.get("type") == "done":
+                done = e["ts"]
+        if started is not None and done is not None:
+            out["train"] = done - started
+    return out
+
+
+def _l1(report: dict[str, Any], set_name: str, target: str) -> dict[str, Any] | None:
+    t = report.get("benchmark", {}).get("sets", {}).get(set_name, {}).get("targets", {}).get(target)
+    return t["l1"] if t else None
+
+
+def _mean(v: Any) -> float | None:
+    if v is None:
+        return None
+    return float(v["mean"]) if isinstance(v, dict) else float(v)
+
+
+def curve_rows(paths: list[Path]) -> list[dict[str, Any]]:
+    rows = []
+    for path in paths:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        meta = data.get("pilot", {})
+        ind, ood = _l1(data, "in_dist", "adapter"), _l1(data, "ood", "adapter")
+        if ind is None:
+            continue
+        stages = _stage_seconds(path.parent)
+        rgt = meta.get("rgt") or {}
+        rows.append(
+            {
+                "run": path.parent.name,
+                "method": meta.get("method", "sft"),
+                "records": meta.get("records"),
+                "seed": meta.get("seed"),
+                "train_samples": meta.get("samples", {}).get("train"),
+                "rgt_attempt_pass_rate": (rgt.get("attempts") or {}).get("pass_rate"),
+                "fixed_test": meta.get("test_set", {}).get("fixed", False),
+                "test_records": meta.get("test_set", {}).get("records"),
+                "decision_in_dist": _mean(ind.get("decision_accuracy")),
+                "task_score_in_dist": _mean(ind.get("task_score")),
+                "tool_call_in_dist": ind.get("tool_call_accuracy"),
+                "json_validity_in_dist": ind.get("json_validity"),
+                "decision_ood": _mean(ood.get("decision_accuracy")) if ood else None,
+                "base_decision_in_dist": _mean((_l1(data, "in_dist", "base") or {}).get("decision_accuracy")),
+                "prepare_s": stages.get("prepare"),
+                "train_s": stages.get("train"),
+                "eval_s": stages.get("eval"),
+            }
+        )
+    rows.sort(key=lambda r: (r["method"], r["records"] or 0, r["seed"] or 0))
+    return rows
+
+
+def curve_summary(rows: list[dict[str, Any]], threshold: float) -> dict[str, Any]:
+    """Fewest records at which each method reaches `threshold` in-dist decision accuracy."""
+    out: dict[str, Any] = {"threshold": threshold, "methods": {}}
+    for m in sorted({r["method"] for r in rows}):
+        hit = next(
+            (r for r in rows if r["method"] == m and (r["decision_in_dist"] or 0) >= threshold),
+            None,
+        )
+        out["methods"][m] = (
+            None
+            if hit is None
+            else {
+                "records": hit["records"],
+                "minutes_to_adapter": round(((hit["prepare_s"] or 0) + (hit["train_s"] or 0)) / 60, 1),
+            }
+        )
+    a, b = out["methods"].get("sft"), out["methods"].get("rgt")
+    if a and b and b["records"]:
+        out["sft_over_rgt_records"] = round(a["records"] / b["records"], 2)
+    return out
+
+
+def curve_markdown(rows: list[dict[str, Any]], summary: dict[str, Any]) -> str:
+    def pct(v: float | None) -> str:
+        return "n/a" if v is None else f"{v * 100:.1f}%"
+
+    def mins(*vals: float | None) -> str:
+        known = [v for v in vals if v is not None]
+        return "n/a" if not known else f"{sum(known) / 60:.1f}"
+
+    lines = [
+        "# Learning curve: standard SFT vs Rationale-Guided Training (RGT)",
+        "",
+        "| Method | Records | Train samples | Prepare min | Train min | Minutes to adapter | Decision acc (in-dist) "
+        "| Task score | Decision acc (OOD) | Tool-call acc | Base attempts correct |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['method'].upper()} | {r['records']} | {r['train_samples']} | {mins(r['prepare_s'])} | "
+            f"{mins(r['train_s'])} | {mins(r['prepare_s'], r['train_s'])} | {pct(r['decision_in_dist'])} | "
+            f"{pct(r['task_score_in_dist'])} | {pct(r['decision_ood'])} | {pct(r['tool_call_in_dist'])} | "
+            f"{pct(r['rgt_attempt_pass_rate'])} |"
+        )
+    base = next((r["base_decision_in_dist"] for r in rows if r["base_decision_in_dist"] is not None), None)
+    lines += ["", f"Base model, no fine-tuning: {pct(base)} decision accuracy (in-dist)."]
+    th = summary["threshold"]
+    for m, hit in summary["methods"].items():
+        lines.append(
+            f"{m.upper()}: "
+            + (
+                f"reaches {th:.0%} decision accuracy at {hit['records']} records "
+                f"({hit['minutes_to_adapter']} min data prep + training)."
+                if hit
+                else f"does not reach {th:.0%} at the sizes tested."
+            )
+        )
+    if "sft_over_rgt_records" in summary:
+        lines.append(f"SFT needs {summary['sft_over_rgt_records']}x the records RGT needs to reach that threshold.")
+    fixed = all(r["fixed_test"] for r in rows)
+    lines += [
+        "",
+        "Caveats: "
+        + ("all runs scored on the same fixed test set; " if fixed else "WARNING: test sets differ between runs; ")
+        + "synthetic invoice data from a rules generator; one training seed per point; RGT trains one extra "
+        "(strategy) sample per decision, about 4 samples per record vs 3 for SFT, so it uses ~33% more "
+        "training compute per record (compare the train-minutes column, not only records).",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def curve(args: argparse.Namespace) -> int:
+    rows = curve_rows([Path(p) for p in args.reports])
+    if not rows:
+        print("no evaluated reports", file=sys.stderr)
+        return 2
+    summary = curve_summary(rows, args.threshold)
+    md = curve_markdown(rows, summary)
+    if args.out:
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "curve.json").write_text(json.dumps({"rows": rows, "summary": summary}, indent=2), encoding="utf-8")
+        (out / "curve.md").write_text(md, encoding="utf-8")
+    print(md)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -535,6 +832,14 @@ def main() -> int:
     p.add_argument("--force", action="store_true")
     p.add_argument("--profile", default=DEFAULT_PROFILE, help="model profile ref (profiles/<ref>.yaml)")
     p.add_argument("--allow-draft", action="store_true", help="allow an unvalidated profile (not for evidence)")
+    p.add_argument("--method", choices=["sft", "rgt"], default="sft", help="rgt = Rationale-Guided Training data")
+    p.add_argument("--test-n", type=int, default=0, help="fixed, separately generated test set size (0 = split)")
+    p.add_argument("--test-seed", type=int, default=7777)
+    p.add_argument("--attempts-url", help="vLLM URL serving the base model, for on-policy RGT attempts")
+    p.add_argument("--attempts-key", default="", help="vLLM API key")
+    p.add_argument("--attempts-model", default="", help="served model name that answers the attempts")
+    p.add_argument("--attempts-cache", help="JSONL cache of attempts, shared across training sizes")
+    p.add_argument("--attempts-concurrency", type=int, default=8)
 
     e = sub.add_parser("evaluate")
     e.add_argument("--workdir", required=True)
@@ -563,6 +868,11 @@ def main() -> int:
     c.add_argument("reports", nargs="+", help="report.json files")
     c.add_argument("--out", help="directory for comparison.json and comparison.md")
 
+    cv = sub.add_parser("curve", help="learning curve across methods and training sizes")
+    cv.add_argument("reports", nargs="+", help="report.json files")
+    cv.add_argument("--threshold", type=float, default=0.95, help="in-dist decision accuracy to reach")
+    cv.add_argument("--out", help="directory for curve.json and curve.md")
+
     pe = sub.add_parser("profile-env", help="print shell exports for a profile")
     pe.add_argument("--profile", default=DEFAULT_PROFILE)
 
@@ -575,6 +885,8 @@ def main() -> int:
         return asyncio.run(_evaluate(args))
     if args.cmd == "compare":
         return compare(args)
+    if args.cmd == "curve":
+        return curve(args)
     if args.cmd == "profile-env":
         return profile_env(args)
     print(secrets.token_urlsafe(32))

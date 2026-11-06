@@ -31,13 +31,7 @@ say "throughput bench: $PROFILE_REF ($HF_ID@${HF_REVISION:0:12}), concurrency [$
 ensure_vllm_venv || die "vLLM install failed; see $LOG"
 ensure_key || die "could not create the vLLM API key"
 
-if [ ! -f "$MODEL_CACHE/config.json" ]; then
-  check_network || die "cannot reach Hugging Face to download $HF_ID"
-  say "downloading $HF_ID (about 16 GB for an 8B model)"
-  mkdir -p "$MODEL_CACHE"
-  "$TRAINER_PY" -c "import sys; from huggingface_hub import snapshot_download as d; d(repo_id=sys.argv[1], revision=sys.argv[2] or None, local_dir=sys.argv[3])" \
-    "$HF_ID" "$HF_REVISION" "$MODEL_CACHE" >>"$LOG" 2>&1 || die "model download failed; see $LOG"
-fi
+ensure_model "$MODEL_CACHE" || die "model download failed; see $LOG"
 
 stop_vllm   # a clean server with known settings, never one left over from another job
 ensure_vllm "$MODEL_CACHE" "$DEST/vllm.log.txt" || die "vLLM did not start (see $DEST/vllm.log.txt)"

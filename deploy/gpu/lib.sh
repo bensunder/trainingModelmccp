@@ -125,10 +125,20 @@ wait_training() {  # $1 workdir; returns 0 when done, 1 on trainer error / death
   done
 }
 
+ensure_model() {  # $1 model dir: download the profile's pinned base model if missing
+  [ -f "$1/config.json" ] && return 0
+  check_network || return 1
+  say "downloading $HF_ID (about 16 GB for an 8B model)"
+  mkdir -p "$1"
+  "$TRAINER_PY" -c "import sys; from huggingface_hub import snapshot_download as d; d(repo_id=sys.argv[1], revision=sys.argv[2] or None, local_dir=sys.argv[3])" \
+    "$HF_ID" "${HF_REVISION:-}" "$1" >>"$LOG" 2>&1
+}
+
 save_run() {  # $1 workdir, $2 destination (under /workspace, which GridShare keeps)
   mkdir -p "$2"
   cp "$1"/output/adapter_config.json "$1"/output/adapter_model.safetensors "$2"/ 2>/dev/null
-  cp "$1"/{events.jsonl,pilot.json,run.json,report.json,soup.yaml} "$2"/ 2>/dev/null
+  cp "$1"/{events.jsonl,pilot.json,run.json,report.json,soup.yaml,timing.jsonl} "$2"/ 2>/dev/null
+  cp "$1"/data/rgt_strategies.jsonl "$2"/ 2>/dev/null
   # GridShare's /workspace save skips *.log, so keep logs as .txt.
   local f
   for f in train vllm pilot-run batch trainer; do

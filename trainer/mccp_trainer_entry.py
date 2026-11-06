@@ -14,6 +14,8 @@ Contract with the control plane (run.json in, events.jsonl out):
    (`tools=`) must be token-identical to the profile rendering; string tool
    arguments must render identically to objects. Any drift fails the job
    before a GPU hour is spent.
+4b. RGT rows (if any): the strategy must survive the template inside the final
+   turn's reasoning block, and pair A must render exactly as the model is served.
 5. Token statistics: p50/p95/p99 sample length; refuse if p99 > max_length
    (truncation would cut the supervised assistant turn); trained_tokens.
 6. Write soup.yaml and run `soup train`, forwarding progress as JSON events.
@@ -123,6 +125,51 @@ def render_row(row: dict[str, Any], chat: dict[str, Any]) -> dict[str, Any]:
             f"{chat.get('profile')}; rebuild the dataset version (current builds keep tools unrendered)"
         )
     return {"messages": row["messages"]}
+
+
+def rgt_render_check(tok: Any, rows: list[dict[str, Any]], chat: dict[str, Any], kwargs: dict[str, Any]) -> int:
+    """Rationale-Guided Training rows must survive the real chat template.
+
+    Pair B: the strategy must appear exactly once, inside the final turn's
+    reasoning block, before the answer. Pair A: the rendered turn must equal
+    the serving prompt (generation prompt with the reasoning mode off) followed
+    by the answer, i.e. the model is trained exactly the way it is served.
+    Some templates drop reasoning from earlier turns or ignore it altogether;
+    either fails here, before a GPU hour is spent. Returns rows checked."""
+    reasoning = chat.get("reasoning") or {}
+    open_tag, close_tag = reasoning.get("open_tag"), reasoning.get("close_tag")
+    marked = [r for r in rows if isinstance(r.get("rgt"), dict)]
+    if not marked:
+        return 0
+    if not open_tag or not close_tag:
+        raise ValueError(f"RGT rows present but profile {chat.get('profile')} declares no reasoning block")
+    checked = {"A": 0, "B": 0}
+    for row in marked:
+        pair = row["rgt"].get("pair")
+        if pair not in checked or checked[pair] >= 10:
+            continue
+        msgs = render_row(row, chat)["messages"]
+        text = tok.apply_chat_template(msgs, tokenize=False, **kwargs)
+        if pair == "B":
+            strategy = row["rgt"]["strategy"]
+            answer = msgs[-1]["content"].split(close_tag, 1)[1].strip()
+            at, o, c = text.find(strategy), text.rfind(open_tag), text.rfind(close_tag)
+            if text.count(strategy) != 1 or not (o < at < c) or text.rfind(answer) < c:
+                raise ValueError(
+                    f"render-check failed: profile {chat.get('profile')} chat template does not keep the RGT "
+                    "strategy inside the final turn's reasoning block"
+                )
+        else:
+            served = tok.apply_chat_template(msgs[:-1], tokenize=False, add_generation_prompt=True, **kwargs)
+            if not text.startswith(served + msgs[-1]["content"]):
+                raise ValueError(
+                    f"render-check failed: profile {chat.get('profile')} renders RGT pair A differently from the "
+                    "serving prompt (reasoning off) plus the answer"
+                )
+        checked[pair] += 1
+    if checked["A"] == 0 or checked["B"] == 0:
+        raise ValueError("RGT rows must include both A and B pairs")
+    return checked["A"] + checked["B"]
 
 
 def template_kwargs(run: dict[str, Any]) -> dict[str, Any]:
@@ -238,6 +285,11 @@ def preflight(run: dict[str, Any], ev: Events) -> dict[str, Any]:
                 )
             args_checked += 1
 
+    try:
+        rgt_checks = rgt_render_check(tok, read_jsonl(run["train_path"]), chat, kwargs)
+    except ValueError as e:
+        raise SystemExit(_fail(ev, EXIT_PREFLIGHT, str(e))) from e
+
     lengths = []
     for row in train_rows:
         lengths.append(len(tok.apply_chat_template(row["messages"], tokenize=True, **kwargs)))
@@ -261,6 +313,7 @@ def preflight(run: dict[str, Any], ev: Events) -> dict[str, Any]:
         "rendering_sha256": chat.get("rendering_sha256"),
         "render_check_records": checked,
         "tool_argument_render_checks": args_checked,
+        "rgt_render_checks": rgt_checks,
         "token_stats": stats,
         "trained_tokens": int(sum(lengths) * epochs),
         "token_count_method": "tokenizer.apply_chat_template",
