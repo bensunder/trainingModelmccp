@@ -283,9 +283,10 @@ cmd_baseline() {
 }
 
 # ------------------------------------------------------------------ runner --
-runner_active() {
+runner_active() {  # a live runner loop, not just any process holding the lock file
   [ -f "$MCCP_HOME/runner.lock" ] || return 1
-  ! flock -n "$MCCP_HOME/runner.lock" true 2>/dev/null
+  flock -n "$MCCP_HOME/runner.lock" true 2>/dev/null && return 1
+  pgrep -f "$P_RUNNER" >/dev/null
 }
 
 start_runner() {
@@ -305,7 +306,12 @@ foreign_gpu_work() { pgrep -f "$P_BATCH" >/dev/null || pgrep -f "$P_TRAINER" >/d
 
 cmd_run() {  # internal: the queue loop (exactly one per box)
   exec 9>"$MCCP_HOME/runner.lock"
-  flock -n 9 || { echo "a runner is already active"; exit 0; }
+  if ! flock -n 9; then
+    if pgrep -f "$P_RUNNER" | grep -vqx "$$"; then echo "a runner is already active"; exit 0; fi
+    # Lock held by a leftover child of an earlier runner (e.g. a vLLM it started).
+    log "runner lock held by pids: $(fuser "$MCCP_HOME/runner.lock" 2>/dev/null); stop them (mccp-gpu stop) and run: mccp-gpu up"
+    exit 1
+  fi
   log "runner up (pid $$)"
   while true; do
     local item
@@ -343,8 +349,8 @@ cmd_run() {  # internal: the queue loop (exactly one per box)
       if [ "${BASELINE_DISABLED:-0}" = 1 ]; then unset BASELINE_URL BASELINE_MODEL MCCP_BASELINE_API_KEY; fi
       PROFILE="$profile" N="${n%%,*}" SIZES="${n//,/ }" METHODS="${methods:-sft}" TEST_N="${test_n:-}" \
         EPOCHS="$epochs" SEEDS="${seeds//,/ }" RUNS="$runs" DEST="$dest" REPO="$rel" \
-        bash "${MCCP_GPU_BATCH_CMD:-$rel/deploy/gpu/run_batch.sh}"
-    ) >> "$RUNNER_LOG" 2>&1
+        bash "${MCCP_GPU_BATCH_CMD:-$rel/deploy/gpu/run_batch.sh}" 9>&-
+    ) >> "$RUNNER_LOG" 2>&1   # 9>&-: the batch (and the vLLM it starts) must not inherit the runner lock
     local rc=$?
     printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$profile" "$rc" "$dest" "$(date -u +%FT%TZ)" >> "$DONE"
     with_queue_lock _queue_pop_if "$id"
