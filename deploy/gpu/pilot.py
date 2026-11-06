@@ -214,6 +214,7 @@ def prepare(args: argparse.Namespace) -> int:
     #    with like; all `--n` records go to train/val.
     raw = b"".join(json.dumps(r, ensure_ascii=False).encode() + b"\n" for r in generate(args.n, seed=args.data_seed))
     params = BuildParams(seed=args.data_seed)
+    test_dropped = 0
     if args.test_n:
         params = BuildParams(seed=args.data_seed, ratios=(0.9, 0.1, 0.0), min_records={"train": 1, "val": 1, "test": 0})
     try:
@@ -228,15 +229,25 @@ def prepare(args: argparse.Namespace) -> int:
     val_rows = _jsonl(built.files["val.jsonl"])
     if args.test_n:
         test_rows, _ = redact_records(generate(args.test_n, seed=args.test_seed, id_offset=TEST_ID_OFFSET))
-        test_overlap = sum(
-            contaminated(
-                [input_text(r["messages"]) for r in train_rows + val_rows],
-                [input_text(r["messages"]) for r in test_rows],
-                n=13,
+        # Same rule as the pipeline's own split: drop train/val samples that share a
+        # non-boilerplate 13-gram with the test inputs. With templated text a few
+        # chance matches (e.g. a repeated random PO number) are expected; more than
+        # 2% would mean real overlap between the generators, so that refuses.
+        test_texts = [input_text(r["messages"]) for r in test_rows]
+        before = len(train_rows) + len(val_rows)
+        flags_train = contaminated([input_text(r["messages"]) for r in train_rows], test_texts, n=13)
+        flags_val = contaminated([input_text(r["messages"]) for r in val_rows], test_texts, n=13)
+        train_rows = [r for r, bad in zip(train_rows, flags_train, strict=True) if not bad]
+        val_rows = [r for r, bad in zip(val_rows, flags_val, strict=True) if not bad]
+        test_dropped = before - len(train_rows) - len(val_rows)
+        if test_dropped > 0.02 * before:
+            print(
+                f"{test_dropped}/{before} train/val samples share 13-grams with the fixed test set; refusing",
+                file=sys.stderr,
             )
-        )
-        if test_overlap:
-            print(f"{test_overlap} train/val samples share 13-grams with the fixed test set; refusing", file=sys.stderr)
+            return 3
+        if not train_rows or not val_rows:
+            print("no train/val samples left after decontamination", file=sys.stderr)
             return 3
         golden_bytes = b"".join(json.dumps(r, ensure_ascii=False).encode() + b"\n" for r in test_rows)
     else:
@@ -358,6 +369,7 @@ def prepare(args: argparse.Namespace) -> int:
             "fixed": bool(args.test_n),
             "records": len(test_rows),
             "seed": args.test_seed if args.test_n else args.data_seed,
+            "dropped_train_val_samples": test_dropped,
         },
         "dataset": {"manifest_sha256": built.manifest_sha256, "card": built.card},
         "ood": {"records": len(ood_rows), "seed": args.ood_seed, "pii_placeholders": ood_pii, "train_overlap": 0},

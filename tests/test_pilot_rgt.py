@@ -45,7 +45,12 @@ def test_fixed_test_set_is_identical_across_sizes_and_disjoint_from_training(tmp
     test_ids = {r["meta"]["source_id"] for r in _jsonl(tmp_path / "n60/data/golden.jsonl")}
     assert len(test_ids) == 40
     meta = json.loads((tmp_path / "n120/pilot.json").read_text())
-    assert meta["test_set"] == {"fixed": True, "records": 40, "seed": 7777}
+    assert {k: meta["test_set"][k] for k in ("fixed", "records", "seed")} == {
+        "fixed": True,
+        "records": 40,
+        "seed": 7777,
+    }
+    assert meta["test_set"]["dropped_train_val_samples"] >= 0
     train_text = (tmp_path / "n120/data/train.jsonl").read_text()
     assert not any(i in train_text for i in test_ids)
 
@@ -97,6 +102,15 @@ def test_rgt_attempts_are_on_policy_and_cached(tmp_path):
     assert meta["rgt"]["attempts"]["graded"] == meta["rgt"]["b_rows"]
     assert meta["rgt"]["attempts_model"] == BASE
     assert meta["rgt"]["b_rows_with_mistake"] == meta["rgt"]["attempts"]["graded"] - meta["rgt"]["attempts"]["passed"]
+
+
+def test_chance_overlap_with_fixed_test_set_is_dropped_not_fatal(tmp_path):
+    # Production sizes: random PO numbers make a few chance 13-gram matches likely.
+    r = _prepare(tmp_path / "n300", "--n", "300", "--test-n", "300")
+    assert r.returncode == 0, r.stderr
+    meta = json.loads((tmp_path / "n300/pilot.json").read_text())
+    dropped = meta["test_set"]["dropped_train_val_samples"]
+    assert 0 < dropped <= 0.02 * (meta["samples"]["train"] + meta["samples"]["val"] + dropped)
 
 
 def test_attempts_flag_needs_rgt(tmp_path):
