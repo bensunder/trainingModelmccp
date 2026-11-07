@@ -35,6 +35,8 @@ from typing import Any, Literal
 import httpx
 import jsonschema
 
+from mccp.rules import RULESETS
+
 from . import layers
 from .stats import bootstrap_mean_ci, mean, percentile
 from .suite import EvalSuite
@@ -280,6 +282,20 @@ def _breakdown(values: dict[str, list[float]]) -> dict[str, dict[str, Any]]:
     return {k: {"n": len(v), "accuracy": round(mean(v), 4)} for k, v in sorted(values.items())}
 
 
+def _rules_decision_correct(rules: Any, meta: dict[str, Any], sc: dict[str, Any]) -> float:
+    """Extract-then-rules: run the policy on what the model extracted (lookups by
+    the extracted ids) and compare with the record's label. Invalid output, an
+    endpoint error or a record without lookups is wrong, never skipped."""
+    if sc.get("error") or not sc.get("json_valid") or "lookups" not in meta or "expected" not in meta:
+        return 0.0
+    try:
+        got = rules(meta, json.loads(sc["content"]))
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+    exp = meta["expected"]
+    return float(got.decision == exp["decision"] and got.reason_code == exp["reason_code"])
+
+
 def summarize_set(
     items: list[layers.Item],
     scores: list[dict[str, Any]],
@@ -290,14 +306,21 @@ def summarize_set(
     out = layers.summarize_l1(scores)
     by_scenario: dict[str, list[float]] = defaultdict(list)
     by_kind: dict[str, list[float]] = defaultdict(list)
+    by_field: dict[str, list[float]] = defaultdict(list)
     lenient: list[float] = []
     decision_correct: list[float] = []
+    rules = RULESETS[suite.decision_rules] if suite.decision_rules else None
     for it, sc in zip(items, scores, strict=True):
         if it.kind != "final":
             continue
         meta = records[it.record].get("meta") or {}
         expected = json.loads(it.expected["content"])
-        ok = float(sc.get("fields", {}).get("reason_code", False) and sc.get("fields", {}).get("decision", False))
+        for f, hit in (sc.get("fields") or {}).items():
+            by_field[f].append(float(hit))
+        if rules is not None:
+            ok = _rules_decision_correct(rules, meta, sc)
+        else:
+            ok = float(sc.get("fields", {}).get("reason_code", False) and sc.get("fields", {}).get("decision", False))
         decision_correct.append(ok)
         by_scenario[str(meta.get("scenario", "unknown"))].append(ok)
         if "ood_kind" in meta:
@@ -311,6 +334,8 @@ def summarize_set(
     out["decision_accuracy"] = bootstrap_mean_ci(decision_correct) if decision_correct else None
     out["field_accuracy_lenient"] = mean(lenient) if lenient else None
     out["by_scenario"] = _breakdown(by_scenario)
+    out["field_accuracy_by_field"] = {f: round(mean(v), 4) for f, v in sorted(by_field.items())} or None
+    out["decision_source"] = f"rules:{suite.decision_rules}" if rules is not None else "model"
     if by_kind:
         out["by_ood_kind"] = _breakdown(by_kind)
     return out

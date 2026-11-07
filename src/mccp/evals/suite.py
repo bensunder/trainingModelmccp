@@ -65,6 +65,17 @@ class EvalSuite(BaseModel):
     safety: SafetyConfig = SafetyConfig()
     regression: RegressionConfig | None = None
     performance: PerformanceConfig = PerformanceConfig()
+    # Extract-then-rules tasks: the model returns facts, this policy turns them into
+    # the decision, and decision accuracy is scored on the policy's output.
+    decision_rules: str | None = None
+
+    @model_validator(mode="after")
+    def _known_rules(self) -> "EvalSuite":
+        from mccp.rules import RULESETS
+
+        if self.decision_rules is not None and self.decision_rules not in RULESETS:
+            raise ValueError(f"unknown decision_rules {self.decision_rules!r} (known: {', '.join(RULESETS)})")
+        return self
 
     @model_validator(mode="after")
     def _golden_is_test(self) -> "EvalSuite":

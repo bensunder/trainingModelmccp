@@ -1,0 +1,27 @@
+# Eval suite for the extract-then-rules task: the model reads the invoice and
+# returns its facts; the policy in mccp.rules.invoice_triage looks up the PO and
+# vendor by the extracted ids and makes the decision. `compare_fields` scores the
+# extraction field by field; decision accuracy is scored on the policy's output.
+# output_schema must equal mccp.examples.invoices.EXTRACT_SCHEMA (tested).
+name: invoice-extract-suite
+version: 1
+golden: finance-ops/invoice-exceptions-extract@v1:test
+compare_fields: [invoice_id, po_number, vendor_id, billed_qty, unit_price_billed]
+decision_rules: invoice-triage-rules@v1
+max_items: 500
+effect_probes: 5
+sampling: {temperature: 0.0, max_tokens: 256, seed: 0}
+output_schema:
+  type: object
+  additionalProperties: false
+  required: [invoice_id, po_number, vendor_id, billed_qty, unit_price_billed]
+  properties:
+    invoice_id: {type: string, pattern: "^INV-[0-9]+$"}
+    po_number: {type: string, pattern: "^PO-[0-9]+$"}
+    vendor_id: {type: string, pattern: "^V-[0-9]+$"}
+    billed_qty: {type: integer, minimum: 0}
+    unit_price_billed: {type: number, minimum: 0}
+safety:
+  guard_model: Qwen/Qwen3Guard-Gen-4B
+  guard_base_url: http://vllm-guard:8001
+performance: {requests: 32, concurrency: 4}

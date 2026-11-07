@@ -54,7 +54,7 @@ from mccp.evals.benchmark import (
 )
 from mccp.evals.guard import live_guard, static_guard
 from mccp.evals.suite import EvalSuite
-from mccp.examples.invoices import TRAIN_MIXES, generate, generate_ood
+from mccp.examples.invoices import TASKS, TRAIN_MIXES, generate, generate_ood
 from mccp.examples.messy import generate_messy
 from mccp.rgt import Attempt, build_rgt_rows, final_turn_prompt, hinge_rows
 from mccp.rgt.invoices import InvoiceRuleGrader, InvoiceTemplateDistiller
@@ -98,6 +98,22 @@ def redact_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
         total += sum(scope.counters.values())
         out.append(d)
     return out, total
+
+
+# task -> (eval suite file, decision policy or None when the model decides)
+SUITE_FILES = {
+    "agent": ("examples/suite-invoice-triage.yaml", None),
+    "extract": ("examples/suite-invoice-extract.yaml", "invoice-triage-rules@v1"),
+}
+
+
+def load_suite(task: str) -> EvalSuite:
+    if task not in SUITE_FILES:
+        raise SystemExit(f"unknown task {task!r} in pilot.json")
+    suite = EvalSuite.model_validate(yaml.safe_load((REPO / SUITE_FILES[task][0]).read_text(encoding="utf-8")))
+    if suite.decision_rules != SUITE_FILES[task][1]:
+        raise SystemExit(f"{SUITE_FILES[task][0]} decision_rules does not match task {task}")
+    return suite
 
 
 def load_profile(ref: str) -> ModelProfile:
@@ -192,6 +208,9 @@ def prepare(args: argparse.Namespace) -> int:
     if (workdir / "run.json").exists() and not args.force:
         print(f"{workdir}/run.json already exists; pass --force to rebuild", file=sys.stderr)
         return 2
+    if args.task == "extract" and args.method == "rgt":
+        print("--method rgt supervises the decision turn; the extract task has none (use sft)", file=sys.stderr)
+        return 2
     if args.attempts_url and (args.method != "rgt" or not args.attempts_model):
         print("--attempts-url needs --method rgt and --attempts-model", file=sys.stderr)
         return 2
@@ -217,7 +236,7 @@ def prepare(args: argparse.Namespace) -> int:
     #    messy sets are always generated from their own seeds and stay identical.
     raw = b"".join(
         json.dumps(r, ensure_ascii=False).encode() + b"\n"
-        for r in generate(args.n, seed=args.data_seed, mix=args.train_mix)
+        for r in generate(args.n, seed=args.data_seed, mix=args.train_mix, task=args.task)
     )
     params = BuildParams(seed=args.data_seed)
     test_dropped = 0
@@ -234,7 +253,9 @@ def prepare(args: argparse.Namespace) -> int:
     train_rows = _jsonl(built.files["train.jsonl"])
     val_rows = _jsonl(built.files["val.jsonl"])
     if args.test_n:
-        test_rows, _ = redact_records(generate(args.test_n, seed=args.test_seed, id_offset=TEST_ID_OFFSET))
+        test_rows, _ = redact_records(
+            generate(args.test_n, seed=args.test_seed, id_offset=TEST_ID_OFFSET, task=args.task)
+        )
         # Same rule as the pipeline's own split: drop train/val samples that share a
         # non-boilerplate 13-gram with the test inputs. With templated text a few
         # chance matches (e.g. a repeated random PO number) are expected; more than
@@ -296,7 +317,7 @@ def prepare(args: argparse.Namespace) -> int:
 
     # 2. OOD set: fixed seed (independent of the training seed) so every run is
     #    scored on identical OOD records; redacted like the golden split.
-    ood_rows, ood_pii = redact_records(generate_ood(args.ood_n, seed=args.ood_seed))
+    ood_rows, ood_pii = redact_records(generate_ood(args.ood_n, seed=args.ood_seed, task=args.task))
     overlap = sum(
         contaminated(
             [input_text(r["messages"]) for r in ood_rows],
@@ -339,6 +360,10 @@ def prepare(args: argparse.Namespace) -> int:
     raw_job["recipe"] = recipe_ref
     raw_job["method"]["sft"]["hyperparameters"]["n_epochs"] = args.epochs
     raw_job["seed"] = args.seed
+    if args.task == "extract":
+        raw_job["training_dataset"] = "finance-ops/invoice-exceptions-extract@v1:train"
+        raw_job["validation_dataset"] = "finance-ops/invoice-exceptions-extract@v1:val"
+        raw_job["eval_suite"] = "invoice-extract-suite@v1"
     cfg = JobRequest.model_validate(raw_job).resolve(recipe, profile, allow_draft_profile=args.allow_draft)
 
     # 4. Trainer workdir: data, golden sets, run.json (the trainer entrypoint's contract).
@@ -350,7 +375,7 @@ def prepare(args: argparse.Namespace) -> int:
     _write_jsonl(workdir / "data" / SET_FILES["ood"], ood_rows)
     messy_meta = None
     if args.messy_n:
-        messy_rows, messy_pii = redact_records(generate_messy(args.messy_n, seed=args.messy_seed))
+        messy_rows, messy_pii = redact_records(generate_messy(args.messy_n, seed=args.messy_seed, task=args.task))
         _write_jsonl(workdir / "data" / SET_FILES["messy"], messy_rows)
         messy_meta = {"records": len(messy_rows), "seed": args.messy_seed, "pii_placeholders": messy_pii}
     run = prepare_workdir(
@@ -374,6 +399,8 @@ def prepare(args: argparse.Namespace) -> int:
         "data_seed": args.data_seed,
         "epochs": args.epochs,
         "method": args.method,
+        "task": args.task,
+        "decision_rules": SUITE_FILES[args.task][1],
         "train_mix": args.train_mix,
         "records": args.n,
         "rgt": rgt_provenance,
@@ -400,6 +427,7 @@ def prepare(args: argparse.Namespace) -> int:
                 "config_hash": manifest["config_hash"],
                 "seed": args.seed,
                 "method": args.method,
+                "task": args.task,
                 "train_mix": args.train_mix,
                 "rgt_b_rows": rgt_provenance["b_rows"] if rgt_provenance else 0,
                 "rgt_attempt_pass_rate": rgt_provenance["attempts"]["pass_rate"] if rgt_provenance else None,
@@ -422,11 +450,13 @@ def _verdict(static: dict[str, Any] | None, live: dict[str, Any] | None, in_dist
     t = in_dist["targets"]
     a = t["adapter"]["l1"]
     b = t["base"]["l1"] if "base" in t else None
+    tools = a["tool_call_parse_rate"]
     checks: dict[str, bool | None] = {
         "static_guard_clean": not static["problems"] if static else None,
         "adapter_has_effect": not live["no_observable_effect"] if live else None,
-        "tool_calls_parsed_ge_95pct": (a["tool_call_parse_rate"] or 0) >= 0.95,
-        "no_tool_calls_leaked_into_content": a["tool_calls_leaked_into_content"] == 0,
+        # A task without tool calls (extract) has no tool-call checks, not failed ones.
+        "tool_calls_parsed_ge_95pct": None if tools is None else tools >= 0.95,
+        "no_tool_calls_leaked_into_content": None if tools is None else a["tool_calls_leaked_into_content"] == 0,
         "json_validity_ge_90pct": (a["json_validity"] or 0) >= 0.90,
         "no_thinking_in_answers": a["thinking_leaks"] == 0,
         "beats_base_on_task_score": a["task_score"]["mean"] > b["task_score"]["mean"] if b else None,
@@ -519,9 +549,7 @@ async def _evaluate(args: argparse.Namespace) -> int:
     profile = load_profile(pilot_meta.get("profile", DEFAULT_PROFILE))
     base_served = served_base_name(profile)
     xbody = extra_body(profile)
-    suite = EvalSuite.model_validate(
-        yaml.safe_load((REPO / "examples/suite-invoice-triage.yaml").read_text(encoding="utf-8"))
-    )
+    suite = load_suite(pilot_meta.get("task", "agent"))
     vllm = VllmClient(args.vllm_url, args.vllm_api_key, timeout=args.timeout)
     static = live = None
     frontier = None
@@ -742,7 +770,8 @@ def curve_rows(paths: list[Path]) -> list[dict[str, Any]]:
             {
                 "run": path.parent.name,
                 "method": meta.get("method", "sft")
-                + ("" if meta.get("train_mix", "standard") == "standard" else f"+{meta['train_mix']}"),
+                + ("" if meta.get("train_mix", "standard") == "standard" else f"+{meta['train_mix']}")
+                + ("" if meta.get("task", "agent") == "agent" else f"+{meta['task']}"),
                 "records": meta.get("records"),
                 "seed": meta.get("seed"),
                 "train_samples": meta.get("samples", {}).get("train"),
@@ -867,7 +896,8 @@ def add_messy(args: argparse.Namespace) -> int:
     if not (workdir / "pilot.json").exists():
         print(f"{workdir} is not a prepared workdir", file=sys.stderr)
         return 2
-    rows, pii = redact_records(generate_messy(args.n, seed=args.seed))
+    task = json.loads((workdir / "pilot.json").read_text(encoding="utf-8")).get("task", "agent")
+    rows, pii = redact_records(generate_messy(args.n, seed=args.seed, task=task))
     _write_jsonl(workdir / "data" / SET_FILES["messy"], rows)
     print(json.dumps({"workdir": str(workdir), "messy_records": len(rows), "seed": args.seed, "pii_placeholders": pii}))
     return 0
@@ -897,6 +927,13 @@ def main() -> int:
         choices=list(TRAIN_MIXES),
         default="standard",
         help="training scenario mix; boundary adds near-threshold cases and rule collisions",
+    )
+    p.add_argument(
+        "--task",
+        choices=list(TASKS),
+        default="agent",
+        help="agent = the model calls the lookups and decides; extract = the model reads the invoice "
+        "facts in one call and the rules engine decides (mccp.rules.invoice_triage)",
     )
     p.add_argument("--messy-n", type=int, default=0, help="messy-invoice evaluation records (0 = none)")
     p.add_argument("--messy-seed", type=int, default=4242)

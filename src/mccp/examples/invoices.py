@@ -19,6 +19,8 @@ import random
 from dataclasses import dataclass
 from typing import Any
 
+from mccp.rules import invoice_triage as _rules
+
 SYSTEM_PROMPT = (
     "You are the accounts-payable exception triage assistant. Use the tools to look up the purchase "
     "order and the vendor before deciding. Reply with only a JSON object with keys decision, "
@@ -75,23 +77,10 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
-NEXT_ACTION = {
-    "WITHIN_TOLERANCE": "Approve for payment in the next payment run.",
-    "PRICE_VARIANCE": "Hold and request a price confirmation or credit memo from the vendor.",
-    "QTY_MISMATCH": "Hold until the remaining quantity is received or a credit memo is issued.",
-    "MISSING_PO": "Hold and ask the requester for a valid purchase order number.",
-    "DUPLICATE_INVOICE": "Reject as a duplicate and notify the vendor.",
-    "VENDOR_BANK_CHANGE": "Escalate to vendor-master security for call-back verification of bank details.",
-}
-
-DECISION = {
-    "WITHIN_TOLERANCE": "approve",
-    "PRICE_VARIANCE": "hold",
-    "QTY_MISMATCH": "hold",
-    "MISSING_PO": "hold",
-    "DUPLICATE_INVOICE": "reject",
-    "VENDOR_BANK_CHANGE": "escalate",
-}
+# The policy lives in mccp.rules.invoice_triage (single source of truth); these
+# names stay importable from here for the generators, RGT and tests.
+NEXT_ACTION = _rules.NEXT_ACTION
+DECISION = _rules.DECISION
 
 _ITEMS = [
     "safety valves",
@@ -129,8 +118,7 @@ class Case:
     variance_pct: float | None
 
 
-def _round(x: float) -> float:
-    return round(x + 0.0, 2)
+_round = _rules.round2
 
 
 # Training mixes. `standard` is the original distribution and must stay bit-identical
@@ -259,19 +247,10 @@ def make_case(rng: random.Random, idx: int, mix: str = "standard") -> Case:
 def decide(
     po: dict[str, Any] | None, vendor: dict[str, Any], invoice_id: str, billed_qty: int, billed_price: float
 ) -> tuple[str, float | None]:
-    """The ground-truth policy. Also used as a verifiable reward in Phase 2."""
-    if po is None:
-        return "MISSING_PO", None
-    variance = _round((billed_price - po["unit_price"]) / po["unit_price"] * 100)
-    if invoice_id in po["paid_invoices"]:
-        return "DUPLICATE_INVOICE", variance
-    if vendor["days_since_bank_change"] < 30:
-        return "VENDOR_BANK_CHANGE", variance
-    if billed_qty > po["received_qty"]:
-        return "QTY_MISMATCH", variance
-    if abs(variance) > 2.0:
-        return "PRICE_VARIANCE", variance
-    return "WITHIN_TOLERANCE", variance
+    """The ground-truth label: `mccp.rules.invoice_triage.evaluate`. Also used as a
+    verifiable reward in Phase 2."""
+    r = _rules.evaluate(po, vendor, invoice_id, billed_qty, billed_price)
+    return r.reason_code, r.variance_pct
 
 
 def user_message(c: Case) -> str:
@@ -320,13 +299,86 @@ def to_record(c: Case, user_text: str | None = None, meta: dict[str, Any] | None
     }
 
 
-def generate(n: int, seed: int = 7, id_offset: int = 0, mix: str = "standard") -> list[dict[str, Any]]:
+# ------------------------------------------------------------ extract task --
+# The model reads the invoice and returns its facts; code does the lookups and
+# applies `mccp.rules.invoice_triage`. One model call per invoice, no tool calls.
+TASKS = ("agent", "extract")
+EXTRACT_FIELDS = ["invoice_id", "po_number", "vendor_id", "billed_qty", "unit_price_billed"]
+EXTRACT_SYSTEM_PROMPT = (
+    "You read accounts-payable invoice exceptions and extract their facts. Reply with only a JSON object "
+    "with keys invoice_id, po_number, vendor_id, billed_qty and unit_price_billed. Write ids in canonical "
+    "form (INV-<digits>, PO-<digits>, V-<digits>), billed_qty as an integer and unit_price_billed as a "
+    "number in US dollars, without currency symbols or thousands separators."
+)
+EXTRACT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": EXTRACT_FIELDS,
+    "properties": {
+        "invoice_id": {"type": "string", "pattern": "^INV-[0-9]+$"},
+        "po_number": {"type": "string", "pattern": "^PO-[0-9]+$"},
+        "vendor_id": {"type": "string", "pattern": "^V-[0-9]+$"},
+        "billed_qty": {"type": "integer", "minimum": 0},
+        "unit_price_billed": {"type": "number", "minimum": 0},
+    },
+}
+
+
+def extraction(c: Case) -> dict[str, Any]:
+    """The facts the model must read from the invoice text (the extract task's label)."""
+    return {
+        "invoice_id": c.invoice_id,
+        "po_number": c.po_number,
+        "vendor_id": c.vendor_id,
+        "billed_qty": c.billed_qty,
+        "unit_price_billed": c.unit_price_billed,
+    }
+
+
+def to_extract_record(c: Case, user_text: str | None = None, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Same case and user text as `to_record`, extract-task supervision. `meta.lookups`
+    holds the system-of-record data keyed by id (what the PO and vendor services
+    would return), and `meta.expected` the policy answer, so the evaluation can run
+    the real pipeline on the *extracted* ids: a wrong id finds nothing, as it would
+    in production."""
+    return {
+        "messages": [
+            {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message(c) if user_text is None else user_text},
+            {"role": "assistant", "content": json.dumps(extraction(c))},
+        ],
+        "meta": {
+            "source_id": c.invoice_id,
+            "license": "internal",
+            "scenario": c.reason_code,
+            **(meta or {}),
+            "task": "extract",
+            "lookups": {
+                "po": {c.po_number: c.po} if c.po is not None else {},
+                "vendor": {c.vendor_id: c.vendor},
+            },
+            "expected": final_answer(c),
+        },
+    }
+
+
+def record_builder(task: str):
+    if task not in TASKS:
+        raise ValueError(f"unknown task {task!r}; choose from {', '.join(TASKS)}")
+    return to_record if task == "agent" else to_extract_record
+
+
+def generate(
+    n: int, seed: int = 7, id_offset: int = 0, mix: str = "standard", task: str = "agent"
+) -> list[dict[str, Any]]:
     """`id_offset` moves invoice/vendor ids into a disjoint range, so a separately
     generated test set can never share a `source_id` with training data.
     `mix` picks the scenario distribution (`standard` or `boundary`, see `_MIXES`);
-    labels always come from `decide`, so every mix is correct by construction."""
+    labels always come from `decide`, so every mix is correct by construction.
+    `task` picks the supervision format; the cases are identical for every task."""
+    build = record_builder(task)
     rng = random.Random(seed)
-    return [to_record(make_case(rng, i + id_offset, mix)) for i in range(n)]
+    return [build(make_case(rng, i + id_offset, mix)) for i in range(n)]
 
 
 def fixtures(n: int, seed: int = 7) -> dict[str, Any]:
@@ -504,16 +556,17 @@ def ood_user_message(c: Case, template_idx: int) -> str:
     )
 
 
-def generate_ood(n: int, seed: int = 1009) -> list[dict[str, Any]]:
+def generate_ood(n: int, seed: int = 1009, task: str = "agent") -> list[dict[str, Any]]:
     """`n` OOD records, kinds balanced round-robin, phrasings rotated
     independently so kind and wording are not confounded."""
     if n < 1:
         raise ValueError("n must be >= 1")
+    build = record_builder(task)
     rng = random.Random(seed)
     out = []
     for i in range(n):
         kind = OOD_KINDS[i % len(OOD_KINDS)]
         c = make_ood_case(rng, i, kind)
         tmpl = (i // len(OOD_KINDS) + i) % len(_OOD_TEMPLATES)
-        out.append(to_record(c, ood_user_message(c, tmpl), {"split": "ood", "ood_kind": kind, "template": tmpl}))
+        out.append(build(c, ood_user_message(c, tmpl), {"split": "ood", "ood_kind": kind, "template": tmpl}))
     return out

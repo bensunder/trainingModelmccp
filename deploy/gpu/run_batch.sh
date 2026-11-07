@@ -27,6 +27,8 @@
 #   copies of each decision sample; with RGT_ATTEMPTS=1 the base model's own answers are
 #   graded first so strategies name its actual mistakes). TEST_N fixes one test set for
 #   every size (required when SIZES has more than one value). Writes curve.md.
+#   TASK=extract: the model reads the invoice facts in one call and the rules engine
+#   (mccp.rules.invoice_triage) decides; decision accuracy is scored on the rules' output.
 #
 # Safe to re-run: finished prepares, trainings and evaluations are skipped.
 
@@ -56,6 +58,7 @@ TEST_N="${TEST_N:-}"
 TEST_SEED="${TEST_SEED:-7777}"
 RGT_ATTEMPTS="${RGT_ATTEMPTS:-1}"
 TRAIN_MIX="${TRAIN_MIX:-standard}"   # standard | boundary (near-threshold cases + rule collisions)
+TASK="${TASK:-agent}"   # agent = model calls the lookups and decides; extract = model reads the facts, rules decide
 MESSY_N="${MESSY_N:-300}"        # messy-invoice eval records (OCR noise, emails, tables, distractors); 0 = off
 EVAL_SETS="in_dist,ood"
 [ "$MESSY_N" -gt 0 ] && EVAL_SETS="in_dist,ood,messy"
@@ -67,12 +70,15 @@ CURVE=0
 TAG="n${N}-e${EPOCHS}"
 [ "$CURVE" = 1 ] && TAG="curve-e${EPOCHS}"
 [ "$TRAIN_MIX" = standard ] || TAG="$TRAIN_MIX-$TAG"
+[ "$TASK" = agent ] || TAG="$TASK-$TAG"
 [ "$PROFILE_REF" = "qwen3-8b@v1" ] || TAG="$PROFILE_ID-$TAG"
 LOG="$RUNS/batch-$TAG.log"
 DEST="${DEST:-/workspace/mccp-batch-$TAG}"
 mkdir -p "$RUNS"
 # shellcheck source=deploy/gpu/lib.sh
 . "$(dirname "$0")/lib.sh"
+case "$TASK" in agent|extract) ;; *) die "TASK must be agent or extract (got $TASK)" ;; esac
+[ "$TASK" = extract ] && [[ " ${METHODS//,/ } " == *" rgt "* ]] && die "METHODS=rgt supervises the decision turn; TASK=extract has none (use sft)"
 
 say "batch $TAG (training mix: $TRAIN_MIX): profile $PROFILE_REF ($PROFILE_STATUS, origin $PROFILE_ORIGIN, $HF_ID), methods [${METHOD_LIST[*]}], sizes [${SIZE_LIST[*]}], seeds [${SEED_LIST[*]}], test ${TEST_N:-split}, OOD $OOD_N, runs in $RUNS"
 for M in "${METHOD_LIST[@]}"; do [ "$M" = sft ] || [ "$M" = rgt ] || die "unknown method $M (sft|rgt)"; done
@@ -142,7 +148,7 @@ for V in "${VARIANTS[@]}"; do
   say "preparing $M n=$S seed $SEED"
   PARGS=(prepare --workdir "$W" --n "$S" --epochs "$EPOCHS" --seed "$SEED" --ood-n "$OOD_N"
          --save-steps "$SAVE_STEPS" --gpu-hourly-usd "$GPU_USD_PER_HOUR" --profile "$PROFILE_REF" --method "$M"
-         --train-mix "$TRAIN_MIX")
+         --train-mix "$TRAIN_MIX" --task "$TASK")
   [ -n "$TEST_N" ] && PARGS+=(--test-n "$TEST_N" --test-seed "$TEST_SEED")
   [ "$MESSY_N" -gt 0 ] && PARGS+=(--messy-n "$MESSY_N")
   if [ "$M" = rgt ] && [ "$RGT_ATTEMPTS" = 1 ]; then

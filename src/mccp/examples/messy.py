@@ -26,7 +26,7 @@ import random
 import re
 from typing import Any
 
-from .invoices import Case, make_case, to_record
+from .invoices import Case, make_case, record_builder
 
 MESSY_ID_OFFSET = 2_000_000
 MESSY_KINDS = (
@@ -134,10 +134,12 @@ def messy_text(c: Case, kinds: tuple[str, ...], rng: random.Random) -> str:
     return body
 
 
-def generate_messy(n: int, seed: int = 4242) -> list[dict[str, Any]]:
-    """`n` records; primary kind round-robin, ~30% with a second kind on top."""
+def generate_messy(n: int, seed: int = 4242, task: str = "agent") -> list[dict[str, Any]]:
+    """`n` records; primary kind round-robin, ~30% with a second kind on top.
+    `task` picks the supervision format; the cases and texts are identical."""
     if n < 1:
         raise ValueError("n must be >= 1")
+    build = record_builder(task)
     rng = random.Random(seed)
     out = []
     for i in range(n):
@@ -147,5 +149,5 @@ def generate_messy(n: int, seed: int = 4242) -> list[dict[str, Any]]:
         if rng.random() < 0.3:
             kinds = (primary, rng.choice([k for k in MESSY_KINDS if k != primary]))
         text = messy_text(c, kinds, rng)
-        out.append(to_record(c, text, {"split": "messy", "ood_kind": primary, "messy_kinds": list(kinds)}))
+        out.append(build(c, text, {"split": "messy", "ood_kind": primary, "messy_kinds": list(kinds)}))
     return out

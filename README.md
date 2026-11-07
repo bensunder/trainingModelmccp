@@ -177,7 +177,14 @@ Base models are switchable: a recipe names a profile (`profiles/<id>@v<N>.yaml`)
 
 `--methods rgt` adds a strategy-explicit copy of every decision sample (the rule chain for that invoice, plus the base model's actual mistake), rendered in the model's own reasoning block and verified against the real chat template before training. `mccp-gpu queue add qwen3-8b@v1 --n 100,300,1000 --methods sft,rgt --seeds 42 --test-n 300` runs the SFT-vs-RGT learning curve on one fixed test set and writes `curve.md`. See [docs/rgt.md](docs/rgt.md).
 
+## Extract-then-rules
+
+`--task extract` trains the model to read the invoice facts in one call (no tool calls); code looks up the PO and vendor by the extracted ids and applies the policy in `mccp.rules.invoice_triage`, with a rule trace. It exists because the agent task's model guessed near the 2% and 30-day thresholds (about chance on both sides) and failed bank-change precedence 0/20, whatever the training mix. `mccp-gpu queue add qwen3-8b@v1 --n 1000 --seeds 42 --test-n 300 --task extract`. See [docs/extract-then-rules.md](docs/extract-then-rules.md).
+
 ## Still not verified
+
+- **The extract task on a GPU.** Data, scoring, serving path and plumbing are tested on CPU against fake endpoints; the first `--task extract` run is the GPU check.
+
 
 - **Checkpoint pruning, mirroring and restore on a GPU.** Tested against a fake training tool that writes checkpoints the way the training library does, plus a deterministic-rebuild test; the first real long run is the GPU check (look for `checkpoint_pruned` / `checkpoint_mirrored` in `events.jsonl`).
 
