@@ -1093,9 +1093,15 @@ def failures(args: argparse.Namespace) -> int:
             if args.examples:
                 for key, exs in res["examples"].items():
                     for ex in exs[: args.examples]:
-                        print(
-                            f"   e.g. [{key}] {ex['source_id']}: expected {ex['expected']!r} got {ex['got']!r} ({ex['outcome']})"
+                        why = ", ".join(ex.get("blocking") or []) or (
+                            "passed: " + (", ".join(ex.get("flags") or []) or "no flags")
                         )
+                        print(
+                            f"   e.g. [{key}] {ex['source_id']}: expected {ex['expected']!r} got {ex['got']!r}"
+                            f" ({ex['outcome']}; {why})"
+                        )
+                        if ex.get("answer") and ex["outcome"] == "auto_wrong":
+                            print(f"        answer: {json.dumps(ex['answer'])[:160]}")
                         if ex["line"]:
                             print(f"        page: {ex['line']}")
             if args.json:
