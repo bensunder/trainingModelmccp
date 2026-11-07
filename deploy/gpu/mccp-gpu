@@ -612,6 +612,12 @@ cmd_eval_messy() {
   done
   [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ] || fail "--n must be a positive number"
   [[ "$set" =~ ^(messy|docs|invcdip)$ ]] || fail "--set must be messy, docs or invcdip"
+  # Guards first: nothing (not even --from's restore) may touch files a running job uses.
+  runner_active && fail "the training runner is active; wait for it (mccp-gpu status)"
+  bench_active && fail "a benchmark is running"
+  { command -v tmux >/dev/null && tmux has-session -t mccp-messy 2>/dev/null; } \
+    && fail "an extra-set eval (messy/docs/invcdip) is already running; wait for it (tmux attach -t mccp-messy, Ctrl-b d to leave)"
+  foreign_gpu_work && fail "GPU busy with work started outside mccp-gpu"
   local id profile rc dest
   if [ -n "$from" ]; then
     restore_run "$from" || exit 1
@@ -626,10 +632,6 @@ cmd_eval_messy() {
     [ "$rc" = 0 ] || fail "run $id did not finish successfully (rc=$rc)"
     [ -d "$RUNS_ROOT/$id" ] || fail "$RUNS_ROOT/$id is gone (machine was stopped?); rebuild it from the saved results: mccp-gpu eval-messy --from $dest"
   fi
-  runner_active && fail "the training runner is active; wait for it (mccp-gpu status)"
-  bench_active && fail "a benchmark is running"
-  { command -v tmux >/dev/null && tmux has-session -t mccp-messy 2>/dev/null; } && fail "a messy eval is already running (tmux attach -t mccp-messy)"
-  foreign_gpu_work && fail "GPU busy with work started outside mccp-gpu"
   local sha rel
   sha="$(git -C "$SRC" rev-parse HEAD)"
   rel="$(release_for "$sha")" || fail "could not prepare release ${sha:0:7}"
