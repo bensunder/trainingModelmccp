@@ -252,3 +252,46 @@ def test_failures_cli_on_a_saved_folder(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "decimal_dropped" in r.stdout and "human_review=1" in r.stdout and "page: GRAND TOTAL $1,533.54" in r.stdout
     assert (w / "failures_invcdip_adapter.json").exists()
+
+
+# The two docs-set answers that got through on the GPU (INV-3200077, INV-3200173):
+# the quantity "1" came from the freight line; qty x price = price fooled the check.
+_LEAK_PAGES = [
+    (
+        {"invoice_id": "INV-3200077", "po_number": "PO-4500048190", "vendor_id": "V-3100077"},
+        "INV-3200077 PO-4500048190 V-3100077\nItem  Description  Qty 138 Unit Price $418.05  $57,690.90 Amount\n"
+        "FRT  Freight and handling  1  $114.99  $114.99",
+        138,
+        418.05,
+    ),
+    (  # OCR garbled the line amount ($88.114.15), so only the quantity's line gives it away
+        {"invoice_id": "INV-3200173", "po_number": "PO-4500058265", "vendor_id": "V-3100173"},
+        "INV-3200173 PO-4500058265 V-3100173\nltem  Description  Qty 193 Unit Price $456.55  $88.114.15 Amount\n"
+        "FRT  Freight and handling  1  $85.00  $85.00",
+        193,
+        456.55,
+    ),
+]
+
+
+@pytest.mark.parametrize(("ids", "page", "qty", "price"), _LEAK_PAGES)
+def test_quantity_from_another_line_is_blocked(ids, page, qty, price):
+    wrong = validate_extract(None, {**ids, "billed_qty": 1, "unit_price_billed": price}, page)
+    assert "qty_not_on_price_line" in wrong.blocking
+    right = validate_extract(None, {**ids, "billed_qty": qty, "unit_price_billed": price}, page)
+    assert right.ok
+
+
+def test_qty_equal_one_never_corroborates_by_itself():
+    assert line_arithmetic(1, 418.05, "Unit Price $418.05  $57,690.90") == "contradicted"
+    assert line_arithmetic(1, 418.05, "Unit Price $418.05") == "absent"
+
+
+def test_invoice_number_label_flag():
+    from mccp.rules.validation import validate_realdoc as vr
+
+    # the line under a label counts as near (values often print below their label)
+    page = "MAROUIS TELEPHONE 555 FAX 556  INVOICE DATE 951695\nSOLD TO ACME\nSHIP TO ACME\nACCOUNT 0000000500"
+    near = vr(None, {"invoice_number": "951695", "po_number": None, "total_amount": None}, page)
+    far = vr(None, {"invoice_number": "0000000500", "po_number": None, "total_amount": None}, page)
+    assert "invoice_number_not_near_label" not in near.flags and "invoice_number_not_near_label" in far.flags

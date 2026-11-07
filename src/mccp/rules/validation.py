@@ -42,6 +42,21 @@ _TOTAL_LINE = re.compile(r"\b(grand\s*total|total|amount\s*due|balance\s*due|pay
 _SUBTOTAL = re.compile(r"sub\s*-?\s*total", re.IGNORECASE)
 
 
+_INVOICE_LABEL = re.compile(r"\binv(?:oice)?\b|\binv\.|invoice", re.IGNORECASE)
+
+
+def _near_label(value: str, text: str, label: re.Pattern[str]) -> bool:
+    """`value` printed on a line carrying the label, or on the line right below it."""
+    lines = text.splitlines()
+    want = _squash(value)
+    for i, ln in enumerate(lines):
+        if label.search(ln):
+            window = ln + (" " + lines[i + 1] if i + 1 < len(lines) else "")
+            if want in _squash(window):
+                return True
+    return False
+
+
 @dataclass
 class Validation:
     validator: str
@@ -133,9 +148,33 @@ def line_arithmetic(qty: int, price: float, text: str) -> str:
             return "corroborated"
         if others:  # the price line prints other amounts, and none is qty x price
             contradicted = True
-    if amount_on_page(product, text):
+    if contradicted:  # a printed line amount that is not qty x price beats any match elsewhere
+        return "contradicted"
+    # qty 1 makes the product equal the price: finding it proves nothing
+    if abs(product - price) >= 0.005 and amount_on_page(product, text):
         return "corroborated"
-    return "contradicted" if contradicted else "absent"
+    return "absent"
+
+
+def int_on_line(n: int, line: str) -> bool:
+    """`n` printed as a standalone integer: not part of an amount ("$1,234.50"
+    holds no 1), a decimal or a longer number."""
+    return re.search(rf"(?<![\d.,$]){n}(?!\d|[.,]\d)", line) is not None
+
+
+def qty_on_price_line(qty: int, price: float, text: str) -> bool | None:
+    """True/False when the page has a line printing the unit price (is the quantity
+    on such a line?); None when no line prints the price."""
+    lines = [ln for ln in text.splitlines() if amount_on_page(price, ln)]
+    if not lines:
+        return None
+    for ln in lines:
+        flat = _GAP_IN_NUMBER.sub(r"\1", ln)
+        for form in amount_forms(price):  # the price's own digits are not the quantity
+            flat = flat.replace(form, " ")
+        if int_on_line(qty, flat):
+            return True
+    return False
 
 
 def validate_extract(raw: dict[str, Any] | None, canon: dict[str, Any], text: str) -> Validation:
@@ -156,6 +195,10 @@ def validate_extract(raw: dict[str, Any] | None, canon: dict[str, Any], text: st
             v.blocking.append("line_amount_mismatch")
         else:
             v.flags.append(f"arithmetic_{arith}")
+        # The quantity belongs to the line that prices it (a "1" from the freight line
+        # next to the goods price is the failure this stops).
+        if qty_on_price_line(int(qty), float(price), text) is False:  # type: ignore[arg-type]
+            v.blocking.append("qty_not_on_price_line")
     return v
 
 
@@ -164,6 +207,9 @@ def validate_realdoc(raw: dict[str, Any] | None, canon: dict[str, Any], text: st
     total ambiguity flags."""
     v = Validation(REALDOC_VALIDATOR_ID)
     flat = _squash(text)
+    inv = canon.get("invoice_number")
+    if isinstance(inv, str) and _squash(inv) and not _near_label(inv, text, _INVOICE_LABEL):
+        v.flags.append("invoice_number_not_near_label")
     for key in ("invoice_number", "po_number"):
         val = canon.get(key)
         if val is not None:

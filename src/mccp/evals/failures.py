@@ -115,6 +115,7 @@ def classify_rows(
     caught: dict[str, Counter] = defaultdict(Counter)
     examples: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     outcomes: Counter = Counter()
+    flag_hits: dict[str, Counter] = defaultdict(Counter)  # flag -> {correct, wrong}
     missing_text = 0
     for r in rows:
         if r.get("kind") != "final":
@@ -139,6 +140,10 @@ def classify_rows(
             else ("auto_correct" if (r.get("score") or 0) >= 1 else "auto_wrong")
         )
         outcomes[outcome] += 1
+        for f in (verdict or {}).get("flags", []):
+            if f.startswith("arithmetic_"):
+                continue
+            flag_hits[f]["on_correct" if (r.get("score") or 0) >= 1 else "on_wrong"] += 1
         if not isinstance(got_raw, dict):
             if (r.get("score") or 0) < 1:
                 causes["(whole answer)"]["invalid_json"] += 1
@@ -197,6 +202,9 @@ def classify_rows(
         "caught_by_validation": {f: dict(c) for f, c in caught.items()},
         "examples": {f"{f} | {c}": v for (f, c), v in examples.items()},
         "rows_without_input_text": missing_text,
+        # Would a flag make a good blocking rule? Hits on correct answers = extra human
+        # review if it blocked; hits on wrong answers = errors it would stop.
+        "flags": {f: dict(c) for f, c in flag_hits.items()},
     }
 
 

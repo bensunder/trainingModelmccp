@@ -1090,6 +1090,11 @@ def failures(args: argparse.Namespace) -> int:
                 for c, k in cs.items():
                     got_caught = res["caught_by_validation"].get(f, {}).get(c, 0)
                     print(f"      {c:44} {k:4}   caught {got_caught:4}   auto_wrong {k - got_caught:4}")
+            for f, c in (res.get("flags") or {}).items():
+                print(
+                    f"   flag {f}: on correct answers {c.get('on_correct', 0)}, on wrong answers {c.get('on_wrong', 0)}"
+                    "  (if it blocked: extra human reviews vs errors stopped)"
+                )
             if args.examples:
                 for key, exs in res["examples"].items():
                     for ex in exs[: args.examples]:
