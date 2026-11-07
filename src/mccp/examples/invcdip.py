@@ -254,18 +254,23 @@ def generate_invcdip(
 
 
 def drop_redacted_labels(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> int:
-    """`after` is `before` with PII redaction applied to the input text. A label
-    that was in the OCR text before redaction and is gone after it becomes
-    unscored (None): the model never saw it. A label the OCR itself lost stays
-    scored, because OCR is part of the pipeline being measured. Returns how many
-    labels were dropped; edits `after` in place."""
+    """`after` is `before` with PII redaction applied to the input text and the label.
+    A label becomes unscored (None) when redaction changed it (the label itself now
+    reads e.g. `<CREDIT_CARD_1>`: a PO number that looks like a card number), or when
+    it was in the OCR text before redaction and is gone after it: either way the
+    model never saw the value. A label the OCR itself lost stays scored, because OCR
+    is part of the pipeline being measured. Returns how many labels were dropped;
+    edits `after` in place."""
     dropped = 0
     for b, a in zip(before, after, strict=True):
         pre, post = _squash(b["messages"][1]["content"]), _squash(a["messages"][1]["content"])
+        orig = json.loads(b["messages"][2]["content"])
         exp = json.loads(a["messages"][2]["content"])
-        for k in ("invoice_number", "po_number"):
-            v = exp.get(k)
-            if v is not None and _squash(v) in pre and _squash(v) not in post:
+        for k in ("invoice_number", "po_number", "total_amount_raw"):
+            v = orig.get(k)
+            if v is None:
+                continue
+            if exp.get(k) != v or (_squash(v) in pre and _squash(v) not in post):
                 exp[k] = None
                 dropped += 1
         a["messages"][2]["content"] = json.dumps(exp)

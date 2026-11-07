@@ -103,9 +103,10 @@ class EvalSuite(BaseModel):
             pol = REVIEW_POLICIES.get(self.review_policy)
             if pol is None:
                 raise ValueError(f"unknown review_policy {self.review_policy!r} (known: {', '.join(REVIEW_POLICIES)})")
-            if pol.validator != self.validation:
+            if self.validation not in pol.validators:
                 raise ValueError(
-                    f"review_policy {pol.id} reads {pol.validator}, the suite validates with {self.validation}"
+                    f"review_policy {pol.id} reads {', '.join(sorted(pol.validators))};"
+                    f" the suite validates with {self.validation}"
                 )
         return self
 

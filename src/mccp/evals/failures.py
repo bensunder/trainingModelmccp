@@ -27,7 +27,14 @@ import re
 from collections import Counter, defaultdict
 from typing import Any
 
-from mccp.rules.validation import amount_on_page, digits_on_page
+from mccp.rules.validation import amount_on_page as _amount_on_page
+from mccp.rules.validation import digits_on_page
+
+
+def amount_on_page(value: float | None, text: str) -> bool:
+    """Classification reads the page like realdoc-validation@v3: 48.1 is 48.10."""
+    return _amount_on_page(value, text, one_decimal=True)
+
 
 AMOUNT_FIELDS = {"unit_price_billed": "unit_price_raw", "total_amount": "total_amount_raw"}
 _LINE_KINDS = [
@@ -104,6 +111,10 @@ def _field_ok(suite: Any, e: Any, g: Any) -> bool:
 
 
 ID_FIELDS = {"invoice_id", "po_number", "vendor_id", "invoice_number"}
+# A PII placeholder (mccp.datasets.pii: "<CREDIT_CARD_1>") is never a real label: the
+# redactor rewrote the label along with the text. Sets built before the builder
+# dropped such labels still carry them; scoring treats them as unlabelled.
+REDACTION_PLACEHOLDER = re.compile(r"<[A-Z][A-Z_]*_\d+>")
 VERDICTS = ("label_wrong", "ocr_lost", "model_wrong")
 
 
@@ -142,8 +153,11 @@ def _rescore(
     texts: dict[str, str],
     validator: Any,
     overrides: dict[tuple[str, str], dict[str, Any]] | None,
+    keep_redacted: bool = False,
 ) -> dict[str, Any] | None:
-    """One saved final answer judged by today's code. None for non-final rows."""
+    """One saved final answer judged by today's code. None for non-final rows.
+    `keep_redacted` scores redaction-placeholder labels anyway (reproduces reports
+    made before that was fixed)."""
     import jsonschema
 
     if r.get("kind") != "final":
@@ -152,6 +166,13 @@ def _rescore(
     text = r.get("input") or texts.get(sid) or ""
     exp_raw = json.loads(r["expected"]) if isinstance(r.get("expected"), str) else dict(r.get("expected") or {})
     unscored: set[str] = set()
+    redacted = (
+        []
+        if keep_redacted
+        else [k for k, v in exp_raw.items() if isinstance(v, str) and REDACTION_PLACEHOLDER.search(v)]
+    )
+    for k in redacted:
+        unscored.add({v: k for k, v in AMOUNT_FIELDS.items()}.get(k, k))
     for (osid, f), o in (overrides or {}).items():  # verified label errors only (load_adjudications)
         if osid != sid or o["verdict"] != "label_wrong":
             continue
@@ -160,7 +181,9 @@ def _rescore(
         else:
             exp_raw[AMOUNT_FIELDS.get(f, f)] = o["corrected"]
     exp = normalize(exp_raw)[0] if normalize else exp_raw
-    out: dict[str, Any] = {"sid": sid, "text": text, "exp_raw": exp_raw, "exp": exp, "invalid": False}
+    out: dict[str, Any] = {
+        "sid": sid, "text": text, "exp_raw": exp_raw, "exp": exp, "invalid": False, "redacted_labels": redacted,
+    }  # fmt: skip
     try:
         got_raw = json.loads(r.get("content") or "")
     except json.JSONDecodeError:
@@ -201,6 +224,7 @@ def classify_rows(
     validator: Any = None,
     policy: Any = None,
     overrides: dict[tuple[str, str], dict[str, Any]] | None = None,
+    keep_redacted: bool = False,
 ) -> dict[str, Any]:
     """Re-score saved answers (`<report>.<set>.<target>.outputs.jsonl`) under the
     CURRENT parser, schema and validator (the model's answers do not change when
@@ -226,10 +250,12 @@ def classify_rows(
     passed: list[tuple[str, bool, frozenset[str], frozenset[str]]] = []
     auto_wrong_fields: list[frozenset[str]] = []
     missing_text = 0
+    redacted_labels = 0
     for r in rows:
-        x = _rescore(r, suite, normalize, texts, validator, overrides)
+        x = _rescore(r, suite, normalize, texts, validator, overrides, keep_redacted)
         if x is None:
             continue
+        redacted_labels += len(x["redacted_labels"])
         text = x["text"]
         if not text:
             missing_text += 1
@@ -307,6 +333,7 @@ def classify_rows(
         "caught_by_validation": {f: dict(c) for f, c in caught.items()},
         "examples": {f"{f} | {c}": v for (f, c), v in examples.items()},
         "rows_without_input_text": missing_text,
+        "redacted_labels_unscored": redacted_labels,
         "label_overrides_applied": sum(1 for o in (overrides or {}).values() if o["verdict"] == "label_wrong"),
         # Hits on correct answers = extra human reviews if the flag blocked; on wrong
         # answers = errors it would stop. Counted among answers validation lets through.

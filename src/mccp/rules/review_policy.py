@@ -16,13 +16,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .validation import MISSING_REQUIRED, REALDOC_VALIDATOR_V2_ID, VALIDATOR_FLAGS
+from .validation import MISSING_REQUIRED, REALDOC_VALIDATOR_V2_ID, REALDOC_VALIDATOR_V3_ID, VALIDATOR_FLAGS
 
 
 @dataclass(frozen=True)
 class ReviewPolicy:
     id: str
-    validator: str  # the validator whose flags this policy reads
+    validators: frozenset[str]  # validators whose flags this policy reads (they raise the same flags)
     block_on: frozenset[str]
     description: str
 
@@ -32,11 +32,15 @@ class ReviewPolicy:
         return [f for f in flags if f in self.block_on], [f for f in flags if f not in self.block_on]
 
 
+_REALDOC = frozenset({REALDOC_VALIDATOR_V2_ID, REALDOC_VALIDATOR_V3_ID})
+
+
 def _policy(pid: str, block_on: set[str], description: str) -> ReviewPolicy:
-    unknown = block_on - VALIDATOR_FLAGS[REALDOC_VALIDATOR_V2_ID]
-    if unknown:
-        raise ValueError(f"{pid}: {REALDOC_VALIDATOR_V2_ID} never raises {sorted(unknown)}")
-    return ReviewPolicy(pid, REALDOC_VALIDATOR_V2_ID, frozenset(block_on), description)
+    for vid in sorted(_REALDOC):
+        unknown = block_on - VALIDATOR_FLAGS[vid]
+        if unknown:
+            raise ValueError(f"{pid}: {vid} never raises {sorted(unknown)}")
+    return ReviewPolicy(pid, _REALDOC, frozenset(block_on), description)
 
 
 REVIEW_POLICIES: dict[str, ReviewPolicy] = {
@@ -64,4 +68,6 @@ def adhoc_policy(validator: str, block_on: list[str]) -> ReviewPolicy:
     if unknown:
         known = ", ".join(sorted(VALIDATOR_FLAGS.get(validator, ())))
         raise ValueError(f"{validator} never raises {sorted(unknown)} (it raises: {known})")
-    return ReviewPolicy("adhoc:" + "+".join(sorted(block_on)), validator, frozenset(block_on), "measurement only")
+    return ReviewPolicy(
+        "adhoc:" + "+".join(sorted(block_on)), frozenset({validator}), frozenset(block_on), "measurement only"
+    )

@@ -170,7 +170,10 @@ findings (a value not on the page) always route to a person, whatever the policy
 * `realdoc-validation@v2` = v1 plus `missing_required_field` (invoice number or
   total null; which ones in `missing`). v1 is kept unchanged, and v2 with no
   blocking policy decides exactly what v1 decided (pinned by a test).
-* Policies: `realdoc-review-flags-none@v1` (the suite default),
+* `realdoc-validation@v3` = v2, and a total printed with one decimal place (`48.1`
+  for 48.10) counts as on the page; v2 sent those to a person although label,
+  answer and page agreed. v1/v2 and the extract validator keep two-decimal forms.
+* Policies: `realdoc-review-flags-none@v1`,
   `realdoc-review-missing@v1`, `realdoc-review-several-totals@v1`,
   `realdoc-review-missing-several-totals@v1`. A policy may only name flags its
   validator raises.
@@ -184,6 +187,17 @@ Measured on the 348 INV-CDIP scans (Qwen3-8B adapter, flags-none): auto_correct
 stops 21 wrong for 28 extra reviews; `invoice_number_not_near_label` 18 for 40;
 `total_not_on_total_line` 2 for 9; the first two together 34 for 63 (union, not
 sum). No flag combination is precise enough to block on by itself.
+
+The realdoc suite (v4) decides with `realdoc-validation@v3` and
+`realdoc-review-missing-several-totals@v1`. `failures --validation realdoc-validation@v1
+--policy none --keep-redacted-labels` reproduces the measurement above exactly;
+`deploy/gpu/measure_policies.sh` does that and then measures each fix as its own step.
+
+**Redaction placeholders are never labels.** PII redaction runs over the label as
+well as the text, so a PO number that looks like a card number became the label
+`<CREDIT_CARD_1>` and was scored. The set builder now drops any label redaction
+changed (`drop_redacted_labels`), and re-scoring treats a placeholder label in an
+older set as unlabelled (`redacted_labels_unscored`).
 
 **The split (C).** Every auto-wrong answer is `amount_only`, `id_only` or
 `amount_and_id` (plus per-field counts), for the reported outcome and for every

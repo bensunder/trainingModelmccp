@@ -1088,13 +1088,15 @@ def _resolve_policy(args: argparse.Namespace, suite: EvalSuite):
         flags = [f.strip() for f in args.block_on.split(",") if f.strip()]
         return adhoc_policy(suite.validation or "", flags)
     pid = getattr(args, "policy", None) or suite.review_policy
-    if pid is None:
+    if pid is None or pid == "none":
         return None
     if pid not in REVIEW_POLICIES:
         raise SystemExit(f"unknown --policy {pid!r} (known: {', '.join(REVIEW_POLICIES)})")
     pol = REVIEW_POLICIES[pid]
-    if pol.validator != suite.validation:
-        raise SystemExit(f"--policy {pid} reads {pol.validator}; this set's suite validates with {suite.validation}")
+    if suite.validation not in pol.validators:
+        raise SystemExit(
+            f"--policy {pid} reads {', '.join(sorted(pol.validators))}; this set's suite validates with {suite.validation}"
+        )
     return pol
 
 
@@ -1106,7 +1108,7 @@ def _pick_policies(pols: list[dict[str, Any]], spec: str, validator: str | None,
     if spec == "all":
         return pols
     if spec == "default":
-        want = {()} | {tuple(sorted(p.block_on)) for p in REVIEW_POLICIES.values() if p.validator == validator}
+        want = {()} | {tuple(sorted(p.block_on)) for p in REVIEW_POLICIES.values() if validator in p.validators}
         if active is not None:
             want.add(tuple(sorted(active.block_on)))
         return [p for p in pols if len(p["block_on"]) <= 1 or tuple(p["block_on"]) in want]
@@ -1150,12 +1152,19 @@ def failures(args: argparse.Namespace) -> int:
     validation routes it to a person or it would be decided wrongly. Read-only:
     nothing in the run folder is written (--json goes to the audit directory)."""
     from mccp.evals.failures import classify_rows, load_adjudications
+    from mccp.rules.validation import VALIDATORS
 
     found = False
     for rp, set_name, suite, normalize, validator, rows, texts in _saved_sets(args):
         found = True
+        if args.validation:
+            if args.validation not in VALIDATORS:
+                raise SystemExit(f"unknown --validation {args.validation!r} (known: {', '.join(VALIDATORS)})")
+            suite = suite.model_copy(update={"validation": args.validation})
+            validator = VALIDATORS[args.validation]
         policy = _resolve_policy(args, suite)
-        res = classify_rows(rows, suite, normalize, texts, validator, policy)
+        keep = args.keep_redacted_labels
+        res = classify_rows(rows, suite, normalize, texts, validator, policy, keep_redacted=keep)
         print(f"\n== {rp.parent.name} / {set_name} / {args.target}: {res['rows']} invoices")
         print(f"   validation: {suite.validation}   review policy: {res['review_policy'] or '(none)'}")
         print("   outcomes: " + _outcome_line(res))
@@ -1165,6 +1174,10 @@ def failures(args: argparse.Namespace) -> int:
                 f"   blocked: {res['review_policy_blocked'] or 0}   hints left to reviewers: {res['review_hints'] or 0}"
             )
         print(f"   auto_wrong by kind: {res['auto_wrong_by_kind']}   by field: {res['auto_wrong_by_field']}")
+        if res["redacted_labels_unscored"]:
+            print(
+                f"   ({res['redacted_labels_unscored']} labels were PII placeholders, e.g. <CREDIT_CARD_1>: not scored)"
+            )
         if res["rows_without_input_text"]:
             print(f"   (no input text for {res['rows_without_input_text']} rows: causes there are unreliable)")
         for f, cs in res["causes"].items():
@@ -1183,7 +1196,7 @@ def failures(args: argparse.Namespace) -> int:
             verdicts: dict[str, int] = {}
             for o in overrides.values():
                 verdicts[o["verdict"]] = verdicts.get(o["verdict"], 0) + 1
-            adjusted = classify_rows(rows, suite, normalize, texts, validator, policy, overrides)
+            adjusted = classify_rows(rows, suite, normalize, texts, validator, policy, overrides, keep_redacted=keep)
             print(f"   adjudications: {verdicts or 'none filled in'} (only label_wrong changes scoring)")
             print(
                 f"   excluding {adjusted['label_overrides_applied']} verified label errors: " + _outcome_line(adjusted)
@@ -1212,10 +1225,17 @@ def failures(args: argparse.Namespace) -> int:
                         print(f"        answer: {json.dumps(ex['answer'])[:160]}")
                     if ex["line"]:
                         print(f"        page: {ex['line']}")
-        if args.json:
+        if args.json or args.json_out:
             out = _out_dir(args, set_name)
-            out.mkdir(parents=True, exist_ok=True)
-            path = out / f"failures_{rp.parent.name}_{args.target}.json"
+            path = (
+                Path(args.json_out).resolve()
+                if args.json_out
+                else out / f"failures_{rp.parent.name}_{args.target}.json"
+            )
+            root = Path(args.folder).resolve()
+            if root in path.parents:
+                raise SystemExit(f"--json-out {path} is inside the run folder {root}")
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"measured": res, "adjusted": adjusted}, indent=2, default=str))
             print(f"   wrote {path}")
     if not found:
@@ -1535,7 +1555,12 @@ def main() -> int:
     fl.add_argument("--json", action="store_true", help="also write the full result as JSON to the audit directory")
     fl.add_argument("--cache", default="/workspace/mccp-cache")
     fl.add_argument("--runs-root", default="/root/mccp-runs")
-    fl.add_argument("--policy", default=None, help="review policy id (default: the suite's)")
+    fl.add_argument("--policy", default=None, help="review policy id (default: the suite's; 'none' = no policy)")
+    fl.add_argument("--validation", default=None, help="validator id instead of the suite's (e.g. to reproduce v1)")
+    fl.add_argument(
+        "--keep-redacted-labels", action="store_true", help="score PII-placeholder labels (as reports before the fix)"
+    )
+    fl.add_argument("--json-out", default=None, help="write the JSON result to this file (outside the run folder)")
     fl.add_argument("--block-on", default=None, help="measure an ad-hoc policy: comma-separated flags")
     fl.add_argument("--policies", default="default", help="simulation rows to print: default | all | 'a+b,c'")
     fl.add_argument("--adjudications", default=None, help="filled-in audit.csv from audit-labels")

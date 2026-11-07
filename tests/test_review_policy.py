@@ -38,9 +38,13 @@ from mccp.rules.validation import (
     MISSING_REQUIRED,
     REALDOC_VALIDATOR_ID,
     REALDOC_VALIDATOR_V2_ID,
+    REALDOC_VALIDATOR_V3_ID,
     VALIDATOR_FLAGS,
+    amount_forms,
+    amount_on_page,
     validate_realdoc,
     validate_realdoc_v2,
+    validate_realdoc_v3,
 )
 from tests.conftest import ROOT
 
@@ -121,9 +125,10 @@ def test_baseline_v2_with_no_blocking_policy_decides_exactly_like_v1():
         assert rows2[k] == p
 
 
-def test_suite_default_is_the_baseline():
-    assert REALDOC.validation == REALDOC_VALIDATOR_V2_ID and REALDOC.review_policy == "realdoc-review-flags-none@v1"
-    assert REVIEW_POLICIES[REALDOC.review_policy].block_on == frozenset()
+def test_suite_default_is_v3_with_missing_and_several_totals_blocking():
+    assert REALDOC.validation == REALDOC_VALIDATOR_V3_ID
+    assert REALDOC.review_policy == "realdoc-review-missing-several-totals@v1"
+    assert REVIEW_POLICIES[REALDOC.review_policy].block_on == {MISSING_REQUIRED, "several_total_amounts"}
 
 
 # -- A: missing required field -----------------------------------------------------
@@ -175,7 +180,8 @@ def test_reported_outcomes_equal_the_simulation_row_of_the_same_policy(pid):
 
 def test_every_registered_policy_names_only_flags_its_validator_raises():
     for p in REVIEW_POLICIES.values():
-        assert p.block_on <= VALIDATOR_FLAGS[p.validator]
+        for vid in p.validators:
+            assert p.block_on <= VALIDATOR_FLAGS[vid]
     with pytest.raises(ValueError, match="never raises"):
         adhoc_policy(REALDOC_VALIDATOR_ID, [MISSING_REQUIRED])  # v1 has no such finding
     assert adhoc_policy(REALDOC_VALIDATOR_V2_ID, ["several_total_amounts"]).block_on == {"several_total_amounts"}
@@ -409,3 +415,66 @@ def test_audit_images_box_the_label_on_a_cached_pdf(tmp_path):
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 0, r.stderr
     assert (tmp_path / "mccp-audit" / run.name / "invcdip" / "images" / "ffpm0094_invoice_number_page.png").exists()
+
+
+# -- realdoc-validation@v3: one decimal place -------------------------------------
+
+
+def test_v3_grounds_a_total_printed_with_one_decimal_place():
+    page = "INVOICE 4411\nTOTAL 48.1"
+    canon = {"invoice_number": "4411", "po_number": None, "total_amount": 48.1}
+    assert "not_on_page:total_amount" in validate_realdoc_v2(None, canon, page).blocking  # the wasted review
+    assert validate_realdoc_v3(None, canon, page).ok
+    assert validate_realdoc_v3(None, {**canon, "total_amount": 1414.4}, "INVOICE 4411\nTOTAL 1414.4").ok
+    assert validate_realdoc_v3(None, {**canon, "total_amount": 1414.4}, "INVOICE 4411\nTOTAL 1,414.4").ok
+
+
+@pytest.mark.parametrize(
+    ("value", "page"),
+    [
+        (48.1, "TOTAL 48.15"),  # a different amount
+        (48.1, "TOTAL 148.1"),  # part of a longer number
+        (48.1, "TOTAL 48.10.5"),
+        (48.11, "TOTAL 48.1"),  # cents not ending in 0: one decimal is not this amount
+        (48.0, "TOTAL 48.0"),  # whole amounts keep their own forms (48 / 48.00)
+    ],
+)
+def test_one_decimal_is_never_a_looser_match(value, page):
+    assert not amount_on_page(value, page, one_decimal=True)
+
+
+def test_v1_v2_and_the_extract_path_keep_two_decimal_forms():
+    assert "48.1" not in amount_forms(48.1) and "48.1" in amount_forms(48.1, one_decimal=True)
+    assert not amount_on_page(48.1, "TOTAL 48.1")
+
+
+@pytest.mark.parametrize(("page", "canon"), CASES)
+def test_v3_equals_v2_on_two_decimal_pages(page, canon):
+    v2, v3 = validate_realdoc_v2(None, canon, page).to_dict(), validate_realdoc_v3(None, canon, page).to_dict()
+    assert {**v2, "validator": None} == {**v3, "validator": None}
+
+
+# -- redaction placeholders are never labels ---------------------------------------
+
+
+def test_builder_drops_a_label_the_redactor_rewrote():
+    before = [invcdip.to_realdoc_record("xqpv0126", "PO 4111 1111 1111 1111\nTOTAL $5.00",
+                                        {"invoice_number": None, "po_number": "4111 1111 1111 1111",
+                                         "total_amount_raw": "$5.00"}, {})]  # fmt: skip
+    after = json.loads(json.dumps(before))
+    for m in after[0]["messages"]:  # what redaction did on the box: label and text rewritten alike
+        m["content"] = m["content"].replace("4111 1111 1111 1111", "<CREDIT_CARD_1>")
+    assert invcdip.drop_redacted_labels(before, after) == 1
+    exp = json.loads(after[0]["messages"][2]["content"])
+    assert exp["po_number"] is None and exp["total_amount_raw"] == "$5.00"
+
+
+def test_rescoring_unscores_placeholder_labels_in_old_sets():
+    exp = {"invoice_number": "10251", "po_number": "<CREDIT_CARD_1>", "total_amount_raw": "$1,533.54"}
+    rows = [_row("xqpv0126", exp, {**exp, "po_number": None}, PAGE_A + "\nPO <CREDIT_CARD_1>")]
+    kw = {"validator": validate_realdoc_v3}
+    fixed = classify_rows(rows, REALDOC, normalize_realdoc, **kw)
+    assert fixed["outcomes"] == {"auto_correct": 1} and fixed["redacted_labels_unscored"] == 1
+    old = classify_rows(rows, REALDOC, normalize_realdoc, keep_redacted=True, **kw)
+    assert old["outcomes"] == {"auto_wrong": 1}  # what the report said before the fix
+    assert label_audit_rows(rows, REALDOC, normalize_realdoc, **kw) == []

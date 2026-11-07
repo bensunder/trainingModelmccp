@@ -6,13 +6,13 @@
 #   ... | bash -s -- /workspace/mccp-<RUN_ID> invcdip
 #
 # 1. updates the code (mccp-gpu update)
-# 2. failures with every flag combination (+ your audit.csv verdicts, if any filled in)
-# 3. the registered policies: missing, several-totals, missing+several-totals
-# 4. the label audit sheet and page images
+# 2. failures, one step per fix (+ your audit.csv verdicts on the last, if filled in)
+# 3. the label audit sheet and page images
 # 5. prints a short summary (fits one screen); full outputs are kept in the audit folder
 #
-# On the 2026-11-07 run it also checks the baseline against the numbers measured
-# before this change (79 auto-wrong; 21/28, 18/40, 2/9, 34/63, 34/66).
+# On the 2026-11-07 run it first reproduces the original baseline exactly (v1,
+# 215/54/79; 21/28, 18/40, 2/9, 34/63, 34/66), then measures each fix as its own
+# step: redaction-label fix, one-decimal totals (v3), A+D blocking (the default).
 
 RUN="${1:-/workspace/mccp-20261107-043803-qwen3-8b-v1}"
 SET="${2:-invcdip}"
@@ -37,14 +37,19 @@ sys.exit(0 if any((r.get('verdict') or '').strip() for r in rows) else 1)
   ADJ=(--adjudications "$OUT/audit.csv")
 fi
 
-echo "measuring every flag combination..."
-mccp-gpu failures "$RUN" --set "$SET" --policies all --json "${ADJ[@]}" > "$OUT/failures_all.txt" 2>&1 \
-  || { tail -8 "$OUT/failures_all.txt"; exit 1; }
-for p in missing several-totals missing-several-totals; do
-  echo "policy realdoc-review-$p@v1..."
-  mccp-gpu failures "$RUN" --set "$SET" --policy "realdoc-review-$p@v1" > "$OUT/policy_$p.txt" 2>&1 \
-    || { tail -8 "$OUT/policy_$p.txt"; exit 1; }
-done
+V1=realdoc-validation@v1
+V3=realdoc-validation@v3
+step() {  # name, then failures options; full output in $OUT/step_<name>.txt, JSON in step_<name>.json
+  local name="$1"; shift
+  echo "measuring: $name..."
+  mccp-gpu failures "$RUN" --set "$SET" --policies all --json-out "$OUT/step_$name.json" "$@" > "$OUT/step_$name.txt" 2>&1 \
+    || { tail -8 "$OUT/step_$name.txt"; exit 1; }
+}
+# each fix on its own, in order, so each one's effect is measured separately
+step 0_baseline_v1      --validation "$V1" --policy none --keep-redacted-labels
+step 1_redaction_fix    --validation "$V1" --policy none
+step 2_one_decimal_v3   --validation "$V3" --policy none
+step 3_default_a_plus_d "${ADJ[@]}"
 echo "building the label audit..."
 mccp-gpu audit-labels "$RUN" --set "$SET" > "$OUT/audit_labels.txt" 2>&1 || { tail -8 "$OUT/audit_labels.txt"; exit 1; }
 
@@ -56,34 +61,45 @@ import os
 import sys
 
 out, run, set_name = sys.argv[1], sys.argv[2], sys.argv[3]
-files = sorted(glob.glob(os.path.join(out, "failures_*_adapter.json")), key=os.path.getmtime)
-data = json.load(open(files[-1]))
-m, adj = data["measured"], data.get("adjusted")
-rows = {tuple(p["block_on"]): p for p in m["policies"]}
+def load(name):
+    return json.load(open(os.path.join(out, "step_%s.json" % name)))
+
+
+steps = [("0_baseline_v1", "baseline (v1, as reported before)"), ("1_redaction_fix", "+ redaction-label fix"),
+         ("2_one_decimal_v3", "+ one-decimal totals (v3)"), ("3_default_a_plus_d", "+ A+D blocking (new default)")]
+base = load("0_baseline_v1")["measured"]
+cur_doc = load("3_default_a_plus_d")
+m, adj = cur_doc["measured"], cur_doc.get("adjusted")
 n = m["rows"]
-o = m["outcomes"]
 MISS, SEV, NEAR, OFF = "missing_required_field", "several_total_amounts", "invoice_number_not_near_label", "total_not_on_total_line"
 
-
-def pct(k):
-    return "%s=%d (%.1f%%)" % (k, o.get(k, 0), 100.0 * o.get(k, 0) / n)
-
-
 print("")
-print("== %s / %s: %d invoices   %s" % (run, set_name, n, "  ".join(pct(k) for k in ("auto_correct", "human_review", "auto_wrong"))))
-
+print("== %s / %s: %d invoices" % (run, set_name, n))
 if run == "mccp-20261107-043803-qwen3-8b-v1" and set_name == "invcdip":
+    o0 = base["outcomes"]
+    rows0 = {tuple(p["block_on"]): p for p in base["policies"]}
     want = {(): (0, 0), (SEV,): (21, 28), (NEAR,): (18, 40), (OFF,): (2, 9),
             (NEAR, SEV): (34, 63), (NEAR, SEV, OFF): (34, 66)}
     bad = []
-    if o.get("auto_wrong") != 79:
-        bad.append("auto_wrong %s != 79" % o.get("auto_wrong"))
-    for k, (s, e) in want.items():
-        r = rows.get(tuple(sorted(k)))
+    if (o0.get("auto_correct"), o0.get("human_review"), o0.get("auto_wrong")) != (215, 54, 79):
+        bad.append("outcomes %s" % o0)
+    for k, v in want.items():
+        r = rows0.get(tuple(sorted(k)))
         got = (r["stops_wrong"], r["extra_reviews_of_correct"]) if r else None
-        if got != (s, e):
-            bad.append("%s: %s != %s" % (" + ".join(k) or "baseline", got, (s, e)))
-    print("   baseline check: " + ("PASS (identical to the numbers before this change)" if not bad else "FAIL " + "; ".join(bad)))
+        if got != v:
+            bad.append("%s: %s != %s" % (" + ".join(k) or "baseline", got, v))
+    print("   baseline check: " + ("PASS (v1 reproduces 215/54/79 and every flag row)" if not bad else "FAIL " + "; ".join(bad)))
+print("   %-34s %12s %12s %12s   %s" % ("step", "auto_correct", "human", "auto_wrong", "wrong amt/id/both"))
+for name, label in steps:
+    r = load(name)["measured"]
+    o = r["outcomes"]
+    k = r["auto_wrong_by_kind"]
+    print("   %-34s %5d %5.1f%% %5d %5.1f%% %5d %5.1f%%   %d/%d/%d" % (
+        label, o.get("auto_correct", 0), 100.0 * o.get("auto_correct", 0) / n, o.get("human_review", 0),
+        100.0 * o.get("human_review", 0) / n, o.get("auto_wrong", 0), 100.0 * o.get("auto_wrong", 0) / n,
+        k.get("amount_only", 0), k.get("id_only", 0), k.get("amount_and_id", 0)))
+rows = {tuple(p["block_on"]): p for p in m["policies"]}
+print("   policy options on v3 (from validation alone):")
 
 
 def line(label, r):
@@ -94,12 +110,14 @@ def line(label, r):
 
 
 print("   %-26s %5s %6s %9s %8s %9s   %s" % ("block on", "stops", "extra", "auto_ok", "human", "auto_wrong", "wrong amt/id/both"))
-for label, k in (("nothing (current)", ()), ("A missing field", (MISS,)), ("D several totals", (SEV,)),
+for label, k in (("nothing", ()), ("A missing field", (MISS,)), ("D several totals", (SEV,)),
                  ("A + D", (MISS, SEV)), ("A + D + near-label", (MISS, SEV, NEAR))):
     r = rows.get(tuple(sorted(k)))
     if r:
         print(line(label, r))
-print("   auto-wrong by field (current): %s" % m["auto_wrong_by_field"])
+print("   auto-wrong by field (new default): %s" % m["auto_wrong_by_field"])
+if m.get("redacted_labels_unscored"):
+    print("   PII-placeholder labels no longer scored: %d" % m["redacted_labels_unscored"])
 
 audit = [json.loads(x) for x in open(os.path.join(out, "audit.jsonl")) if x.strip()]
 by = {}

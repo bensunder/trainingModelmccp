@@ -76,9 +76,13 @@ class Validation:
         return d
 
 
-def amount_forms(value: float) -> list[str]:
-    """Printed forms of an amount, most specific first."""
+def amount_forms(value: float, one_decimal: bool = False) -> list[str]:
+    """Printed forms of an amount, most specific first. `one_decimal` also accepts an
+    amount whose cents end in 0 printed with one decimal place (48.1 for 48.10), as
+    real invoices do (realdoc-validation@v3)."""
     forms = [f"{value:,.2f}", f"{value:.2f}"]
+    if one_decimal and round(value * 100) % 10 == 0 and round(value) != value:
+        forms += [f"{value:,.1f}", f"{value:.1f}"]
     if round(value) == value:
         forms += [f"{value:,.0f}", f"{value:.0f}"]
     return list(dict.fromkeys(forms))
@@ -87,14 +91,14 @@ def amount_forms(value: float) -> list[str]:
 _GAP_IN_NUMBER = re.compile(r"(?<=\d)[ \t]*([.,])[ \t]*(?=\d)")
 
 
-def amount_on_page(value: float | None, text: str) -> bool:
+def amount_on_page(value: float | None, text: str, one_decimal: bool = False) -> bool:
     """True when a printed form of `value` occurs as a whole number in the text.
     Spaces and line breaks stay boundaries; only gaps OCR puts inside a number
     around a separator ("1, 533.54") are closed first."""
     if value is None:
         return False
     flat = _GAP_IN_NUMBER.sub(r"\1", text)
-    for form in amount_forms(value):
+    for form in amount_forms(value, one_decimal):
         for m in re.finditer(re.escape(form), flat):
             before = flat[m.start() - 1] if m.start() > 0 else ""
             after = flat[m.end()] if m.end() < len(flat) else ""
@@ -209,6 +213,10 @@ def validate_extract(raw: dict[str, Any] | None, canon: dict[str, Any], text: st
 def validate_realdoc(raw: dict[str, Any] | None, canon: dict[str, Any], text: str) -> Validation:
     """realdoc-validation@v1: grounding of what was extracted (nulls are not checked),
     total ambiguity flags."""
+    return _validate_realdoc(canon, text, one_decimal=False)
+
+
+def _validate_realdoc(canon: dict[str, Any], text: str, one_decimal: bool) -> Validation:
     v = Validation(REALDOC_VALIDATOR_ID)
     flat = _squash(text)
     inv = canon.get("invoice_number")
@@ -220,7 +228,7 @@ def validate_realdoc(raw: dict[str, Any] | None, canon: dict[str, Any], text: st
             v.grounded[key] = isinstance(val, str) and bool(_squash(val)) and _squash(val) in flat
     total = canon.get("total_amount")
     if total is not None:
-        v.grounded["total_amount"] = isinstance(total, (int, float)) and amount_on_page(float(total), text)
+        v.grounded["total_amount"] = isinstance(total, (int, float)) and amount_on_page(float(total), text, one_decimal)
         cands = candidate_totals(text)
         if v.grounded["total_amount"] and cands and not any(abs(c - total) < 0.005 for c in cands):
             v.flags.append("total_not_on_total_line")
@@ -242,8 +250,21 @@ def validate_realdoc_v2(raw: dict[str, Any] | None, canon: dict[str, Any], text:
     invoice number or the total is null (which fields: `missing`). A finding, not a
     block: the review policy decides whether it routes the invoice to a person, so
     v2 with no blocking policy decides exactly what v1 decides."""
-    v = validate_realdoc(raw, canon, text)
-    v.validator = REALDOC_VALIDATOR_V2_ID
+    return _with_missing(_validate_realdoc(canon, text, one_decimal=False), canon, REALDOC_VALIDATOR_V2_ID)
+
+
+REALDOC_VALIDATOR_V3_ID = "realdoc-validation@v3"
+
+
+def validate_realdoc_v3(raw: dict[str, Any] | None, canon: dict[str, Any], text: str) -> Validation:
+    """realdoc-validation@v3: v2, and a total printed with one decimal place (48.1
+    for 48.10) counts as on the page. v2 sent those to a person as not on the page
+    although label, answer and page agreed (seen on INV-CDIP scans)."""
+    return _with_missing(_validate_realdoc(canon, text, one_decimal=True), canon, REALDOC_VALIDATOR_V3_ID)
+
+
+def _with_missing(v: Validation, canon: dict[str, Any], vid: str) -> Validation:
+    v.validator = vid
     v.missing = [
         k for k in REALDOC_REQUIRED if canon.get(k) is None or (isinstance(canon[k], str) and not _squash(canon[k]))
     ]
@@ -256,6 +277,7 @@ VALIDATORS = {
     EXTRACT_VALIDATOR_ID: validate_extract,
     REALDOC_VALIDATOR_ID: validate_realdoc,
     REALDOC_VALIDATOR_V2_ID: validate_realdoc_v2,
+    REALDOC_VALIDATOR_V3_ID: validate_realdoc_v3,
 }
 # Every flag each validator can raise: a review policy may only block on these, so a
 # policy can never name a flag its validator never emits (and silently block nothing).
@@ -268,3 +290,4 @@ VALIDATOR_FLAGS: dict[str, frozenset[str]] = {
         {"invoice_number_not_near_label", "total_not_on_total_line", "several_total_amounts", MISSING_REQUIRED}
     ),
 }
+VALIDATOR_FLAGS[REALDOC_VALIDATOR_V3_ID] = VALIDATOR_FLAGS[REALDOC_VALIDATOR_V2_ID]
