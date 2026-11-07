@@ -63,13 +63,17 @@ class Validation:
     blocking: list[str] = field(default_factory=list)  # reasons that route the invoice to a human
     flags: list[str] = field(default_factory=list)  # reported, not blocking
     grounded: dict[str, bool] = field(default_factory=dict)
+    missing: list[str] = field(default_factory=list)  # required fields left null (v2+)
 
     @property
     def ok(self) -> bool:
         return not self.blocking
 
     def to_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "ok": self.ok}
+        d = {**asdict(self), "ok": self.ok}
+        if not d["missing"]:  # keep v1 output exactly as it was
+            del d["missing"]
+        return d
 
 
 def amount_forms(value: float) -> list[str]:
@@ -228,4 +232,39 @@ def validate_realdoc(raw: dict[str, Any] | None, canon: dict[str, Any], text: st
     return v
 
 
-VALIDATORS = {EXTRACT_VALIDATOR_ID: validate_extract, REALDOC_VALIDATOR_ID: validate_realdoc}
+REALDOC_VALIDATOR_V2_ID = "realdoc-validation@v2"
+REALDOC_REQUIRED = ("invoice_number", "total_amount")
+MISSING_REQUIRED = "missing_required_field"
+
+
+def validate_realdoc_v2(raw: dict[str, Any] | None, canon: dict[str, Any], text: str) -> Validation:
+    """realdoc-validation@v2: v1, plus the finding `missing_required_field` when the
+    invoice number or the total is null (which fields: `missing`). A finding, not a
+    block: the review policy decides whether it routes the invoice to a person, so
+    v2 with no blocking policy decides exactly what v1 decides."""
+    v = validate_realdoc(raw, canon, text)
+    v.validator = REALDOC_VALIDATOR_V2_ID
+    v.missing = [
+        k for k in REALDOC_REQUIRED if canon.get(k) is None or (isinstance(canon[k], str) and not _squash(canon[k]))
+    ]
+    if v.missing:
+        v.flags.append(MISSING_REQUIRED)
+    return v
+
+
+VALIDATORS = {
+    EXTRACT_VALIDATOR_ID: validate_extract,
+    REALDOC_VALIDATOR_ID: validate_realdoc,
+    REALDOC_VALIDATOR_V2_ID: validate_realdoc_v2,
+}
+# Every flag each validator can raise: a review policy may only block on these, so a
+# policy can never name a flag its validator never emits (and silently block nothing).
+VALIDATOR_FLAGS: dict[str, frozenset[str]] = {
+    EXTRACT_VALIDATOR_ID: frozenset({"arithmetic_corroborated", "arithmetic_absent"}),
+    REALDOC_VALIDATOR_ID: frozenset(
+        {"invoice_number_not_near_label", "total_not_on_total_line", "several_total_amounts"}
+    ),
+    REALDOC_VALIDATOR_V2_ID: frozenset(
+        {"invoice_number_not_near_label", "total_not_on_total_line", "several_total_amounts", MISSING_REQUIRED}
+    ),
+}

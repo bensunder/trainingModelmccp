@@ -36,6 +36,7 @@ import httpx
 import jsonschema
 
 from mccp.rules import NORMALIZERS, RULESETS
+from mccp.rules.review_policy import REVIEW_POLICIES
 from mccp.rules.validation import VALIDATORS
 
 from . import layers
@@ -297,10 +298,13 @@ def _rules_decision_correct(rules: Any, meta: dict[str, Any], sc: dict[str, Any]
     return float(got.decision == exp["decision"] and got.reason_code == exp["reason_code"])
 
 
-def _outcome(it: layers.Item, sc: dict[str, Any], correct: float, validator: Any, normalize: Any) -> str:
+def _outcome(
+    it: layers.Item, sc: dict[str, Any], correct: float, validator: Any, normalize: Any, policy: Any = None
+) -> str:
     """auto_correct | human_review | auto_wrong for one answer. Invalid output or an
     endpoint error is human review (serving never decides on it); with a validator,
-    a blocking finding is human review too. Records the validation on `sc`."""
+    a blocking finding is human review too, and so is a flag the review policy
+    blocks on. Records the validation (and the policy's verdict) on `sc`."""
     if sc.get("error") or not sc.get("json_valid"):
         return "human_review"
     if validator is not None:
@@ -314,6 +318,11 @@ def _outcome(it: layers.Item, sc: dict[str, Any], correct: float, validator: Any
         sc["validation"] = v.to_dict()
         if not v.ok:
             return "human_review"
+        if policy is not None:
+            blocked_by, hints = policy.decide(sc["validation"])
+            sc["review"] = {"policy": policy.id, "blocked_by": blocked_by, "hints": hints}
+            if blocked_by:
+                return "human_review"
     return "auto_correct" if correct >= 1.0 else "auto_wrong"
 
 
@@ -334,7 +343,9 @@ def summarize_set(
     decides = {"decision", "reason_code"} <= set(suite.compare_fields)
     validator = VALIDATORS[suite.validation] if suite.validation else None
     normalize = NORMALIZERS[suite.output_normalizer] if suite.output_normalizer else None
+    policy = REVIEW_POLICIES[suite.review_policy] if suite.review_policy else None
     outcomes: list[str] = []
+    policy_blocking: dict[str, int] = defaultdict(int)
     blocking: dict[str, int] = defaultdict(int)
     flags: dict[str, int] = defaultdict(int)
     for it, sc in zip(items, scores, strict=True):
@@ -352,8 +363,10 @@ def summarize_set(
             ok = None
         # Breakdowns follow the decision when there is one, else the record's exactness.
         unit = ok if ok is not None else float(sc.get("score") == 1.0)
-        outcome = _outcome(it, sc, unit, validator, normalize)
+        outcome = _outcome(it, sc, unit, validator, normalize, policy)
         outcomes.append(outcome)
+        for f in (sc.get("review") or {}).get("blocked_by", []):
+            policy_blocking[f] += 1
         for r in (sc.get("validation") or {}).get("blocking", []):
             blocking[r] += 1
         for f in (sc.get("validation") or {}).get("flags", []):
@@ -381,6 +394,9 @@ def summarize_set(
         out["outcomes"]["validation"] = suite.validation
         out["validation_blocking"] = dict(sorted(blocking.items()))
         out["validation_flags"] = dict(sorted(flags.items()))
+        if policy is not None:
+            out["outcomes"]["review_policy"] = policy.id
+            out["review_policy_blocking"] = dict(sorted(policy_blocking.items()))
     out["field_accuracy_lenient"] = mean(lenient) if lenient else None
     out["by_scenario"] = _breakdown(by_scenario)
     out["field_accuracy_by_field"] = {f: round(mean(v), 4) for f, v in sorted(by_field.items())} or None

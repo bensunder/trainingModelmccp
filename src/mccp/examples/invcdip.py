@@ -148,6 +148,45 @@ def first_page_image(pdf: bytes, dpi: int = 200):
     return Image.frombytes("L", (pix.width, pix.height), pix.samples)
 
 
+_ANNOTATION_LABELS = {
+    "invoice_number": ("Invoice_number",),
+    "po_number": ("Purchase_order",),
+    "total_amount": ("total_amount", "amount_due"),  # the same order labels() uses
+}
+
+
+def label_box(annotation: dict[str, Any], field: str) -> tuple[float, float, float, float] | None:
+    """Where the annotator saw the label, as fractions of the page (x0, y0, x1, y1),
+    or None. Annotation boxes are in pixels of the original scan, whose size is
+    `image_dims` = "[height, width, channels]"."""
+    try:
+        h, w = (float(v) for v in json.loads(annotation["image_dims"])[:2])
+    except (KeyError, ValueError, TypeError):
+        return None
+    for want in _ANNOTATION_LABELS.get(field, ()):
+        for f in annotation.get("Fields", []):
+            b = (f.get("value") or {}).get("bbox")
+            if (f.get("value") or {}).get("label") == want and b:
+                return (b["xmin"] / w, b["ymin"] / h, b["xmax"] / w, b["ymax"] / h)
+    return None
+
+
+def audit_images(pdf: bytes, box: tuple[float, float, float, float] | None, dpi: int = 110):
+    """(page, crop) PIL images of page 1 for a reviewer: the annotated label boxed in
+    red on the page, and a crop around it (None without a box)."""
+    from PIL import ImageDraw
+
+    page = first_page_image(pdf, dpi=dpi).convert("RGB")
+    if box is None:
+        return page, None
+    W, H = page.size
+    x0, y0, x1, y1 = box[0] * W, box[1] * H, box[2] * W, box[3] * H
+    ImageDraw.Draw(page).rectangle((x0 - 3, y0 - 3, x1 + 3, y1 + 3), outline=(220, 0, 0), width=3)
+    pad_x, pad_y = max(60.0, (x1 - x0)), max(40.0, 2 * (y1 - y0))
+    crop = page.crop((max(0, x0 - pad_x), max(0, y0 - pad_y), min(W, x1 + pad_x), min(H, y1 + pad_y)))
+    return page, crop
+
+
 def to_realdoc_record(doc_id: str, text: str, expected: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
     labelled = sorted(k for k, v in expected.items() if v is not None)
     return {

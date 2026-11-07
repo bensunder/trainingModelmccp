@@ -103,21 +103,116 @@ def _field_ok(suite: Any, e: Any, g: Any) -> bool:
     return normalized_equal(e, g) if suite.field_match == "normalized" else g == e
 
 
+ID_FIELDS = {"invoice_id", "po_number", "vendor_id", "invoice_number"}
+VERDICTS = ("label_wrong", "ocr_lost", "model_wrong")
+
+
+def wrong_kind(fields: frozenset[str] | set[str]) -> str:
+    """amount_only | id_only | amount_and_id (| other... for e.g. a quantity): what a
+    wrong answer got wrong. A wrong amount costs money directly; a wrong id mostly
+    breaks duplicate detection and matching."""
+    groups = {"amount" if f in AMOUNT_FIELDS else "id" if f in ID_FIELDS else "other" for f in fields}
+    if groups == {"amount"}:
+        return "amount_only"
+    if groups == {"id"}:
+        return "id_only"
+    if groups == {"amount", "id"}:
+        return "amount_and_id"
+    return "+".join(sorted(groups)) or "none"
+
+
+def _split(wrong_rows: list[frozenset[str]]) -> tuple[dict[str, int], dict[str, int]]:
+    kinds: Counter = Counter(wrong_kind(w) for w in wrong_rows)
+    fields: Counter = Counter(f for w in wrong_rows for f in w)
+    return dict(sorted(kinds.items())), dict(sorted(fields.items()))
+
+
+def _label_on_page(suite: Any, f: str, e: Any, text: str) -> bool:
+    if f in AMOUNT_FIELDS:
+        return amount_on_page(float(e), text)
+    if f == "billed_qty" or (f in ID_FIELDS and suite.field_match == "exact"):
+        return digits_on_page(str(e).split("-", 1)[-1] if f != "billed_qty" else str(e), text)
+    return bool(_squash(e)) and _squash(e) in _squash(text)
+
+
+def _rescore(
+    r: dict[str, Any],
+    suite: Any,
+    normalize: Any,
+    texts: dict[str, str],
+    validator: Any,
+    overrides: dict[tuple[str, str], dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """One saved final answer judged by today's code. None for non-final rows."""
+    import jsonschema
+
+    if r.get("kind") != "final":
+        return None
+    sid = str(r.get("source_id"))
+    text = r.get("input") or texts.get(sid) or ""
+    exp_raw = json.loads(r["expected"]) if isinstance(r.get("expected"), str) else dict(r.get("expected") or {})
+    unscored: set[str] = set()
+    for (osid, f), o in (overrides or {}).items():  # verified label errors only (load_adjudications)
+        if osid != sid or o["verdict"] != "label_wrong":
+            continue
+        if o.get("corrected") is None:
+            unscored.add(f)
+        else:
+            exp_raw[AMOUNT_FIELDS.get(f, f)] = o["corrected"]
+    exp = normalize(exp_raw)[0] if normalize else exp_raw
+    out: dict[str, Any] = {"sid": sid, "text": text, "exp_raw": exp_raw, "exp": exp, "invalid": False}
+    try:
+        got_raw = json.loads(r.get("content") or "")
+    except json.JSONDecodeError:
+        got_raw = None
+    if not isinstance(got_raw, dict) or r.get("error"):
+        out["invalid"] = True
+        return out
+    got = normalize(got_raw)[0] if normalize else got_raw
+    try:
+        jsonschema.validate(got, suite.output_schema)
+        valid = True
+    except jsonschema.ValidationError:
+        valid = False
+    scored = [
+        f
+        for f in suite.compare_fields
+        if f not in unscored and not (exp.get(f) is None and suite.field_match == "normalized")
+    ]
+    wrong = [f for f in scored if not (valid and _field_ok(suite, exp.get(f), got.get(f)))]
+    verdict = validator(got_raw, got, text).to_dict() if (validator is not None and valid and text) else None
+    out.update(
+        got_raw=got_raw,
+        got=got,
+        valid=valid,
+        scored=scored,
+        wrong=wrong,
+        verdict=verdict,
+        blocked=(not valid) or bool((verdict or {}).get("blocking")),
+    )
+    return out
+
+
 def classify_rows(
     rows: list[dict[str, Any]],
     suite: Any,
     normalize: Any,
     texts: dict[str, str] | None = None,
     validator: Any = None,
+    policy: Any = None,
+    overrides: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Re-score saved answers (`<report>.<set>.<target>.outputs.jsonl`) under the
     CURRENT parser, schema and validator (the model's answers do not change when
     that code does, so this is exact and needs no GPU), classify every wrong field,
     and simulate flag-based blocking policies.
 
+    `policy` (mccp.rules.review_policy.ReviewPolicy) decides the reported outcomes;
+    the simulation always starts from validation alone, so its rows are comparable
+    whatever policy is active. `overrides` ({(source_id, field): adjudication}) are
+    a person's verdicts: a verified label error is re-scored against the corrected
+    label, or not scored when none is given; every other verdict changes nothing.
     `texts` ({source_id: model input}) fills in rows saved before inputs were recorded."""
-    import jsonschema
-
     texts = texts or {}
     causes: dict[str, Counter] = defaultdict(Counter)
     caught: dict[str, Counter] = defaultdict(Counter)
@@ -125,43 +220,43 @@ def classify_rows(
     outcomes: Counter = Counter()
     flag_hits: dict[str, Counter] = defaultdict(Counter)  # flag -> {correct, wrong} among auto-decided
     refused_shapes: Counter = Counter()  # what the parser refused, digits as 9
-    passed: list[tuple[str, bool, frozenset[str]]] = []  # (source_id, correct, flags) of auto-decided rows
+    hints: Counter = Counter()  # flags the active policy passed to the reviewer, on auto-decided rows
+    policy_blocked: Counter = Counter()
+    # (source_id, correct, flags, wrong fields) of every answer validation lets through
+    passed: list[tuple[str, bool, frozenset[str], frozenset[str]]] = []
+    auto_wrong_fields: list[frozenset[str]] = []
     missing_text = 0
     for r in rows:
-        if r.get("kind") != "final":
+        x = _rescore(r, suite, normalize, texts, validator, overrides)
+        if x is None:
             continue
-        text = r.get("input") or texts.get(str(r.get("source_id"))) or ""
+        text = x["text"]
         if not text:
             missing_text += 1
-        exp_raw = json.loads(r["expected"]) if isinstance(r.get("expected"), str) else (r.get("expected") or {})
-        exp = normalize(exp_raw)[0] if normalize else exp_raw
-        try:
-            got_raw = json.loads(r.get("content") or "")
-        except json.JSONDecodeError:
-            got_raw = None
-        if not isinstance(got_raw, dict) or r.get("error"):
+        if x["invalid"]:
             outcomes["human_review"] += 1
             causes["(whole answer)"]["invalid_json_or_error"] += 1
             caught["(whole answer)"]["invalid_json_or_error"] += 1
             continue
-        got = normalize(got_raw)[0] if normalize else got_raw
-        try:
-            jsonschema.validate(got, suite.output_schema)
-            valid = True
-        except jsonschema.ValidationError:
-            valid = False
-        scored = [f for f in suite.compare_fields if not (exp.get(f) is None and suite.field_match == "normalized")]
-        wrong = [f for f in scored if not (valid and _field_ok(suite, exp.get(f), got.get(f)))]
+        exp, got, got_raw, wrong, verdict = x["exp"], x["got"], x["got_raw"], x["wrong"], x["verdict"]
         correct = not wrong
-        verdict = validator(got_raw, got, text).to_dict() if (validator is not None and valid and text) else None
-        blocked = (not valid) or bool((verdict or {}).get("blocking"))
-        outcome = "human_review" if blocked else ("auto_correct" if correct else "auto_wrong")
-        outcomes[outcome] += 1
         flags = frozenset(f for f in (verdict or {}).get("flags", []) if not f.startswith("arithmetic_"))
+        blocked = x["blocked"]
         if not blocked:
-            passed.append((str(r.get("source_id")), correct, flags))
+            passed.append((x["sid"], correct, flags, frozenset(wrong)))
             for f in flags:
                 flag_hits[f]["on_correct" if correct else "on_wrong"] += 1
+            if policy is not None:
+                by, hint = policy.decide(verdict)
+                if by:
+                    blocked = True
+                    policy_blocked.update(by)
+                else:
+                    hints.update(h for h in hint if not h.startswith("arithmetic_"))
+        outcome = "human_review" if blocked else ("auto_correct" if correct else "auto_wrong")
+        outcomes[outcome] += 1
+        if outcome == "auto_wrong":
+            auto_wrong_fields.append(frozenset(wrong))
         for f in wrong:
             e, g = exp.get(f), got.get(f)
             if f in AMOUNT_FIELDS:
@@ -189,66 +284,204 @@ def classify_rows(
             if len(examples[(f, cause)]) < 3:
                 examples[(f, cause)].append(
                     {
-                        "source_id": r.get("source_id"),
+                        "source_id": x["sid"],
                         "expected": e,
                         "got": got_raw.get(AMOUNT_FIELDS.get(f, f), g),
                         "outcome": outcome,
-                        "blocking": (verdict or {}).get("blocking", []) or ([] if valid else ["schema"]),
+                        "blocking": (verdict or {}).get("blocking", []) or ([] if x["valid"] else ["schema"]),
                         "flags": sorted(flags),
                         "line": _line_with(e, text),
                         "answer": got_raw,
                     }
                 )
+    kinds, by_field = _split(auto_wrong_fields)
     return {
         "rows": sum(outcomes.values()),
         "outcomes": dict(outcomes),
+        "review_policy": getattr(policy, "id", None),
+        "review_policy_blocked": dict(policy_blocked),
+        "review_hints": dict(hints.most_common()),
+        "auto_wrong_by_kind": kinds,
+        "auto_wrong_by_field": by_field,
         "causes": {f: dict(c.most_common()) for f, c in causes.items()},
         "caught_by_validation": {f: dict(c) for f, c in caught.items()},
         "examples": {f"{f} | {c}": v for (f, c), v in examples.items()},
         "rows_without_input_text": missing_text,
+        "label_overrides_applied": sum(1 for o in (overrides or {}).values() if o["verdict"] == "label_wrong"),
         # Hits on correct answers = extra human reviews if the flag blocked; on wrong
-        # answers = errors it would stop. Counted among auto-decided answers only.
+        # answers = errors it would stop. Counted among answers validation lets through.
         "flags": {f: dict(c) for f, c in flag_hits.items()},
         "refused_amount_shapes": dict(refused_shapes.most_common(15)),
-        "policies": simulate_policies(passed, dict(outcomes)),
+        "policies": simulate_policies(passed, outcomes_before_policy(outcomes, policy_blocked, passed)),
     }
 
 
-def simulate_policies(passed: list[tuple[str, bool, frozenset[str]]], outcomes: dict[str, int]) -> list[dict[str, Any]]:
+def outcomes_before_policy(outcomes: Counter, policy_blocked: Counter, passed: list[Any]) -> dict[str, int]:
+    """Outcome counts with validation alone (the simulation's starting point)."""
+    n = sum(outcomes.values())
+    wrong = sum(1 for p in passed if not p[1])
+    return {"auto_correct": len(passed) - wrong, "auto_wrong": wrong, "human_review": n - len(passed)}
+
+
+def simulate_policies(passed: list[tuple[Any, ...]], outcomes: dict[str, int]) -> list[dict[str, Any]]:
     """For every combination of flags (as one blocking rule: block when ANY flag in
     the combination is raised), on the union of flagged invoices (never summed):
-    wrong invoices stopped, correct ones sent to a person, and the resulting rates."""
+    wrong invoices stopped, correct ones sent to a person, the resulting rates, and
+    what the auto-wrong that remains got wrong (`auto_wrong_by_kind` / `_by_field`).
+
+    `passed`: (source_id, correct, flags[, wrong fields]) of every answer validation
+    lets through; `outcomes`: counts with validation alone."""
     from itertools import combinations
 
+    rows = [(p[0], p[1], p[2], p[3] if len(p) > 3 else frozenset()) for p in passed]
     n = sum(outcomes.values()) or 1
-    base_wrong = sum(1 for _, ok, _ in passed if not ok)
+    base_wrong = sum(1 for _, ok, _, _ in rows if not ok)
     base_human = outcomes.get("human_review", 0)
-    names = sorted({f for _, _, fl in passed for f in fl})
-    out = [
-        {
-            "block_on": [],
-            "stops_wrong": 0,
-            "extra_reviews_of_correct": 0,
-            "auto_correct": round((len(passed) - base_wrong) / n, 4),
-            "human_review": round(base_human / n, 4),
-            "auto_wrong": round(base_wrong / n, 4),
+    names = sorted({f for _, _, fl, _ in rows for f in fl})
+
+    def row(combo: tuple[str, ...]) -> dict[str, Any]:
+        hit = [(ok, w) for _, ok, fl, w in rows if fl & set(combo)]  # union of flagged invoices
+        stops = sum(1 for ok, _ in hit if not ok)
+        extra = sum(1 for ok, _ in hit if ok)
+        left = [w for _, ok, fl, w in rows if not ok and not (fl & set(combo))]
+        kinds, by_field = _split(left)
+        return {
+            "block_on": list(combo),
+            "stops_wrong": stops,
+            "extra_reviews_of_correct": extra,
+            "auto_correct": round((len(rows) - base_wrong - extra) / n, 4),
+            "human_review": round((base_human + len(hit)) / n, 4),
+            "auto_wrong": round((base_wrong - stops) / n, 4),
+            "auto_wrong_n": base_wrong - stops,
+            "auto_wrong_by_kind": kinds,
+            "auto_wrong_by_field": by_field,
         }
-    ]
-    for k in range(1, len(names) + 1):
-        for combo in combinations(names, k):
-            hit = [(sid, ok) for sid, ok, fl in passed if fl & set(combo)]  # union of flagged invoices
-            stops = sum(1 for _, ok in hit if not ok)
-            extra = sum(1 for _, ok in hit if ok)
+
+    return [row(())] + [row(c) for k in range(1, len(names) + 1) for c in combinations(names, k)]
+
+
+# -- label audit (labels the model could not have read) ---------------------------
+
+
+def _levenshtein(a: str, b: str, cap: int) -> int:
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+        if min(cur) > cap:
+            return cap + 1
+        prev = cur
+    return prev[-1]
+
+
+def closest_on_page(label: str, text: str, max_tokens: int = 3) -> tuple[str | None, int | None]:
+    """The run of 1..3 OCR tokens closest to the label (ignoring case, spaces and
+    punctuation), and its edit distance; (None, None) when nothing is within reach."""
+    want = _squash(label)
+    if not want:
+        return None, None
+    toks = text.split()
+    cap = max(2, len(want) // 2)
+    best: tuple[int, str] | None = None
+    for i in range(len(toks)):
+        for k in range(1, max_tokens + 1):
+            win = " ".join(toks[i : i + k])
+            d = _levenshtein(want, _squash(win), cap)
+            if d <= cap and (best is None or d < best[0] or (d == best[0] and len(win) < len(best[1]))):
+                best = (d, win)
+            if i + k >= len(toks):
+                break
+    return (best[1], best[0]) if best else (None, None)
+
+
+def audit_hint(label: str, answer_on_page: bool, distance: int | None) -> str:
+    """A first guess for the reviewer, never a verdict: `ocr_near_miss` (the OCR
+    printed something within a character or two of the label: OCR damage, or a typo
+    in the label), `answer_on_page_label_absent` (the model's value is printed and
+    the label is not: possibly a wrong label), `absent`."""
+    if distance is not None and distance <= max(1, min(2, len(_squash(label)) // 5)):
+        return "ocr_near_miss"
+    return "answer_on_page_label_absent" if answer_on_page else "absent"
+
+
+def label_audit_rows(
+    rows: list[dict[str, Any]],
+    suite: Any,
+    normalize: Any,
+    texts: dict[str, str] | None = None,
+    validator: Any = None,
+    policy: Any = None,
+) -> list[dict[str, Any]]:
+    """Every scored field whose label is not in the text the model read, with what a
+    person needs to judge it. Read-only; one entry per (source_id, field)."""
+    texts = texts or {}
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        x = _rescore(r, suite, normalize, texts, validator, None)
+        if x is None or x["invalid"] or not x["text"]:
+            continue
+        blocked = x["blocked"]
+        if not blocked and policy is not None:
+            blocked = bool(policy.decide(x["verdict"])[0])
+        correct = not x["wrong"]
+        outcome = "human_review" if blocked else ("auto_correct" if correct else "auto_wrong")
+        for f in x["scored"]:
+            e = x["exp"].get(f)
+            if _label_on_page(suite, f, e, x["text"]):
+                continue
+            label_text = str(x["exp_raw"].get(AMOUNT_FIELDS.get(f, f)))
+            g = x["got"].get(f)
+            ans_on = g is not None and (
+                (isinstance(g, (int, float)) and amount_on_page(float(g), x["text"]))
+                if f in AMOUNT_FIELDS
+                else _label_on_page(suite, f, g, x["text"])
+            )
+            snippet, dist = closest_on_page(label_text, x["text"])
             out.append(
                 {
-                    "block_on": list(combo),
-                    "stops_wrong": stops,
-                    "extra_reviews_of_correct": extra,
-                    "auto_correct": round((len(passed) - base_wrong - extra) / n, 4),
-                    "human_review": round((base_human + len(hit)) / n, 4),
-                    "auto_wrong": round((base_wrong - stops) / n, 4),
+                    "source_id": x["sid"],
+                    "field": f,
+                    "outcome": outcome,
+                    "field_correct": f not in x["wrong"],
+                    "label": label_text,
+                    "answer": x["got_raw"].get(AMOUNT_FIELDS.get(f, f)),
+                    "answer_on_page": bool(ans_on),
+                    "closest_on_page": snippet,
+                    "distance": dist,
+                    "hint": audit_hint(label_text, bool(ans_on), dist),
                 }
             )
+    return out
+
+
+def load_adjudications(rows: list[dict[str, str]]) -> dict[tuple[str, str], dict[str, Any]]:
+    """{(source_id, field): {"verdict", "corrected"}} from the filled-in audit sheet.
+    Blank verdicts are skipped; anything else unexpected is an error, never a guess:
+    an unknown verdict, a corrected label without `label_wrong`, a corrected total
+    the amount parser refuses, or the same (source_id, field) twice."""
+    from mccp.rules.extraction import parse_money
+
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for i, r in enumerate(rows, 2):  # line numbers as a spreadsheet shows them
+        verdict = (r.get("verdict") or "").strip()
+        corrected = (r.get("corrected_label") or "").strip() or None
+        key = (str(r.get("source_id") or "").strip(), str(r.get("field") or "").strip())
+        if not verdict:
+            if corrected:
+                raise ValueError(f"line {i} {key}: corrected_label given without a verdict")
+            continue
+        if verdict not in VERDICTS:
+            raise ValueError(f"line {i} {key}: verdict {verdict!r} is not one of {', '.join(VERDICTS)}")
+        if corrected and verdict != "label_wrong":
+            raise ValueError(f"line {i} {key}: corrected_label only goes with label_wrong")
+        if corrected and key[1] in AMOUNT_FIELDS and parse_money(corrected) is None:
+            raise ValueError(f"line {i} {key}: corrected amount {corrected!r} is not readable; type it as printed")
+        if key in out:
+            raise ValueError(f"line {i} {key}: adjudicated twice")
+        out[key] = {"verdict": verdict, "corrected": corrected}
     return out
 
 

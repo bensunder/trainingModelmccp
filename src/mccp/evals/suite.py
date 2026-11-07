@@ -81,6 +81,9 @@ class EvalSuite(BaseModel):
     # Financial-field validation between extraction and decision (mccp.rules.validation):
     # values not on the page, contradicted arithmetic -> human review, never auto-decided.
     validation: str | None = None
+    # Which validation flags also route to a person (mccp.rules.review_policy). Must
+    # read the suite's validator; None = no flag blocks.
+    review_policy: str | None = None
 
     @model_validator(mode="after")
     def _known_rules(self) -> "EvalSuite":
@@ -94,6 +97,16 @@ class EvalSuite(BaseModel):
             raise ValueError(f"unknown validation {self.validation!r} (known: {', '.join(VALIDATORS)})")
         if self.output_normalizer is not None and self.output_normalizer not in NORMALIZERS:
             raise ValueError(f"unknown output_normalizer {self.output_normalizer!r} (known: {', '.join(NORMALIZERS)})")
+        if self.review_policy is not None:
+            from mccp.rules.review_policy import REVIEW_POLICIES
+
+            pol = REVIEW_POLICIES.get(self.review_policy)
+            if pol is None:
+                raise ValueError(f"unknown review_policy {self.review_policy!r} (known: {', '.join(REVIEW_POLICIES)})")
+            if pol.validator != self.validation:
+                raise ValueError(
+                    f"review_policy {pol.id} reads {pol.validator}, the suite validates with {self.validation}"
+                )
         return self
 
     @model_validator(mode="after")

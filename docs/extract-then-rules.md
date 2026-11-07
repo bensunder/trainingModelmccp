@@ -160,6 +160,49 @@ disagrees with the page). Each cause shows how many validation caught and how ma
 decided wrongly. Rows saved before validation existed are re-validated, so old runs are judged by the
 current pipeline.
 
+## Review policies, the auto-wrong split and the label audit
+
+**Findings vs policy.** The validator reports findings; a review policy
+(`mccp.rules.review_policy`) decides which flags also route an invoice to a person.
+Flags a policy does not block on are passed to the reviewer as hints. Blocking
+findings (a value not on the page) always route to a person, whatever the policy.
+
+* `realdoc-validation@v2` = v1 plus `missing_required_field` (invoice number or
+  total null; which ones in `missing`). v1 is kept unchanged, and v2 with no
+  blocking policy decides exactly what v1 decided (pinned by a test).
+* Policies: `realdoc-review-flags-none@v1` (the suite default),
+  `realdoc-review-missing@v1`, `realdoc-review-several-totals@v1`,
+  `realdoc-review-missing-several-totals@v1`. A policy may only name flags its
+  validator raises.
+* `mccp-gpu failures RUN --set invcdip --policy ID` reports outcomes under a
+  policy; `--block-on f,g` measures an unregistered one. The simulation always
+  starts from validation alone, so its rows compare across policies; `--policies all`
+  prints every combination.
+
+Measured on the 348 INV-CDIP scans (Qwen3-8B adapter, flags-none): auto_correct
+61.8%, human 15.5%, auto_wrong 22.7% (79). Blocking on `several_total_amounts`
+stops 21 wrong for 28 extra reviews; `invoice_number_not_near_label` 18 for 40;
+`total_not_on_total_line` 2 for 9; the first two together 34 for 63 (union, not
+sum). No flag combination is precise enough to block on by itself.
+
+**The split (C).** Every auto-wrong answer is `amount_only`, `id_only` or
+`amount_and_id` (plus per-field counts), for the reported outcome and for every
+simulation row (`wrong amt/id/both`). A wrong amount costs money directly; a wrong
+id mostly breaks duplicate detection.
+
+**Label audit (B).** `mccp-gpu audit-labels RUN --set invcdip` lists every scored
+field whose label is not in the text the model read and writes, to
+`/workspace/mccp-audit/<run>/<set>/` (never into the run folder; only cached PDFs and
+annotations are read): `audit.csv`, `audit.jsonl`, `index.html` and page images with
+the annotator's box. The `hint` column (`ocr_near_miss`,
+`answer_on_page_label_absent`, `absent`) is a guess and changes nothing. A person
+fills in `verdict` (`label_wrong`, `ocr_lost`, `model_wrong`) and, for
+`label_wrong`, optionally `corrected_label` as printed (parsed by the same code;
+an unreadable amount is an error). Re-running keeps typed verdicts.
+`failures --adjudications audit.csv` then reports both: as measured, and excluding
+verified label errors (re-scored against the corrected label, or unscored).
+`ocr_lost` stays scored: OCR is part of the pipeline being measured.
+
 ## Serving
 
 `mccp.agent.extract.triage_extract(chat, text, model=..., lookup_po=..., lookup_vendor=...)`: one

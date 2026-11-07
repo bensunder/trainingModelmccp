@@ -251,7 +251,8 @@ def test_failures_cli_on_a_saved_folder(tmp_path):
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     assert r.returncode == 0, r.stderr
     assert "decimal_dropped" in r.stdout and "human_review=1" in r.stdout and "page: GRAND TOTAL $1,533.54" in r.stdout
-    assert (w / "failures_invcdip_adapter.json").exists()
+    assert (tmp_path / "mccp-audit" / w.parent.name / "invcdip" / "failures_extract-n1000-e1-s42_adapter.json").exists()
+    assert not list(w.glob("failures_*"))  # never written into the run folder
 
 
 # The two docs-set answers that got through on the GPU (INV-3200077, INV-3200173):

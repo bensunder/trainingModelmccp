@@ -1039,23 +1039,20 @@ def _input_texts(set_name: str, cache: Path, runs_root: Path, run_id: str, workd
     return out
 
 
-def failures(args: argparse.Namespace) -> int:
-    """Classify every wrong field in a saved run folder: cause, and whether
-    validation routes it to a person or it would be decided wrongly. Read-only."""
-    from mccp.evals.failures import classify_rows
+def _saved_sets(args: argparse.Namespace):
+    """Yield (report path, set, suite, normalizer, validator, rows, texts) for every
+    saved answer file in a run folder. Read-only."""
     from mccp.rules import NORMALIZERS
     from mccp.rules.validation import VALIDATORS
 
     root = Path(args.folder).resolve()
     run_id = root.name.removeprefix("mccp-")
-    found = False
     for rp in sorted(root.glob("*/report*.json")):
         stem = rp.stem
         for outs in sorted(rp.parent.glob(f"{stem}.*.{args.target}.outputs.jsonl")):
             set_name = outs.name[len(stem) + 1 :].split(".")[0]
             if args.set and set_name != args.set:
                 continue
-            found = True
             meta = (
                 json.loads((rp.parent / "pilot.json").read_text(encoding="utf-8"))
                 if (rp.parent / "pilot.json").exists()
@@ -1071,65 +1068,281 @@ def failures(args: argparse.Namespace) -> int:
             validator = VALIDATORS[suite.validation] if suite.validation else None
             rows = _jsonl(outs.read_bytes())
             texts = _input_texts(set_name, Path(args.cache), Path(args.runs_root), run_id, rp.parent.name)
-            res = classify_rows(rows, suite, normalize, texts, validator)
-            n = res["rows"] or 1
-            o = res["outcomes"]
-            print(f"\n== {rp.parent.name} / {set_name} / {args.target}: {res['rows']} invoices")
+            yield rp, set_name, suite, normalize, validator, rows, texts
+
+
+def _out_dir(args: argparse.Namespace, set_name: str) -> Path:
+    """Where derived files go: never inside the run folder (its files are the record
+    of the experiment). Default /workspace/mccp-audit/<run folder>/<set>/."""
+    root = Path(args.folder).resolve()
+    out = Path(args.out).resolve() if args.out else root.parent / "mccp-audit" / root.name / set_name
+    if out == root or root in out.parents:
+        raise SystemExit(f"--out {out} is inside the run folder {root}; choose a directory outside it")
+    return out
+
+
+def _resolve_policy(args: argparse.Namespace, suite: EvalSuite):
+    from mccp.rules.review_policy import REVIEW_POLICIES, adhoc_policy
+
+    if getattr(args, "block_on", None) is not None:
+        flags = [f.strip() for f in args.block_on.split(",") if f.strip()]
+        return adhoc_policy(suite.validation or "", flags)
+    pid = getattr(args, "policy", None) or suite.review_policy
+    if pid is None:
+        return None
+    if pid not in REVIEW_POLICIES:
+        raise SystemExit(f"unknown --policy {pid!r} (known: {', '.join(REVIEW_POLICIES)})")
+    pol = REVIEW_POLICIES[pid]
+    if pol.validator != suite.validation:
+        raise SystemExit(f"--policy {pid} reads {pol.validator}; this set's suite validates with {suite.validation}")
+    return pol
+
+
+def _pick_policies(pols: list[dict[str, Any]], spec: str, validator: str | None, active: Any) -> list[dict[str, Any]]:
+    """default: no blocking, each flag alone, and every registered policy for this
+    validator (plus the active one); all: every combination; else 'a+b,c'."""
+    from mccp.rules.review_policy import REVIEW_POLICIES
+
+    if spec == "all":
+        return pols
+    if spec == "default":
+        want = {()} | {tuple(sorted(p.block_on)) for p in REVIEW_POLICIES.values() if p.validator == validator}
+        if active is not None:
+            want.add(tuple(sorted(active.block_on)))
+        return [p for p in pols if len(p["block_on"]) <= 1 or tuple(p["block_on"]) in want]
+    want = {tuple(sorted(x.strip() for x in c.split("+") if x.strip())) for c in spec.split(",")} | {()}
+    return [p for p in pols if tuple(p["block_on"]) in want]
+
+
+def _print_policies(pols: list[dict[str, Any]]) -> None:
+    print(
+        f"      {'block on':52} {'stops wrong':>11} {'extra reviews':>13} {'auto_correct':>12} {'human':>7}"
+        f" {'auto_wrong':>10} {'wrong amt/id/both':>17}"
+    )
+    for p in pols:
+        name = " + ".join(p["block_on"]) or "(nothing: validation only)"
+        k = p.get("auto_wrong_by_kind") or {}
+        split = f"{k.get('amount_only', 0)}/{k.get('id_only', 0)}/{k.get('amount_and_id', 0)}"
+        print(
+            f"      {name:52} {p['stops_wrong']:11} {p['extra_reviews_of_correct']:13}"
+            f" {p['auto_correct'] * 100:11.1f}% {p['human_review'] * 100:6.1f}% {p['auto_wrong'] * 100:9.1f}%"
+            f" {split:>17}"
+        )
+
+
+def _outcome_line(res: dict[str, Any]) -> str:
+    n = res["rows"] or 1
+    o = res["outcomes"]
+    return "  ".join(
+        f"{k}={o.get(k, 0)} ({o.get(k, 0) / n * 100:.1f}%)" for k in ("auto_correct", "human_review", "auto_wrong")
+    )
+
+
+def _read_csv(path: Path) -> list[dict[str, str]]:
+    import csv
+
+    with path.open(newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def failures(args: argparse.Namespace) -> int:
+    """Classify every wrong field in a saved run folder: cause, and whether
+    validation routes it to a person or it would be decided wrongly. Read-only:
+    nothing in the run folder is written (--json goes to the audit directory)."""
+    from mccp.evals.failures import classify_rows, load_adjudications
+
+    found = False
+    for rp, set_name, suite, normalize, validator, rows, texts in _saved_sets(args):
+        found = True
+        policy = _resolve_policy(args, suite)
+        res = classify_rows(rows, suite, normalize, texts, validator, policy)
+        print(f"\n== {rp.parent.name} / {set_name} / {args.target}: {res['rows']} invoices")
+        print(f"   validation: {suite.validation}   review policy: {res['review_policy'] or '(none)'}")
+        print("   outcomes: " + _outcome_line(res))
+        if policy is not None:
             print(
-                "   outcomes: "
-                + "  ".join(
-                    f"{k}={o.get(k, 0)} ({o.get(k, 0) / n * 100:.1f}%)"
-                    for k in ("auto_correct", "human_review", "auto_wrong")
-                )
+                f"   policy blocks on: {', '.join(sorted(policy.block_on)) or '(nothing)'}"
+                f"   blocked: {res['review_policy_blocked'] or 0}   hints left to reviewers: {res['review_hints'] or 0}"
             )
-            if res["rows_without_input_text"]:
-                print(f"   (no input text for {res['rows_without_input_text']} rows: causes there are unreliable)")
-            for f, cs in res["causes"].items():
-                total = sum(cs.values())
-                print(f"   {f}: {total} wrong")
-                for c, k in cs.items():
-                    got_caught = res["caught_by_validation"].get(f, {}).get(c, 0)
-                    print(f"      {c:44} {k:4}   caught {got_caught:4}   auto_wrong {k - got_caught:4}")
-            pols = res.get("policies") or []
-            if len(pols) > 1:
-                print("   policy simulation (block when ANY listed flag is raised; union of invoices, not sums):")
-                print(
-                    f"      {'block on':52} {'stops wrong':>11} {'extra reviews':>13} {'auto_correct':>12} {'human':>7} {'auto_wrong':>10}"
-                )
-                for p in pols:
-                    name = " + ".join(p["block_on"]) or "(nothing: current)"
-                    print(
-                        f"      {name:52} {p['stops_wrong']:11} {p['extra_reviews_of_correct']:13}"
-                        f" {p['auto_correct'] * 100:11.1f}% {p['human_review'] * 100:6.1f}% {p['auto_wrong'] * 100:9.1f}%"
+        print(f"   auto_wrong by kind: {res['auto_wrong_by_kind']}   by field: {res['auto_wrong_by_field']}")
+        if res["rows_without_input_text"]:
+            print(f"   (no input text for {res['rows_without_input_text']} rows: causes there are unreliable)")
+        for f, cs in res["causes"].items():
+            total = sum(cs.values())
+            print(f"   {f}: {total} wrong")
+            for c, k in cs.items():
+                got_caught = res["caught_by_validation"].get(f, {}).get(c, 0)
+                print(f"      {c:44} {k:4}   caught {got_caught:4}   auto_wrong {k - got_caught:4}")
+        pols = res.get("policies") or []
+        if len(pols) > 1:
+            print("   policy simulation (block when ANY listed flag is raised; union of invoices, not sums):")
+            _print_policies(_pick_policies(pols, args.policies, suite.validation, policy))
+        adjusted = None
+        if args.adjudications:
+            overrides = load_adjudications(_read_csv(Path(args.adjudications)))
+            verdicts: dict[str, int] = {}
+            for o in overrides.values():
+                verdicts[o["verdict"]] = verdicts.get(o["verdict"], 0) + 1
+            adjusted = classify_rows(rows, suite, normalize, texts, validator, policy, overrides)
+            print(f"   adjudications: {verdicts or 'none filled in'} (only label_wrong changes scoring)")
+            print(
+                f"   excluding {adjusted['label_overrides_applied']} verified label errors: " + _outcome_line(adjusted)
+            )
+            if len(adjusted.get("policies") or []) > 1:
+                _print_policies(_pick_policies(adjusted["policies"], args.policies, suite.validation, policy))
+        shapes = res.get("refused_amount_shapes") or {}
+        if shapes:
+            print("   refused amount copies by shape: " + "  ".join(f"{k!r}x{v}" for k, v in shapes.items()))
+        for f, c in (res.get("flags") or {}).items():
+            print(
+                f"   flag {f}: on correct answers {c.get('on_correct', 0)}, on wrong answers {c.get('on_wrong', 0)}"
+                "  (if it blocked: extra human reviews vs errors stopped)"
+            )
+        if args.examples:
+            for key, exs in res["examples"].items():
+                for ex in exs[: args.examples]:
+                    why = ", ".join(ex.get("blocking") or []) or (
+                        "passed: " + (", ".join(ex.get("flags") or []) or "no flags")
                     )
-            shapes = res.get("refused_amount_shapes") or {}
-            if shapes:
-                print("   refused amount copies by shape: " + "  ".join(f"{k!r}x{v}" for k, v in shapes.items()))
-            for f, c in (res.get("flags") or {}).items():
-                print(
-                    f"   flag {f}: on correct answers {c.get('on_correct', 0)}, on wrong answers {c.get('on_wrong', 0)}"
-                    "  (if it blocked: extra human reviews vs errors stopped)"
-                )
-            if args.examples:
-                for key, exs in res["examples"].items():
-                    for ex in exs[: args.examples]:
-                        why = ", ".join(ex.get("blocking") or []) or (
-                            "passed: " + (", ".join(ex.get("flags") or []) or "no flags")
-                        )
-                        print(
-                            f"   e.g. [{key}] {ex['source_id']}: expected {ex['expected']!r} got {ex['got']!r}"
-                            f" ({ex['outcome']}; {why})"
-                        )
-                        if ex.get("answer") and ex["outcome"] == "auto_wrong":
-                            print(f"        answer: {json.dumps(ex['answer'])[:160]}")
-                        if ex["line"]:
-                            print(f"        page: {ex['line']}")
-            if args.json:
-                (rp.parent / f"failures_{set_name}_{args.target}.json").write_text(
-                    json.dumps(res, indent=2, default=str)
-                )
+                    print(
+                        f"   e.g. [{key}] {ex['source_id']}: expected {ex['expected']!r} got {ex['got']!r}"
+                        f" ({ex['outcome']}; {why})"
+                    )
+                    if ex.get("answer") and ex["outcome"] == "auto_wrong":
+                        print(f"        answer: {json.dumps(ex['answer'])[:160]}")
+                    if ex["line"]:
+                        print(f"        page: {ex['line']}")
+        if args.json:
+            out = _out_dir(args, set_name)
+            out.mkdir(parents=True, exist_ok=True)
+            path = out / f"failures_{rp.parent.name}_{args.target}.json"
+            path.write_text(json.dumps({"measured": res, "adjusted": adjusted}, indent=2, default=str))
+            print(f"   wrote {path}")
     if not found:
-        print(f"no saved answers (*.{args.target}.outputs.jsonl) under {root}", file=sys.stderr)
+        print(f"no saved answers (*.{args.target}.outputs.jsonl) under {Path(args.folder).resolve()}", file=sys.stderr)
+        return 2
+    return 0
+
+
+_AUDIT_COLUMNS = [
+    "source_id", "field", "outcome", "label", "answer", "answer_on_page", "closest_on_page", "distance", "hint",
+    "page_image", "crop_image", "verdict", "corrected_label", "note",
+]  # fmt: skip
+_KEEP = ("verdict", "corrected_label", "note")  # what a person typed: carried over on a re-run
+
+
+def _no_download(url: str) -> bytes:
+    raise RuntimeError(f"audit-labels never downloads ({url}); only cached files are used")
+
+
+def audit_labels(args: argparse.Namespace) -> int:
+    """Labels the model could not have read: for every scored field whose label is
+    not in the text the model was given, write a review sheet (audit.csv: fill in
+    verdict = label_wrong | ocr_lost | model_wrong, and for label_wrong optionally
+    corrected_label as printed), the page with the annotated box, and index.html.
+    Uses cached PDFs and annotations only; writes outside the run folder; keeps any
+    verdicts already typed into audit.csv."""
+    import csv
+    import html
+    import io
+
+    from mccp.evals.failures import label_audit_rows
+    from mccp.examples import invcdip
+
+    found = False
+    for rp, set_name, suite, normalize, validator, rows, texts in _saved_sets(args):
+        found = True
+        out = _out_dir(args, set_name)
+        (out / "images").mkdir(parents=True, exist_ok=True)
+        policy = _resolve_policy(args, suite)
+        items = label_audit_rows(rows, suite, normalize, texts, validator, policy)
+        cache = Path(args.cache) / "invcdip"
+        annotations: dict[str, Any] = {}
+        if set_name == "invcdip" and (cache / f"inv-cdip-{invcdip.ANNOTATIONS_COMMIT[:12]}.tar.gz").exists():
+            annotations = invcdip.fetch_annotations(cache, opener=_no_download)
+        no_pdf = 0
+        for it in items:
+            it["page_image"] = it["crop_image"] = ""
+            pdf_path = cache / "pdf" / f"{it['source_id']}.pdf"
+            if set_name != "invcdip" or not pdf_path.exists():
+                no_pdf += set_name == "invcdip"
+                continue
+            box = (
+                invcdip.label_box(annotations[it["source_id"]], it["field"]) if it["source_id"] in annotations else None
+            )
+            page, crop = invcdip.audit_images(pdf_path.read_bytes(), box)
+            base = f"images/{it['source_id']}_{it['field']}"
+            page.save(out / f"{base}_page.png", optimize=True)
+            it["page_image"] = f"{base}_page.png"
+            if crop is not None:
+                crop.save(out / f"{base}_crop.png", optimize=True)
+                it["crop_image"] = f"{base}_crop.png"
+        sheet = out / "audit.csv"
+        typed: dict[tuple[str, str], dict[str, str]] = {}
+        if sheet.exists():
+            for r in _read_csv(sheet):
+                typed[(r.get("source_id", ""), r.get("field", ""))] = {k: r.get(k, "") or "" for k in _KEEP}
+        for it in items:
+            it.update(typed.pop((it["source_id"], it["field"]), {k: "" for k in _KEEP}))
+        orphans = [k for k, v in typed.items() if any(v.values())]
+        if orphans:
+            raise SystemExit(
+                f"{sheet} has verdicts for rows this run no longer lists: {orphans[:5]}; move it aside first"
+            )
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=_AUDIT_COLUMNS, extrasaction="ignore", lineterminator="\n")
+        w.writeheader()
+        for it in items:
+            w.writerow({k: ("" if it.get(k) is None else it.get(k)) for k in _AUDIT_COLUMNS})
+        tmp = sheet.with_suffix(".part")
+        tmp.write_text(buf.getvalue(), encoding="utf-8")
+        tmp.replace(sheet)
+        _write_jsonl(out / "audit.jsonl", items)
+        cells = []
+        for it in items:
+            img = it["crop_image"] or it["page_image"]
+            pic = (
+                f'<a href="{html.escape(it["page_image"])}"><img src="{html.escape(img)}" alt="page"></a>'
+                if img
+                else "(no cached PDF)"
+            )
+            cells.append(
+                "<tr>"
+                + "".join(
+                    f"<td>{html.escape(str(it.get(k, '') if it.get(k) is not None else ''))}</td>"
+                    for k in ("source_id", "field", "outcome", "label", "answer", "closest_on_page", "hint", "verdict")
+                )
+                + f"<td>{pic}</td></tr>"
+            )
+        (out / "index.html").write_text(
+            "<!doctype html><meta charset='utf-8'><title>Label audit</title>"
+            "<style>body{font:14px system-ui;margin:16px}td,th{border:1px solid #ccc;padding:4px;vertical-align:top}"
+            "table{border-collapse:collapse}img{max-width:420px}</style>"
+            f"<h1>Label audit: {html.escape(rp.parent.parent.name)} / {html.escape(set_name)}</h1>"
+            "<p>Each row: a scored field whose label is not in the OCR text the model read. The red box is where the "
+            "annotator saw the label. Fill <b>verdict</b> in audit.csv: <code>label_wrong</code> (the label disagrees "
+            "with the page; put the printed value in corrected_label if you can read it), <code>ocr_lost</code> (the "
+            "page shows the label, the OCR lost it), <code>model_wrong</code>. The hint is a guess, not a verdict.</p>"
+            "<table><tr><th>id</th><th>field</th><th>outcome</th><th>label</th><th>answer</th><th>closest OCR</th>"
+            "<th>hint</th><th>verdict</th><th>page (click for full)</th></tr>" + "".join(cells) + "</table>",
+            encoding="utf-8",
+        )
+        by: dict[str, int] = {}
+        for it in items:
+            k = f"{it['field']}/{it['outcome']}"
+            by[k] = by.get(k, 0) + 1
+        hints: dict[str, int] = {}
+        for it in items:
+            hints[it["hint"]] = hints.get(it["hint"], 0) + 1
+        print(f"\n== {rp.parent.name} / {set_name}: {len(items)} labelled fields not in the text the model read")
+        print(f"   by field/outcome: {dict(sorted(by.items()))}")
+        print(f"   hints (guesses, not verdicts): {dict(sorted(hints.items()))}")
+        print(f"   verdicts already filled in: {sum(1 for it in items if it['verdict'])}")
+        if no_pdf:
+            print(f"   ({no_pdf} rows without a cached PDF: no image)")
+        print(f"   wrote {sheet}  {out / 'index.html'}  ({out / 'images'})")
+    if not found:
+        print(f"no saved answers (*.{args.target}.outputs.jsonl) under {Path(args.folder).resolve()}", file=sys.stderr)
         return 2
     return 0
 
@@ -1319,9 +1532,23 @@ def main() -> int:
     fl.add_argument("--target", default="adapter", choices=["adapter", "base", "frontier"])
     fl.add_argument("--set", default=None, help="only this set (docs, invcdip, messy, ...)")
     fl.add_argument("--examples", type=int, default=0, help="examples to print per cause")
-    fl.add_argument("--json", action="store_true", help="also write failures_<set>_<target>.json next to the report")
+    fl.add_argument("--json", action="store_true", help="also write the full result as JSON to the audit directory")
     fl.add_argument("--cache", default="/workspace/mccp-cache")
     fl.add_argument("--runs-root", default="/root/mccp-runs")
+    fl.add_argument("--policy", default=None, help="review policy id (default: the suite's)")
+    fl.add_argument("--block-on", default=None, help="measure an ad-hoc policy: comma-separated flags")
+    fl.add_argument("--policies", default="default", help="simulation rows to print: default | all | 'a+b,c'")
+    fl.add_argument("--adjudications", default=None, help="filled-in audit.csv from audit-labels")
+    fl.add_argument("--out", default=None, help="for --json (default /workspace/mccp-audit/<run>/<set>/)")
+
+    al = sub.add_parser("audit-labels", help="review sheet for labels the model could not read (read-only)")
+    al.add_argument("folder", help="e.g. /workspace/mccp-<RUN_ID>")
+    al.add_argument("--target", default="adapter", choices=["adapter", "base", "frontier"])
+    al.add_argument("--set", default="invcdip")
+    al.add_argument("--cache", default="/workspace/mccp-cache")
+    al.add_argument("--runs-root", default="/root/mccp-runs")
+    al.add_argument("--policy", default=None, help="review policy for the outcome column (default: the suite's)")
+    al.add_argument("--out", default=None, help="default /workspace/mccp-audit/<run>/<set>/ (never in the run folder)")
 
     pe = sub.add_parser("profile-env", help="print shell exports for a profile")
     pe.add_argument("--profile", default=DEFAULT_PROFILE)
@@ -1343,6 +1570,8 @@ def main() -> int:
         return add_set(args)
     if args.cmd == "summary":
         return summary(args)
+    if args.cmd == "audit-labels":
+        return audit_labels(args)
     if args.cmd == "failures":
         return failures(args)
     if args.cmd == "profile-env":
