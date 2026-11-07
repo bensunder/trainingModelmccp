@@ -93,7 +93,13 @@ def _args(tc: dict[str, Any]) -> Any:
     return a
 
 
-def score_item(item: Item, response: dict[str, Any], schema: dict[str, Any], fields: list[str]) -> dict[str, Any]:
+def score_item(
+    item: Item,
+    response: dict[str, Any],
+    schema: dict[str, Any],
+    fields: list[str],
+    normalize: Callable[[Any], tuple[Any, list[dict[str, Any]]]] | None = None,
+) -> dict[str, Any]:
     msg = response["choices"][0]["message"]
     got_calls = msg.get("tool_calls") or []
     content = (msg.get("content") or "").strip()
@@ -120,19 +126,37 @@ def score_item(item: Item, response: dict[str, Any], schema: dict[str, Any], fie
         }
     try:
         obj = json.loads(content)
-        jsonschema.validate(obj, schema)
-        valid = True
-    except (json.JSONDecodeError, jsonschema.ValidationError):
-        obj, valid = None, False
+    except json.JSONDecodeError:
+        obj = None
+    raw_valid = _valid(obj, schema) if obj is not None else False
+    changes: list[dict[str, Any]] = []
+    if obj is not None and normalize is not None:
+        obj, changes = normalize(obj)
+    valid = _valid(obj, schema) if obj is not None else False
     expected = json.loads(item.expected["content"])
     matches = [bool(valid and obj.get(f) == expected.get(f)) for f in fields]
-    return {
+    out = {
         "kind": "final",
         "score": float(valid) * (sum(matches) / len(fields)),
         "json_valid": valid,
         "fields": dict(zip(fields, matches, strict=True)),
         "content": content[:4000],
     }
+    if normalize is not None:
+        # What the model wrote, before canonicalization: the honest format metric.
+        out["json_valid_raw"] = raw_valid
+        out["normalized"] = changes
+        if changes and valid:
+            out["normalized_content"] = json.dumps(obj)
+    return out
+
+
+def _valid(obj: Any, schema: dict[str, Any]) -> bool:
+    try:
+        jsonschema.validate(obj, schema)
+    except jsonschema.ValidationError:
+        return False
+    return True
 
 
 async def run_items(
@@ -156,8 +180,11 @@ async def run_items(
                 resp = await chat(payload)
             except Exception as e:  # noqa: BLE001 - an endpoint error scores 0, recorded
                 return {"kind": it.kind, "score": 0.0, "error": str(e)[:200], "parsed": False, "json_valid": False}
-        return score_item(it, resp, suite.output_schema, suite.compare_fields)
+        return score_item(it, resp, suite.output_schema, suite.compare_fields, normalize)
 
+    from mccp.rules import NORMALIZERS
+
+    normalize = NORMALIZERS[suite.output_normalizer] if suite.output_normalizer else None
     return await asyncio.gather(*(one(i) for i in items))
 
 
@@ -172,6 +199,12 @@ def summarize_l1(scores: list[dict[str, Any]]) -> dict[str, Any]:
         "tool_args_valid_rate": mean([float(s.get("args_valid", False)) for s in tools]) if tools else None,
         "tool_calls_leaked_into_content": sum(bool(s.get("leaked_into_content")) for s in tools),
         "json_validity": mean([float(s.get("json_valid", False)) for s in finals]) if finals else None,
+        "json_validity_raw": (
+            mean([float(s.get("json_valid_raw", False)) for s in finals])
+            if finals and any("json_valid_raw" in s for s in finals)
+            else None
+        ),
+        "normalized_answers": sum(1 for s in finals if s.get("normalized")),
         "field_accuracy": mean([s["score"] for s in finals]) if finals else None,
         "errors": sum(1 for s in scores if "error" in s),
     }

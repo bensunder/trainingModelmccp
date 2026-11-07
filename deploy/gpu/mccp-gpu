@@ -19,7 +19,7 @@
 #   mccp-gpu bench [--profile P] [--concurrency 1,5,10] [--duration 120] [--output-tokens 256]
 #                  [--adapter DIR] [--rate INR_PER_HOUR] [--eager 0|1]
 #                                   serving throughput + cost per 1M output tokens (no API calls)
-#   mccp-gpu eval-messy [RUN_ID] [--n 300]
+#   mccp-gpu eval-messy [RUN_ID] [--n 300] [--rescore]
 #                                   score a finished run's adapters on messy invoices (no retraining)
 #   mccp-gpu stop [--yes]           stop the runner and free the GPU (queue is kept)
 #   mccp-gpu update                 refresh the code used by *future* runs
@@ -571,10 +571,11 @@ cmd_bench() {
 }
 
 cmd_eval_messy() {
-  local run_id="" n=300
+  local run_id="" n=300 rescore=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --n) n="$2"; shift 2 ;;
+      --rescore) rescore=1; shift ;;
       -*) fail "unknown option $1" ;;
       *) run_id="$1"; shift ;;
     esac
@@ -601,7 +602,7 @@ cmd_eval_messy() {
       || fail "bootstrap failed (details above)"
   fi
   local cmd
-  cmd="$(printf 'RUN_DIR=%q DEST=%q PROFILE=%q MESSY_N=%q REPO=%q' "$RUNS_ROOT/$id" "$dest" "$profile" "$n" "$rel") bash ${MCCP_GPU_MESSY_CMD:-$rel/deploy/gpu/eval_messy.sh}"
+  cmd="$(printf 'RUN_DIR=%q DEST=%q PROFILE=%q MESSY_N=%q REPO=%q RESCORE=%q' "$RUNS_ROOT/$id" "$dest" "$profile" "$n" "$rel" "$rescore") bash ${MCCP_GPU_MESSY_CMD:-$rel/deploy/gpu/eval_messy.sh}"
   mkdir -p "$dest"
   if command -v tmux >/dev/null && [ "${MCCP_GPU_NO_TMUX:-0}" != 1 ]; then
     tmux new-session -d -s mccp-messy "$cmd > '$dest/eval-messy.console.txt' 2>&1"

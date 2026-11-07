@@ -289,7 +289,7 @@ def _rules_decision_correct(rules: Any, meta: dict[str, Any], sc: dict[str, Any]
     if sc.get("error") or not sc.get("json_valid") or "lookups" not in meta or "expected" not in meta:
         return 0.0
     try:
-        got = rules(meta, json.loads(sc["content"]))
+        got = rules(meta, json.loads(sc.get("normalized_content") or sc["content"]))
     except (KeyError, TypeError, ValueError, ZeroDivisionError):
         return 0.0
     exp = meta["expected"]
@@ -394,9 +394,12 @@ async def run_benchmark(
     targets: list[Target],
     suite: EvalSuite,
     max_items: int | None = None,
+    on_scores: Any = None,
 ) -> dict[str, Any]:
     """Every target on every set; targets run sequentially so latency numbers
-    are not distorted by each other on a shared GPU."""
+    are not distorted by each other on a shared GPU. `on_scores(set_name,
+    target_name, items, records, scores)` receives the per-item scores (raw
+    answers included) before they are dropped from the report."""
     report: dict[str, Any] = {"sets": {}, "suite": f"{suite.name}@v{suite.version}"}
     for set_name, records in sets.items():
         items = layers.golden_items(records, max_items or 10**9)
@@ -417,7 +420,9 @@ async def run_benchmark(
             set_out["adapter_delta"] = {
                 n: layers.delta_vs(a, set_out["targets"][n]["_scores"]) for n in names if n != "adapter"
             }
-        for t in set_out["targets"].values():
+        for name, t in set_out["targets"].items():
+            if on_scores is not None:
+                on_scores(set_name, name, items, records, t["_scores"])
             t.pop("_scores")
         report["sets"][set_name] = set_out
     return report

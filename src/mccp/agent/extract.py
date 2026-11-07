@@ -28,6 +28,7 @@ import jsonschema
 
 from mccp.examples.invoices import EXTRACT_SCHEMA, EXTRACT_SYSTEM_PROMPT
 from mccp.rules import invoice_triage
+from mccp.rules.extraction import normalize_extraction
 
 ChatFn = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 LookupFn = Callable[[str], Any]  # returns a record, None / {"error": ...} when not found; may be async
@@ -36,11 +37,13 @@ ROUTE_DECIDED = "decided"
 ROUTE_HUMAN = "human_review"
 
 
-def parse_extraction(content: str) -> dict[str, Any]:
-    """Strict: the model is trained to answer with the bare JSON object."""
-    obj = json.loads(content)
+def parse_extraction(content: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Strict JSON (the model is trained to answer with the bare object), then the
+    deterministic id canonicalization (`invoice-extract-ids@v1`, digits never
+    changed), then the schema. Returns the facts and the canonicalizations made."""
+    obj, changes = normalize_extraction(json.loads(content))
     jsonschema.validate(obj, EXTRACT_SCHEMA)
-    return obj
+    return obj, changes
 
 
 async def _call(fn: LookupFn, key: str) -> Any:
@@ -54,6 +57,7 @@ def _human(reason: str, *, extracted: dict[str, Any] | None, model: str | None, 
         "reason": reason[:300],
         "decision": None,
         "extracted": extracted,
+        "normalized": [],
         "policy": invoice_triage.POLICY_ID,
         "trace": [],
         "model": model,
@@ -93,7 +97,7 @@ async def triage_extract(
     except Exception as e:  # noqa: BLE001 - any endpoint failure routes to a human
         return _human(f"model call failed: {type(e).__name__}: {e}", extracted=None, model=model, raw=None, t0=t0)
     try:
-        facts = parse_extraction(raw)
+        facts, normalized = parse_extraction(raw)
     except (json.JSONDecodeError, jsonschema.ValidationError) as e:
         msg_ = e.message if isinstance(e, jsonschema.ValidationError) else str(e)
         return _human(f"invalid extraction: {msg_}", extracted=None, model=served, raw=raw[:2000], t0=t0)
@@ -110,6 +114,7 @@ async def triage_extract(
         "reason": result.reason_code,
         "decision": result.answer(),
         "extracted": facts,
+        "normalized": normalized,
         "policy": result.policy,
         "trace": result.trace,
         "model": served,

@@ -68,13 +68,18 @@ class EvalSuite(BaseModel):
     # Extract-then-rules tasks: the model returns facts, this policy turns them into
     # the decision, and decision accuracy is scored on the policy's output.
     decision_rules: str | None = None
+    # Deterministic canonicalization applied to the parsed output before the schema
+    # check (e.g. id formats). Raw format validity is still reported separately.
+    output_normalizer: str | None = None
 
     @model_validator(mode="after")
     def _known_rules(self) -> "EvalSuite":
-        from mccp.rules import RULESETS
+        from mccp.rules import NORMALIZERS, RULESETS
 
         if self.decision_rules is not None and self.decision_rules not in RULESETS:
             raise ValueError(f"unknown decision_rules {self.decision_rules!r} (known: {', '.join(RULESETS)})")
+        if self.output_normalizer is not None and self.output_normalizer not in NORMALIZERS:
+            raise ValueError(f"unknown output_normalizer {self.output_normalizer!r} (known: {', '.join(NORMALIZERS)})")
         return self
 
     @model_validator(mode="after")

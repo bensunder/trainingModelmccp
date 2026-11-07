@@ -465,6 +465,42 @@ def _verdict(static: dict[str, Any] | None, live: dict[str, Any] | None, in_dist
     return {"pass": all(v for v in checks.values() if v is not None), "checks": checks}
 
 
+class _OutputSaver:
+    """Writes every scored answer (raw model output, the canonicalized form, field
+    hits) to `<report-stem>.<set>.<target>.outputs.jsonl` in the workdir, so a
+    failure can be read instead of guessed. Contains only test-set text (already
+    PII-redacted) and model answers; no keys."""
+
+    def __init__(self, workdir: Path, report_name: str) -> None:
+        self.workdir = workdir
+        self.stem = Path(report_name).stem
+        self.written: list[Path] = []
+
+    def __call__(self, set_name: str, target: str, items: list, records: list, scores: list) -> None:
+        path = self.workdir / f"{self.stem}.{set_name}.{target}.outputs.jsonl"
+        with path.open("w", encoding="utf-8") as f:
+            for it, sc in zip(items, scores, strict=True):
+                meta = records[it.record].get("meta") or {}
+                row = {
+                    "record": it.record,
+                    "source_id": meta.get("source_id"),
+                    "scenario": meta.get("scenario"),
+                    "ood_kind": meta.get("ood_kind"),
+                    "messy_kinds": meta.get("messy_kinds"),
+                    "kind": sc.get("kind"),
+                    "score": sc.get("score"),
+                    "json_valid": sc.get("json_valid"),
+                    "json_valid_raw": sc.get("json_valid_raw"),
+                    "normalized": sc.get("normalized"),
+                    "fields": sc.get("fields"),
+                    "error": sc.get("error"),
+                    "expected": it.expected.get("content") or it.expected.get("tool_calls"),
+                    "content": sc.get("content"),
+                }
+                f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        self.written.append(path)
+
+
 def _frontier_target(args: argparse.Namespace) -> tuple[Target, OpenAICompatClient] | None:
     if not args.baseline_url:
         return None
@@ -611,7 +647,8 @@ async def _evaluate(args: argparse.Namespace) -> int:
                     print(f"frontier baseline skipped: {frontier_skipped}", file=sys.stderr)
                 else:
                     targets.append(ft[0])
-        bench = await run_benchmark(sets=sets, targets=targets, suite=suite, max_items=args.max_items)
+        saver = _OutputSaver(workdir, args.report_name) if args.save_outputs else None
+        bench = await run_benchmark(sets=sets, targets=targets, suite=suite, max_items=args.max_items, on_scores=saver)
     except (ServingError, httpx.HTTPError) as e:
         print(f"vLLM error: {type(e).__name__}: {e}", file=sys.stderr)
         return 4
@@ -652,6 +689,8 @@ async def _evaluate(args: argparse.Namespace) -> int:
                 else round(t["l1"]["decision_accuracy"]["mean"], 4),
                 "tool_call_accuracy": t["l1"]["tool_call_accuracy"],
                 "json_validity": t["l1"]["json_validity"],
+                "json_validity_raw": t["l1"].get("json_validity_raw"),
+                "normalized_answers": t["l1"].get("normalized_answers"),
                 "latency_p50_s": t["calls"]["latency_p50_s"],
                 "usd_per_1k_decisions": t["cost"]["usd_per_1k_decisions"],
             }
@@ -958,6 +997,11 @@ def main() -> int:
     )
     e.add_argument("--adapter-name", help="vLLM serving name; default derived from the workdir")
     e.add_argument("--max-items", type=int, default=None, help="cap items per set (default: all)")
+    e.add_argument(
+        "--save-outputs",
+        action="store_true",
+        help="write every scored answer to <report>.<set>.<target>.outputs.jsonl in the workdir",
+    )
     e.add_argument("--concurrency", type=int, default=8)
     e.add_argument("--timeout", type=float, default=180.0)
     e.add_argument("--gpu-usd-per-hour", type=float, default=0.35, help="for self-hosted cost per 1k decisions")

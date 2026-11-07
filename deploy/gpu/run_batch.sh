@@ -209,7 +209,7 @@ for V in "${VARIANTS[@]}"; do
     [ -n "$BASELINE_URL" ] && TARGETS=adapter,base,frontier
   fi
   say "evaluating $M n=$S seed $SEED ($TARGETS on $EVAL_SETS)"
-  ARGS=(evaluate --workdir "$W" --vllm-api-key "$KEY" --targets "$TARGETS" --sets "$EVAL_SETS"
+  ARGS=(evaluate --workdir "$W" --vllm-api-key "$KEY" --targets "$TARGETS" --sets "$EVAL_SETS" --save-outputs
         --gpu-usd-per-hour "$GPU_USD_PER_HOUR")
   if [ -n "$BASELINE_URL" ]; then
     ARGS+=(--baseline-url "$BASELINE_URL" --baseline-model "$BASELINE_MODEL" --baseline-auth "${BASELINE_AUTH:-bearer}")

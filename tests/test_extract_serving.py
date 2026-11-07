@@ -65,7 +65,7 @@ async def test_async_lookups_work():
         ("Sure! The invoice is fine.", "invalid extraction"),
         ('{"invoice_id": "INV-1"}', "invalid extraction"),
         (
-            '{"invoice_id": "INV-1", "po_number": "PO 45", "vendor_id": "V-1", "billed_qty": 1, "unit_price_billed": 2}',
+            '{"invoice_id": "INV-1", "po_number": "PO 45 00", "vendor_id": "V-1", "billed_qty": 1, "unit_price_billed": 2}',
             "invalid extraction",
         ),
     ],

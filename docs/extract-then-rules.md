@@ -59,6 +59,26 @@ no tool-call checks for this task (there are no tool calls), instead of failing 
 Both tasks are generated from identical cases: same seeds give the same invoices, texts and labels
 (tested), only the supervision differs.
 
+## ID canonicalization (`invoice-extract-ids@v1`)
+
+First extract run (1k records): 100% in-distribution and OOD, 93.3% on messy invoices, with the base
+model identical to the adapter. Every miss was a schema-invalid answer (JSON validity 93.3% = decision
+accuracy), concentrated in house id formats (`id_format` 66%): the model copied `P.O. 4500...` /
+`vendor no. ...` instead of writing `PO-...` / `V-...`. Those answers route to human review, so they
+were deferrals, not wrong decisions.
+
+Canonical form is a formatting rule, so code applies it (`mccp.rules.extraction`), identically in
+scoring (suite `output_normalizer`) and serving (`triage_extract`): one run of digits with a
+recognised prefix for that field becomes `PO-<digits>` / `V-<digits>` / `INV-<digits>`. Digits are
+never changed; another field's prefix, split digits or letters among digits are left as written and
+still go to a human; a canonical id that does not exist finds nothing and the policy holds the invoice.
+`json_validity_raw` keeps reporting what the model wrote before canonicalization, and
+`normalized_answers` how many answers were rewritten, so the step cannot hide model behaviour.
+
+`evaluate --save-outputs` (on by default in batches and `eval-messy`) writes every scored answer to
+`<report>.<set>.<target>.outputs.jsonl`, so misses can be read. Re-score a finished run after a scoring
+change: `mccp-gpu eval-messy <RUN_ID> --rescore`.
+
 ## Serving
 
 `mccp.agent.extract.triage_extract(chat, text, model=..., lookup_po=..., lookup_vendor=...)`: one

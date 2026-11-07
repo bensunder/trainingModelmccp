@@ -3,7 +3,9 @@
 # Normally started by `mccp-gpu eval-messy [RUN_ID]`. Adds report_messy.json next to each
 # report.json (report.json is never touched), re-writes curve.md / comparison.md with a
 # messy column, and copies everything to the run's /workspace folder.
-# Env: RUN_DIR (required), DEST (required), PROFILE, MESSY_N (300), REPO.
+# Env: RUN_DIR (required), DEST (required), PROFILE, MESSY_N (300), REPO, RESCORE (0; 1 = re-score
+# adapters that already have report_messy.json, e.g. after a scoring change).
+# Every answer is saved to report_messy.messy.<target>.outputs.jsonl next to the report.
 # No `set -e` on purpose.
 
 PROFILE="${PROFILE:-qwen3-8b@v1}"
@@ -31,15 +33,16 @@ for W in "${WORKDIRS[@]}"; do
   REPORTS+=("$W/report.json")
   [ -f "$W/data/golden_messy.jsonl" ] || \
     (cd "$REPO" && uv run python deploy/gpu/pilot.py add-messy --workdir "$W" --n "$MESSY_N") 2>&1 | tee -a "$LOG"
-  if [ -f "$W/report_messy.json" ]; then say "$(basename "$W") already scored on messy"; FIRST=0; continue; fi
+  if [ -f "$W/report_messy.json" ] && [ "${RESCORE:-0}" != 1 ]; then say "$(basename "$W") already scored on messy"; FIRST=0; continue; fi
   TARGETS=adapter
   [ "$FIRST" = 1 ] && TARGETS=adapter,base
   say "scoring $(basename "$W") ($TARGETS) on messy invoices"
   (cd "$REPO" && uv run python deploy/gpu/pilot.py evaluate --workdir "$W" --vllm-api-key "$KEY" \
-    --targets "$TARGETS" --sets messy --report-name report_messy.json --gpu-usd-per-hour "$GPU_USD_PER_HOUR") \
-    2>&1 | tee -a "$LOG"
+    --targets "$TARGETS" --sets messy --report-name report_messy.json --gpu-usd-per-hour "$GPU_USD_PER_HOUR" \
+    --save-outputs) 2>&1 | tee -a "$LOG"
   [ "${PIPESTATUS[0]}" -le 1 ] || die "messy evaluation failed for $W"
-  cp "$W/report_messy.json" "$DEST/$(basename "$W")/" 2>/dev/null
+  mkdir -p "$DEST/$(basename "$W")"
+  cp "$W/report_messy.json" "$W"/report_messy.*.outputs.jsonl "$DEST/$(basename "$W")/" 2>/dev/null
   FIRST=0
 done
 if [ "${#WORKDIRS[@]}" -gt 1 ]; then

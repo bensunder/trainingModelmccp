@@ -139,6 +139,7 @@ save_run() {  # $1 workdir, $2 destination (under /workspace, which GridShare ke
   cp "$1"/output/adapter_config.json "$1"/output/adapter_model.safetensors "$2"/ 2>/dev/null
   cp "$1"/{events.jsonl,pilot.json,run.json,report.json,soup.yaml,timing.jsonl} "$2"/ 2>/dev/null
   cp "$1"/data/rgt_strategies.jsonl "$2"/ 2>/dev/null
+  cp "$1"/*.outputs.jsonl "$2"/ 2>/dev/null   # every scored answer (evaluate --save-outputs)
   # GridShare's /workspace save skips *.log, so keep logs as .txt.
   local f
   for f in train vllm pilot-run batch trainer; do
