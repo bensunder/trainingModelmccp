@@ -25,6 +25,7 @@
 #                                   --from: rebuild the run from its saved /workspace folder (after
 #                                   the machine was stopped or lost; works on a fresh machine)
 #                                   score a finished run's adapters on messy invoices (no retraining)
+#   mccp-gpu summary [FOLDER]       every result in a run folder (default: newest /workspace/mccp-*), read-only
 #   mccp-gpu stop [--yes]           stop the runner and free the GPU (queue is kept)
 #   mccp-gpu update                 refresh the code used by *future* runs
 #
@@ -598,6 +599,21 @@ restore_run() {  # $1 saved run folder (/workspace/mccp-<id>) -> workdirs under 
   c_ok "restored $n adapter(s) of run $RESTORED_ID from $src (profile $RESTORED_PROFILE)"
 }
 
+cmd_summary() {  # [FOLDER] [--misses N]
+  local folder="${1:-}"
+  [ -n "$folder" ] && [ "${folder#--}" = "$folder" ] && shift || folder=""
+  [ -n "$folder" ] || folder="$(find "$WORKSPACE" -maxdepth 1 -type d -name 'mccp-2*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+  [ -n "$folder" ] && [ -d "$folder" ] || fail "no run folder found (give one: mccp-gpu summary /workspace/mccp-<RUN_ID>)"
+  local rel
+  rel="$(release_for "$(git -C "$SRC" rev-parse HEAD)")" || fail "could not prepare the code release"
+  if [ ! -d "$rel/.venv" ] && [ "${MCCP_GPU_SKIP_BOOTSTRAP:-0}" != 1 ]; then
+    echo "preparing the code environment (seconds when the machine is already set up)..." >&2
+    REPO="$rel" BOOTSTRAP_NO_GIT=1 LOG="$MCCP_HOME/bootstrap.log" bash "$rel/deploy/gpu/bootstrap.sh" >/dev/null 2>&1 \
+      || fail "bootstrap failed; see $MCCP_HOME/bootstrap.log (or run: mccp-gpu up)"
+  fi
+  (cd "$rel" && uv run --frozen python deploy/gpu/pilot.py summary "${folder%/}" "$@")
+}
+
 cmd_eval_messy() {
   local run_id="" n=300 rescore=0 from="" set=messy
   while [ $# -gt 0 ]; do
@@ -718,7 +734,8 @@ case "${1:-help}" in
   baseline) cmd_baseline ;;
   stop) shift; cmd_stop "$@" ;;
   update) ensure_src; install_link; c_ok "code updated to $(git -C "$SRC" log -1 --format='%h %s'); applies to future runs" ;;
+  summary) shift; cmd_summary "$@" ;;
   _run) cmd_run ;;
-  help|-h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) fail "unknown command $1 (see: mccp-gpu help)" ;;
 esac

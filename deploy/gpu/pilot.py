@@ -952,6 +952,58 @@ def curve(args: argparse.Namespace) -> int:
     return 0
 
 
+def summary(args: argparse.Namespace) -> int:
+    """Print every report in a saved run folder (report.json and report_<set>.json per
+    adapter): decision / exact-record / validity / per-field accuracy, per-kind
+    breakdown, set facts (OCR ceiling, failed downloads) and the first misses with
+    what the model wrote. Read-only; replaces pasting ad-hoc scripts."""
+    root = Path(args.folder).resolve()
+    reports = sorted(root.glob("*/report*.json")) or sorted(root.glob("report*.json"))
+    if not reports:
+        print(f"no report*.json under {root}", file=sys.stderr)
+        return 2
+    for rp in reports:
+        try:
+            sets = json.loads(rp.read_text(encoding="utf-8"))["benchmark"]["sets"]
+        except (KeyError, json.JSONDecodeError):
+            continue
+        print(f"\n== {rp.parent.name}/{rp.name}")
+        for set_name, body in sets.items():
+            for target, t in body["targets"].items():
+                a = t["l1"]
+                d = a.get("decision_accuracy")
+                dec = "n/a" if d is None else f"{d['mean'] * 100:.1f}%"
+                ex = a.get("exact_record_rate")
+                raw = a.get("json_validity_raw")
+                print(
+                    f"{set_name:8} {target:8} decision={dec:>6}"
+                    f"  exact_record={'n/a' if ex is None else f'{ex * 100:.1f}%'}"
+                    f"  valid={(a.get('json_validity') or 0) * 100:.1f}%"
+                    + ("" if raw is None else f"  raw_valid={raw * 100:.1f}%")
+                    + f"  errors={a.get('errors')}"
+                )
+                fields = a.get("field_accuracy_by_field") or {}
+                if fields:
+                    print("         fields: " + "  ".join(f"{k}={v * 100:.1f}%" for k, v in fields.items()))
+                if target == "adapter":
+                    for k, v in sorted((a.get("by_ood_kind") or {}).items()):
+                        print(f"           {k:30} {v['accuracy'] * 100:5.1f}%  (n={v['n']})")
+            info = rp.parent / f"set_{set_name}.json"
+            if info.exists():
+                i = json.loads(info.read_text(encoding="utf-8"))
+                keep = ("records", "ocr_ceiling", "failed_downloads", "labels_dropped_by_redaction", "cache")
+                print("         set: " + ", ".join(f"{k}={i[k]}" for k in keep if k in i))
+            outs = rp.parent / f"{rp.stem}.{set_name}.adapter.outputs.jsonl"
+            if outs.exists():
+                rows = [json.loads(x) for x in outs.read_text(encoding="utf-8").splitlines() if x.strip()]
+                bad = [r for r in rows if r.get("kind") == "final" and (r.get("score") or 0) < 1]
+                print(f"         adapter misses: {len(bad)} of {sum(r.get('kind') == 'final' for r in rows)}")
+                for r in bad[: args.misses]:
+                    print(f"           [{r.get('ood_kind')}] expected {str(r.get('expected'))[:170]}")
+                    print(f"           {'':{len(str(r.get('ood_kind'))) + 2}} got      {str(r.get('content'))[:170]}")
+    return 0
+
+
 def add_messy(args: argparse.Namespace) -> int:
     """Write the messy-invoice set into an existing workdir (no retraining needed)."""
     args.set = "messy"
@@ -1112,6 +1164,10 @@ def main() -> int:
     cv.add_argument("--threshold", type=float, default=0.95, help="in-dist decision accuracy to reach")
     cv.add_argument("--out", help="directory for curve.json and curve.md")
 
+    sm = sub.add_parser("summary", help="print every report in a saved run folder (read-only)")
+    sm.add_argument("folder", help="e.g. /workspace/mccp-<RUN_ID>")
+    sm.add_argument("--misses", type=int, default=8, help="adapter misses to show per set")
+
     pe = sub.add_parser("profile-env", help="print shell exports for a profile")
     pe.add_argument("--profile", default=DEFAULT_PROFILE)
 
@@ -1130,6 +1186,8 @@ def main() -> int:
         return add_messy(args)
     if args.cmd == "add-set":
         return add_set(args)
+    if args.cmd == "summary":
+        return summary(args)
     if args.cmd == "profile-env":
         return profile_env(args)
     print(secrets.token_urlsafe(32))

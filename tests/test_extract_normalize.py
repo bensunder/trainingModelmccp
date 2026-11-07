@@ -221,3 +221,32 @@ def test_restored_workdir_regenerates_the_messy_set_in_its_own_task_format(tmp_p
     assert len(rows) == 30 and all(row["meta"]["task"] == "extract" and "lookups" in row["meta"] for row in rows)
     fresh = generate_messy(30, task="extract")
     assert [x["meta"]["source_id"] for x in rows] == [x["meta"]["source_id"] for x in fresh]
+
+
+async def test_summary_prints_every_report_with_misses(tmp_path):
+    """`pilot.py summary` (behind `mccp-gpu summary`) replaces pasted result scripts."""
+    import subprocess
+
+    spec = importlib.util.spec_from_file_location("gpu_pilot_sum", ROOT / "deploy/gpu/pilot.py")
+    pilot = importlib.util.module_from_spec(spec)
+    sys.modules["gpu_pilot_sum"] = pilot
+    spec.loader.exec_module(pilot)
+    w = tmp_path / "run" / "extract-n1000-e1-s42"
+    w.mkdir(parents=True)
+    recs = [r for r in generate_messy(60, task="extract") if r["meta"]["ood_kind"] == "id_format"]
+    saver = pilot._OutputSaver(w, "report_messy.json")
+    t = Target("adapter", "adapter", "m", _copying_model(recs), {}, 4)
+    bench = await run_benchmark(
+        sets={"messy": recs}, targets=[t], suite=SUITE.model_copy(update={"output_normalizer": None}), on_scores=saver
+    )
+    (w / "report_messy.json").write_text(json.dumps({"benchmark": bench}))
+    (w / "set_messy.json").write_text(json.dumps({"records": len(recs), "cache": "hit"}))
+    cmd = [sys.executable, str(ROOT / "deploy/gpu/pilot.py"), "summary", str(tmp_path / "run"), "--misses", "2"]
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "extract-n1000-e1-s42/report_messy.json" in out and "messy    adapter" in out
+    assert "id_format" in out and "adapter misses:" in out and out.count("got      ") == 2
+    assert "set: records=10, cache=hit" in out
+    empty = subprocess.run([*cmd[:3], str(tmp_path / "nothing")], capture_output=True, text=True, cwd=ROOT)
+    assert empty.returncode == 2 and "no report" in empty.stderr
