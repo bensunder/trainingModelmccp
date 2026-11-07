@@ -78,6 +78,9 @@ class EvalSuite(BaseModel):
     # What the model itself must write, before the normalizer (e.g. amounts as printed).
     # json_validity_raw is measured against it when given, else against output_schema.
     raw_output_schema: dict[str, Any] | None = None
+    # Financial-field validation between extraction and decision (mccp.rules.validation):
+    # values not on the page, contradicted arithmetic -> human review, never auto-decided.
+    validation: str | None = None
 
     @model_validator(mode="after")
     def _known_rules(self) -> "EvalSuite":
@@ -85,6 +88,10 @@ class EvalSuite(BaseModel):
 
         if self.decision_rules is not None and self.decision_rules not in RULESETS:
             raise ValueError(f"unknown decision_rules {self.decision_rules!r} (known: {', '.join(RULESETS)})")
+        from mccp.rules.validation import VALIDATORS
+
+        if self.validation is not None and self.validation not in VALIDATORS:
+            raise ValueError(f"unknown validation {self.validation!r} (known: {', '.join(VALIDATORS)})")
         if self.output_normalizer is not None and self.output_normalizer not in NORMALIZERS:
             raise ValueError(f"unknown output_normalizer {self.output_normalizer!r} (known: {', '.join(NORMALIZERS)})")
         return self

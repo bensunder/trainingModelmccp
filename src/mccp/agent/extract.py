@@ -29,6 +29,7 @@ import jsonschema
 from mccp.examples.invoices import EXTRACT_SCHEMA, EXTRACT_SYSTEM_PROMPT
 from mccp.rules import invoice_triage
 from mccp.rules.extraction import normalize_extraction_v2
+from mccp.rules.validation import validate_extract
 
 ChatFn = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 LookupFn = Callable[[str], Any]  # returns a record, None / {"error": ...} when not found; may be async
@@ -63,6 +64,7 @@ def _human(reason: str, *, extracted: dict[str, Any] | None, model: str | None, 
         "decision": None,
         "extracted": extracted,
         "normalized": [],
+        "validation": None,
         "policy": invoice_triage.POLICY_ID,
         "trace": [],
         "model": model,
@@ -80,6 +82,7 @@ async def triage_extract(
     lookup_vendor: LookupFn,
     extra_body: dict[str, Any] | None = None,
     max_tokens: int = 256,
+    validate: bool = True,
 ) -> dict[str, Any]:
     """Triage one invoice exception. Returns the route, the decision (policy
     answer) or the reason it needs a human, the extracted facts, and the trace."""
@@ -106,6 +109,15 @@ async def triage_extract(
     except (json.JSONDecodeError, jsonschema.ValidationError) as e:
         msg_ = e.message if isinstance(e, jsonschema.ValidationError) else str(e)
         return _human(f"invalid extraction: {msg_}", extracted=None, model=served, raw=raw[:2000], t0=t0)
+    # Financial-field validation before any lookup: every fact must be on the page and
+    # the line arithmetic must not contradict it. Nothing is corrected, only blocked.
+    validation = validate_extract(json.loads(raw), facts, invoice_text) if validate else None
+    if validation is not None and not validation.ok:
+        out = _human(
+            "validation failed: " + ", ".join(validation.blocking), extracted=facts, model=served, raw=raw[:2000], t0=t0
+        )
+        out["validation"] = validation.to_dict()
+        return out
     try:
         po = await _call(lookup_po, facts["po_number"])
         vendor = await _call(lookup_vendor, facts["vendor_id"])
@@ -120,6 +132,7 @@ async def triage_extract(
         "decision": result.answer(),
         "extracted": facts,
         "normalized": normalized,
+        "validation": validation.to_dict() if validation is not None else None,
         "policy": result.policy,
         "trace": result.trace,
         "model": served,

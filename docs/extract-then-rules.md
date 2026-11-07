@@ -131,6 +131,35 @@ the decimal point with the separators. So number formatting moved to code, like 
 Suites moved to version 2. OCR text is cached by rendering version (`RENDER_VERSION`); records are
 always rebuilt by the current code, so a prompt or label change never needs a new OCR pass.
 
+## Financial-field validation (`invoice-extract-validation@v1`, `realdoc-validation@v1`)
+
+Between extraction and the rules (`mccp.rules.validation`), identically in serving and scoring. It
+never corrects a value; it confirms it against the text the model read or blocks the invoice:
+
+* **grounding (blocks):** every extracted value must be printed on the page: an amount in one of its
+  printed forms (`1,533.54`, `1533.54`, and `1,534`/`1534` for whole amounts) as a whole number, an id
+  by its digits (free-form real-document ids by letters and digits). `153354` for a page that says
+  `$1,533.54` is not on the page, so it is blocked, never "repaired".
+* **line arithmetic (blocks when contradicted):** on the line that prints the unit price, if other
+  amounts with cents are printed, one must equal qty x price; taking the line amount as the unit
+  price contradicts it. No printed line amount is not a contradiction; corroboration is reported.
+* **total ambiguity (flags):** amounts on total-labelled lines (not SUBTOTAL); several of them, or an
+  answer that is on the page but not on such a line, is reported so the policy can be set from rates.
+
+Checked on every gold answer of the test, OOD and messy sets: none is blocked.
+
+**Outcomes** (what a customer buys, in every report and in `mccp-gpu summary`): `auto_correct`
+(decided without a person, and right), `human_review` (invalid output or blocked by validation) and
+`auto_wrong` (passed everything and was still wrong: the number to drive to zero).
+
+**Failure classification:** `mccp-gpu failures [FOLDER] [--set S] [--examples N]` gives every wrong
+field one cause, comparing the label, the answer and the exact text the model read: decimal dropped,
+unparseable copy, missing, wrong amount on the page (with the kind of line it came from: net, gross,
+tax, subtotal, ...), invented or misread, or label not on the page (OCR lost it or the label
+disagrees with the page). Each cause shows how many validation caught and how many would have been
+decided wrongly. Rows saved before validation existed are re-validated, so old runs are judged by the
+current pipeline.
+
 ## Serving
 
 `mccp.agent.extract.triage_extract(chat, text, model=..., lookup_po=..., lookup_vendor=...)`: one

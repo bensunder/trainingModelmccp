@@ -35,7 +35,8 @@ from typing import Any, Literal
 import httpx
 import jsonschema
 
-from mccp.rules import RULESETS
+from mccp.rules import NORMALIZERS, RULESETS
+from mccp.rules.validation import VALIDATORS
 
 from . import layers
 from .stats import bootstrap_mean_ci, mean, percentile
@@ -296,6 +297,26 @@ def _rules_decision_correct(rules: Any, meta: dict[str, Any], sc: dict[str, Any]
     return float(got.decision == exp["decision"] and got.reason_code == exp["reason_code"])
 
 
+def _outcome(it: layers.Item, sc: dict[str, Any], correct: float, validator: Any, normalize: Any) -> str:
+    """auto_correct | human_review | auto_wrong for one answer. Invalid output or an
+    endpoint error is human review (serving never decides on it); with a validator,
+    a blocking finding is human review too. Records the validation on `sc`."""
+    if sc.get("error") or not sc.get("json_valid"):
+        return "human_review"
+    if validator is not None:
+        text = next((m.get("content") or "" for m in reversed(it.messages) if m.get("role") == "user"), "")
+        try:
+            raw = json.loads(sc["content"])
+        except (json.JSONDecodeError, KeyError):
+            return "human_review"
+        canon = normalize(raw)[0] if normalize else raw
+        v = validator(raw, canon, text)
+        sc["validation"] = v.to_dict()
+        if not v.ok:
+            return "human_review"
+    return "auto_correct" if correct >= 1.0 else "auto_wrong"
+
+
 def summarize_set(
     items: list[layers.Item],
     scores: list[dict[str, Any]],
@@ -311,6 +332,11 @@ def summarize_set(
     decision_correct: list[float] = []
     rules = RULESETS[suite.decision_rules] if suite.decision_rules else None
     decides = {"decision", "reason_code"} <= set(suite.compare_fields)
+    validator = VALIDATORS[suite.validation] if suite.validation else None
+    normalize = NORMALIZERS[suite.output_normalizer] if suite.output_normalizer else None
+    outcomes: list[str] = []
+    blocking: dict[str, int] = defaultdict(int)
+    flags: dict[str, int] = defaultdict(int)
     for it, sc in zip(items, scores, strict=True):
         if it.kind != "final":
             continue
@@ -326,6 +352,12 @@ def summarize_set(
             ok = None
         # Breakdowns follow the decision when there is one, else the record's exactness.
         unit = ok if ok is not None else float(sc.get("score") == 1.0)
+        outcome = _outcome(it, sc, unit, validator, normalize)
+        outcomes.append(outcome)
+        for r in (sc.get("validation") or {}).get("blocking", []):
+            blocking[r] += 1
+        for f in (sc.get("validation") or {}).get("flags", []):
+            flags[f] += 1
         if ok is not None:
             decision_correct.append(ok)
         by_scenario[str(meta.get("scenario", "unknown"))].append(unit)
@@ -338,6 +370,17 @@ def summarize_set(
         )
     out["thinking_leaks"] = sum("<think>" in (sc.get("content") or "") for sc in scores if sc["kind"] == "final")
     out["decision_accuracy"] = bootstrap_mean_ci(decision_correct) if decision_correct else None
+    # What a customer pays for: correct without anyone touching it, sent to a person,
+    # or wrong and not caught (the number that must go to ~0).
+    if outcomes:
+        n = len(outcomes)
+        out["outcomes"] = {
+            k: {"n": outcomes.count(k), "rate": round(outcomes.count(k) / n, 4)}
+            for k in ("auto_correct", "human_review", "auto_wrong")
+        }
+        out["outcomes"]["validation"] = suite.validation
+        out["validation_blocking"] = dict(sorted(blocking.items()))
+        out["validation_flags"] = dict(sorted(flags.items()))
     out["field_accuracy_lenient"] = mean(lenient) if lenient else None
     out["by_scenario"] = _breakdown(by_scenario)
     out["field_accuracy_by_field"] = {f: round(mean(v), 4) for f, v in sorted(by_field.items())} or None

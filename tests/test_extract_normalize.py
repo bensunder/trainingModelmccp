@@ -197,7 +197,9 @@ async def test_serving_canonicalizes_ids_and_records_the_change():
         return {"choices": [{"message": {"role": "assistant", "content": json.dumps(written)}}]}
 
     lk = rec["meta"]["lookups"]
-    out = await triage_extract(chat, "x", model="m", lookup_po=lk["po"].get, lookup_vendor=lk["vendor"].get)
+    out = await triage_extract(
+        chat, rec["messages"][1]["content"], model="m", lookup_po=lk["po"].get, lookup_vendor=lk["vendor"].get
+    )
     assert out["route"] == ROUTE_DECIDED and out["decision"] == rec["meta"]["expected"]
     assert {c["field"] for c in out["normalized"]} == {"po_number", "vendor_id", "unit_price_raw"}
     assert out["extracted"]["po_number"] == facts["po_number"]

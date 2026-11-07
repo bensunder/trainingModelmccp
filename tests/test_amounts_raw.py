@@ -149,16 +149,17 @@ async def test_serving_routes_an_unreadable_price_to_a_human_and_parses_a_good_o
     rec = generate(1, seed=6, task="extract")[0]
     lk = rec["meta"]["lookups"]
     gold = json.loads(rec["messages"][2]["content"])
+    page = rec["messages"][1]["content"]
     out = await triage_extract(
         _model(lambda p: {**gold, "unit_price_raw": "316:77"}),
-        "x",
+        page,
         model="m",
         lookup_po=lk["po"].get,
         lookup_vendor=lk["vendor"].get,
     )
     assert out["route"] == ROUTE_HUMAN and "unparseable amount" in out["reason"] and out["decision"] is None
     ok = await triage_extract(
-        _model(lambda p: gold), "x", model="m", lookup_po=lk["po"].get, lookup_vendor=lk["vendor"].get
+        _model(lambda p: gold), page, model="m", lookup_po=lk["po"].get, lookup_vendor=lk["vendor"].get
     )
     assert ok["route"] == ROUTE_DECIDED and ok["decision"] == rec["meta"]["expected"]
     assert ok["extracted"]["unit_price_billed"] == parse_money(gold["unit_price_raw"])

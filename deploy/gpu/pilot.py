@@ -504,6 +504,9 @@ class _OutputSaver:
                     "error": sc.get("error"),
                     "expected": it.expected.get("content") or it.expected.get("tool_calls"),
                     "content": sc.get("content"),
+                    "validation": sc.get("validation"),
+                    # the exact text the model read (test-set text, already PII-redacted)
+                    "input": next((m.get("content") for m in reversed(it.messages) if m.get("role") == "user"), None),
                 }
                 f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         self.written.append(path)
@@ -982,6 +985,15 @@ def summary(args: argparse.Namespace) -> int:
                     + (f"  unparseable_amounts={a['unparseable_amounts']}" if a.get("unparseable_amounts") else "")
                     + f"  errors={a.get('errors')}"
                 )
+                oc = a.get("outcomes")
+                if oc:
+                    print(
+                        "         outcomes: "
+                        + "  ".join(
+                            f"{k}={oc[k]['rate'] * 100:.1f}%" for k in ("auto_correct", "human_review", "auto_wrong")
+                        )
+                        + (f"  (validation {oc.get('validation')})" if oc.get("validation") else "")
+                    )
                 fields = a.get("field_accuracy_by_field") or {}
                 if fields:
                     print("         fields: " + "  ".join(f"{k}={v * 100:.1f}%" for k, v in fields.items()))
@@ -1001,6 +1013,98 @@ def summary(args: argparse.Namespace) -> int:
                 for r in bad[: args.misses]:
                     print(f"           [{r.get('ood_kind')}] expected {str(r.get('expected'))[:170]}")
                     print(f"           {'':{len(str(r.get('ood_kind'))) + 2}} got      {str(r.get('content'))[:170]}")
+    return 0
+
+
+def _input_texts(set_name: str, cache: Path, runs_root: Path, run_id: str, workdir_name: str) -> dict[str, str]:
+    """{source_id: the text the model read} for answers saved before inputs were
+    recorded: the run's own set file when the machine still has it, else the caches."""
+    out: dict[str, str] = {}
+    own = runs_root / run_id / workdir_name / "data" / SET_FILES.get(set_name, f"{set_name}.jsonl")
+    if own.exists():
+        for r in _jsonl(own.read_bytes()):
+            out[str(r["meta"]["source_id"])] = r["messages"][1]["content"]
+        return out
+    if set_name == "docs":
+        from mccp.examples import documents
+
+        for f in sorted(cache.glob("docs-*.jsonl")):
+            for r in _jsonl(f.read_bytes()):
+                out.setdefault(str(r["meta"]["source_id"]), r["messages"][1]["content"])
+    elif set_name == "invcdip":
+        from mccp.examples import documents
+
+        for f in sorted((cache / "invcdip" / "ocr").glob("*.txt")):
+            out[f.stem] = documents.OCR_PREFIX + f.read_text(encoding="utf-8")
+    return out
+
+
+def failures(args: argparse.Namespace) -> int:
+    """Classify every wrong field in a saved run folder: cause, and whether
+    validation routes it to a person or it would be decided wrongly. Read-only."""
+    from mccp.evals.failures import classify_rows
+    from mccp.rules import NORMALIZERS
+    from mccp.rules.validation import VALIDATORS
+
+    root = Path(args.folder).resolve()
+    run_id = root.name.removeprefix("mccp-")
+    found = False
+    for rp in sorted(root.glob("*/report*.json")):
+        stem = rp.stem
+        for outs in sorted(rp.parent.glob(f"{stem}.*.{args.target}.outputs.jsonl")):
+            set_name = outs.name[len(stem) + 1 :].split(".")[0]
+            if args.set and set_name != args.set:
+                continue
+            found = True
+            meta = (
+                json.loads((rp.parent / "pilot.json").read_text(encoding="utf-8"))
+                if (rp.parent / "pilot.json").exists()
+                else {}
+            )
+            if set_name in SET_SUITES:
+                suite = EvalSuite.model_validate(
+                    yaml.safe_load((REPO / SET_SUITES[set_name]).read_text(encoding="utf-8"))
+                )
+            else:
+                suite = load_suite(meta.get("task", "agent"))
+            normalize = NORMALIZERS[suite.output_normalizer] if suite.output_normalizer else None
+            validator = VALIDATORS[suite.validation] if suite.validation else None
+            rows = _jsonl(outs.read_bytes())
+            texts = _input_texts(set_name, Path(args.cache), Path(args.runs_root), run_id, rp.parent.name)
+            res = classify_rows(rows, suite, normalize, texts, validator)
+            n = res["rows"] or 1
+            o = res["outcomes"]
+            print(f"\n== {rp.parent.name} / {set_name} / {args.target}: {res['rows']} invoices")
+            print(
+                "   outcomes: "
+                + "  ".join(
+                    f"{k}={o.get(k, 0)} ({o.get(k, 0) / n * 100:.1f}%)"
+                    for k in ("auto_correct", "human_review", "auto_wrong")
+                )
+            )
+            if res["rows_without_input_text"]:
+                print(f"   (no input text for {res['rows_without_input_text']} rows: causes there are unreliable)")
+            for f, cs in res["causes"].items():
+                total = sum(cs.values())
+                print(f"   {f}: {total} wrong")
+                for c, k in cs.items():
+                    got_caught = res["caught_by_validation"].get(f, {}).get(c, 0)
+                    print(f"      {c:44} {k:4}   caught {got_caught:4}   auto_wrong {k - got_caught:4}")
+            if args.examples:
+                for key, exs in res["examples"].items():
+                    for ex in exs[: args.examples]:
+                        print(
+                            f"   e.g. [{key}] {ex['source_id']}: expected {ex['expected']!r} got {ex['got']!r} ({ex['outcome']})"
+                        )
+                        if ex["line"]:
+                            print(f"        page: {ex['line']}")
+            if args.json:
+                (rp.parent / f"failures_{set_name}_{args.target}.json").write_text(
+                    json.dumps(res, indent=2, default=str)
+                )
+    if not found:
+        print(f"no saved answers (*.{args.target}.outputs.jsonl) under {root}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -1184,6 +1288,15 @@ def main() -> int:
     sm.add_argument("folder", help="e.g. /workspace/mccp-<RUN_ID>")
     sm.add_argument("--misses", type=int, default=8, help="adapter misses to show per set")
 
+    fl = sub.add_parser("failures", help="classify every wrong field in a saved run folder (read-only)")
+    fl.add_argument("folder", help="e.g. /workspace/mccp-<RUN_ID>")
+    fl.add_argument("--target", default="adapter", choices=["adapter", "base", "frontier"])
+    fl.add_argument("--set", default=None, help="only this set (docs, invcdip, messy, ...)")
+    fl.add_argument("--examples", type=int, default=0, help="examples to print per cause")
+    fl.add_argument("--json", action="store_true", help="also write failures_<set>_<target>.json next to the report")
+    fl.add_argument("--cache", default="/workspace/mccp-cache")
+    fl.add_argument("--runs-root", default="/root/mccp-runs")
+
     pe = sub.add_parser("profile-env", help="print shell exports for a profile")
     pe.add_argument("--profile", default=DEFAULT_PROFILE)
 
@@ -1204,6 +1317,8 @@ def main() -> int:
         return add_set(args)
     if args.cmd == "summary":
         return summary(args)
+    if args.cmd == "failures":
+        return failures(args)
     if args.cmd == "profile-env":
         return profile_env(args)
     print(secrets.token_urlsafe(32))

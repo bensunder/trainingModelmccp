@@ -55,7 +55,7 @@ async def test_async_lookups_work():
         return vendor(k)
 
     chat, _ = _reply(rec["messages"][2]["content"])
-    out = await triage_extract(chat, "x", model="m", lookup_po=apo, lookup_vendor=aven)
+    out = await triage_extract(chat, rec["messages"][1]["content"], model="m", lookup_po=apo, lookup_vendor=aven)
     assert out["decision"] == rec["meta"]["expected"]
 
 
@@ -92,7 +92,9 @@ async def test_lookup_outage_is_not_treated_as_not_found():
     def down(k):
         raise ConnectionError("vendor master unreachable")
 
-    out = await triage_extract(chat, "x", model="m", lookup_po=_lookups(rec)[0], lookup_vendor=down)
+    out = await triage_extract(
+        chat, rec["messages"][1]["content"], model="m", lookup_po=_lookups(rec)[0], lookup_vendor=down
+    )
     assert out["route"] == ROUTE_HUMAN and "ConnectionError" in out["reason"]
     from mccp.rules.extraction import normalize_extraction_v2
 
@@ -100,8 +102,9 @@ async def test_lookup_outage_is_not_treated_as_not_found():
 
 
 async def test_unknown_ids_hold_the_invoice():
-    facts = {"invoice_id": "INV-1", "po_number": "PO-1", "vendor_id": "V-1", "billed_qty": 1, "unit_price_billed": 9.5}
+    facts = {"invoice_id": "INV-1", "po_number": "PO-1", "vendor_id": "V-1", "billed_qty": 1, "unit_price_raw": "$9.50"}
     chat, _ = _reply(json.dumps(facts))
-    out = await triage_extract(chat, "x", model="m", lookup_po=lambda k: None, lookup_vendor=lambda k: None)
+    page = "Invoice INV-1 from Acme (V-1) bills 1 x pump seals at $9.50 each against PO-1."
+    out = await triage_extract(chat, page, model="m", lookup_po=lambda k: None, lookup_vendor=lambda k: None)
     assert out["route"] == ROUTE_DECIDED and out["decision"]["decision"] == "hold"
     assert out["reason"] == "MISSING_PO"

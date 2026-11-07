@@ -10,6 +10,7 @@ golden: finance-ops/invcdip-realdoc@v1:test
 compare_fields: [invoice_number, po_number, total_amount]
 field_match: normalized
 output_normalizer: realdoc-amounts@v1
+validation: realdoc-validation@v1
 max_items: 500
 effect_probes: 5
 sampling: {temperature: 0.0, max_tokens: 256, seed: 0}
