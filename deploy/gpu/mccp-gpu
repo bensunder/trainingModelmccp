@@ -19,7 +19,9 @@
 #   mccp-gpu bench [--profile P] [--concurrency 1,5,10] [--duration 120] [--output-tokens 256]
 #                  [--adapter DIR] [--rate INR_PER_HOUR] [--eager 0|1]
 #                                   serving throughput + cost per 1M output tokens (no API calls)
-#   mccp-gpu eval-messy [RUN_ID] [--n 300] [--rescore]
+#   mccp-gpu eval-messy [RUN_ID] [--n 300] [--rescore] [--from /workspace/mccp-<RUN_ID>]
+#                                   --from: rebuild the run from its saved /workspace folder (after
+#                                   the machine was stopped or lost; works on a fresh machine)
 #                                   score a finished run's adapters on messy invoices (no retraining)
 #   mccp-gpu stop [--yes]           stop the runner and free the GPU (queue is kept)
 #   mccp-gpu update                 refresh the code used by *future* runs
@@ -570,26 +572,56 @@ cmd_bench() {
   echo "  results: $dest/throughput.md   check with: mccp-gpu status"
 }
 
+restore_run() {  # $1 saved run folder (/workspace/mccp-<id>) -> workdirs under $RUNS_ROOT/<id>
+  local src="$1" d w n=0 p
+  [ -d "$src" ] || { c_warn "no such folder: $src" >&2; return 1; }
+  RESTORED_ID="$(basename "$(readlink -f "$src")")"; RESTORED_ID="${RESTORED_ID#mccp-}"
+  RESTORED_PROFILE=""
+  for d in "$src"/*/; do
+    d="${d%/}"
+    [ -f "$d/adapter_model.safetensors" ] && [ -f "$d/adapter_config.json" ] && [ -f "$d/pilot.json" ] \
+      && [ -f "$d/run.json" ] && [ -f "$d/report.json" ] || continue
+    w="$RUNS_ROOT/$RESTORED_ID/$(basename "$d")"
+    mkdir -p "$w/output" "$w/data"
+    cp "$d/adapter_model.safetensors" "$d/adapter_config.json" "$w/output/" || return 1
+    cp "$d/pilot.json" "$d/run.json" "$d/report.json" "$w/" || return 1
+    [ -f "$d/report_messy.json" ] && cp "$d/report_messy.json" "$w/"
+    p="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("profile",""))' "$d/pilot.json" 2>/dev/null)"
+    [ -n "$p" ] && RESTORED_PROFILE="$p"
+    n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || { c_warn "no saved adapters (adapter + pilot.json + run.json + report.json) under $src" >&2; return 1; }
+  [ -n "$RESTORED_PROFILE" ] || RESTORED_PROFILE="$DEFAULT_PROFILE"
+  valid_profile "$RESTORED_PROFILE"
+  c_ok "restored $n adapter(s) of run $RESTORED_ID from $src (profile $RESTORED_PROFILE)"
+}
+
 cmd_eval_messy() {
-  local run_id="" n=300 rescore=0
+  local run_id="" n=300 rescore=0 from=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --n) n="$2"; shift 2 ;;
       --rescore) rescore=1; shift ;;
+      --from) from="$2"; shift 2 ;;
       -*) fail "unknown option $1" ;;
       *) run_id="$1"; shift ;;
     esac
   done
   [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ] || fail "--n must be a positive number"
-  [ -s "$DONE" ] || fail "no finished runs"
-  local line
-  if [ -n "$run_id" ]; then line="$(awk -F'\t' -v id="$run_id" '$1==id' "$DONE" | tail -1)"
-  else line="$(awk -F'\t' '$3=="0"' "$DONE" | tail -1)"; fi
-  [ -n "$line" ] || fail "no successful finished run${run_id:+ with id $run_id}"
   local id profile rc dest
-  IFS=$'\t' read -r id profile rc dest _ <<<"$line"
-  [ "$rc" = 0 ] || fail "run $id did not finish successfully (rc=$rc)"
-  [ -d "$RUNS_ROOT/$id" ] || fail "$RUNS_ROOT/$id is gone (machine was stopped?); adapters must still be on this box"
+  if [ -n "$from" ]; then
+    restore_run "$from" || exit 1
+    id="$RESTORED_ID" profile="$RESTORED_PROFILE" dest="$(readlink -f "$from")"
+  else
+    [ -s "$DONE" ] || fail "no finished runs on this machine (after a Stop, use --from /workspace/mccp-<RUN_ID>)"
+    local line
+    if [ -n "$run_id" ]; then line="$(awk -F'\t' -v id="$run_id" '$1==id' "$DONE" | tail -1)"
+    else line="$(awk -F'\t' '$3=="0"' "$DONE" | tail -1)"; fi
+    [ -n "$line" ] || fail "no successful finished run${run_id:+ with id $run_id}"
+    IFS=$'\t' read -r id profile rc dest _ <<<"$line"
+    [ "$rc" = 0 ] || fail "run $id did not finish successfully (rc=$rc)"
+    [ -d "$RUNS_ROOT/$id" ] || fail "$RUNS_ROOT/$id is gone (machine was stopped?); rebuild it from the saved results: mccp-gpu eval-messy --from $dest"
+  fi
   runner_active && fail "the training runner is active; wait for it (mccp-gpu status)"
   bench_active && fail "a benchmark is running"
   { command -v tmux >/dev/null && tmux has-session -t mccp-messy 2>/dev/null; } && fail "a messy eval is already running (tmux attach -t mccp-messy)"
@@ -612,7 +644,10 @@ cmd_eval_messy() {
   local adapters
   adapters="$(find "$RUNS_ROOT/$id" -mindepth 2 -maxdepth 2 -name report.json | wc -l)"
   c_ok "messy-invoice eval started for $id ($adapters adapters, $n records each)"
-  echo "  about $(( (adapters * 4) + 3 )) min; about INR $(awk -v a="$adapters" -v r="$(gpu_rate)" 'BEGIN{printf "%.0f", (a*4+3)/60*r}') of GPU time; no API calls"
+  local mins=$(( (adapters * 4) + 3 ))
+  # A machine without the base model downloads it first (about 16 GB): add about 10 minutes.
+  [ -n "$(find /root/models -maxdepth 2 -name config.json 2>/dev/null | head -1)" ] || mins=$((mins + 10))
+  echo "  about $mins min; about INR $(awk -v m="$mins" -v r="$(gpu_rate)" 'BEGIN{printf "%.0f", m/60*r}') of GPU time; no API calls"
   echo "  progress: tail -f $dest/eval-messy.console.txt   results: mccp-gpu results"
 }
 
@@ -672,6 +707,6 @@ case "${1:-help}" in
   stop) shift; cmd_stop "$@" ;;
   update) ensure_src; install_link; c_ok "code updated to $(git -C "$SRC" log -1 --format='%h %s'); applies to future runs" ;;
   _run) cmd_run ;;
-  help|-h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) fail "unknown command $1 (see: mccp-gpu help)" ;;
 esac

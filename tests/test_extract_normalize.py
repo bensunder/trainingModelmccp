@@ -204,3 +204,20 @@ async def test_serving_still_sends_ambiguous_ids_to_a_human():
 
     out = await triage_extract(chat, "x", model="m", lookup_po=lambda k: None, lookup_vendor=lambda k: None)
     assert out["route"] == ROUTE_HUMAN and out["decision"] is None
+
+
+def test_restored_workdir_regenerates_the_messy_set_in_its_own_task_format(tmp_path):
+    """After a lost machine only the saved folder (adapter, pilot.json, reports) is
+    left; add-messy must rebuild the identical messy set in the run's task format."""
+    import subprocess
+
+    w = tmp_path / "w"
+    (w / "data").mkdir(parents=True)
+    (w / "pilot.json").write_text(json.dumps({"profile": "qwen3-8b@v1", "task": "extract"}))
+    cmd = [sys.executable, str(ROOT / "deploy/gpu/pilot.py"), "add-messy", "--workdir", str(w), "--n", "30"]
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    rows = [json.loads(x) for x in (w / "data/golden_messy.jsonl").read_text().splitlines()]
+    assert len(rows) == 30 and all(row["meta"]["task"] == "extract" and "lookups" in row["meta"] for row in rows)
+    fresh = generate_messy(30, task="extract")
+    assert [x["meta"]["source_id"] for x in rows] == [x["meta"]["source_id"] for x in fresh]

@@ -577,7 +577,14 @@ async def _evaluate(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    probe_records = sets.get("in_dist") or _jsonl((workdir / "data" / SET_FILES["in_dist"]).read_bytes())
+    # Adapter-effect probes: in-dist when available; a workdir restored from /workspace
+    # (machine lost, only saved results left) has only the set being scored.
+    in_dist_path = workdir / "data" / SET_FILES["in_dist"]
+    probe_records = (
+        sets.get("in_dist")
+        or (_jsonl(in_dist_path.read_bytes()) if in_dist_path.exists() else None)
+        or next(iter(sets.values()))
+    )
 
     adapter_dir = workdir / "output"
     adapter_name = args.adapter_name or adapter_serving_name(workdir)

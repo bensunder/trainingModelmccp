@@ -26,6 +26,7 @@ mapfile -t WORKDIRS < <(find "$RUN_DIR" -mindepth 2 -maxdepth 2 -name report.jso
 [ "${#WORKDIRS[@]}" -gt 0 ] || die "no evaluated workdirs in $RUN_DIR"
 say "messy-invoice eval: ${#WORKDIRS[@]} adapters in $RUN_DIR, $MESSY_N records"
 ensure_key || die "could not read the vLLM API key"
+ensure_model "$MODEL_CACHE" || die "base model download failed; see $LOG"   # a fresh machine has none
 ensure_vllm "$MODEL_CACHE" "$DEST/vllm-messy.log.txt" || die "vLLM did not start"
 FIRST=1
 REPORTS=()
