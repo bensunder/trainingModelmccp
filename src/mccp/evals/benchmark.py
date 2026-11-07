@@ -310,6 +310,7 @@ def summarize_set(
     lenient: list[float] = []
     decision_correct: list[float] = []
     rules = RULESETS[suite.decision_rules] if suite.decision_rules else None
+    decides = {"decision", "reason_code"} <= set(suite.compare_fields)
     for it, sc in zip(items, scores, strict=True):
         if it.kind != "final":
             continue
@@ -319,12 +320,17 @@ def summarize_set(
             by_field[f].append(float(hit))
         if rules is not None:
             ok = _rules_decision_correct(rules, meta, sc)
-        else:
+        elif decides:
             ok = float(sc.get("fields", {}).get("reason_code", False) and sc.get("fields", {}).get("decision", False))
-        decision_correct.append(ok)
-        by_scenario[str(meta.get("scenario", "unknown"))].append(ok)
+        else:  # an extraction-only suite (real documents) makes no decision: not scored, not 0%
+            ok = None
+        # Breakdowns follow the decision when there is one, else the record's exactness.
+        unit = ok if ok is not None else float(sc.get("score") == 1.0)
+        if ok is not None:
+            decision_correct.append(ok)
+        by_scenario[str(meta.get("scenario", "unknown"))].append(unit)
         if "ood_kind" in meta:
-            by_kind[str(meta["ood_kind"])].append(ok)
+            by_kind[str(meta["ood_kind"])].append(unit)
         lenient.append(
             lenient_final_score(sc.get("content", ""), expected, suite.output_schema, suite.compare_fields)
             if not sc.get("error")

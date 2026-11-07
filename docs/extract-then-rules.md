@@ -79,6 +79,35 @@ still go to a human; a canonical id that does not exist finds nothing and the po
 `<report>.<set>.<target>.outputs.jsonl`, so misses can be read. Re-score a finished run after a scoring
 change: `mccp-gpu eval-messy <RUN_ID> --rescore`.
 
+## Documents, not text: `docs` and `invcdip` sets
+
+Every set above hands the model clean text. Production reads PDFs and scans through OCR, so two
+more sets measure that path (`mccp-gpu eval-messy --set docs|invcdip`, scoring a finished run):
+
+* **docs** (`mccp.examples.documents`): the same cases rendered as one-page PDF invoices in four
+  layouts (classic, modern, compact, remittance with a freight line), rasterized, scan-degraded at
+  three levels (clean, light: slight skew/blur/JPEG, heavy: 2 degree skew, blur, speckle,
+  downscaling) and OCR'd with RapidOCR (CPU, pip-only, models bundled). The pages carry what real
+  invoices carry and the text sets never did: a remit-to `PO Box` near the PO number, bank account
+  and routing digits, subtotal/tax/total beside the unit price, a freight line, terms, dates and
+  phone numbers. Labels are exact (same `make_case`), so the full decision is scored end to end.
+  OCR artifacts are kept on purpose (merged words, `$35.805.60` for `$35,805.60`); the engine's
+  angle classifier is off because it flipped short skewed boxes 180 degrees (`90` read as `06`), an
+  engine artifact rather than scan damage.
+* **invcdip** (`mccp.examples.invcdip`): the 350 labelled **real** scanned invoices of INV-CDIP
+  (Gao et al., 2022; documents from the UCSF Industry Documents Library, downloaded from its public
+  AWS Open Data mirror). There are no PO or vendor records for them, so this set scores extraction
+  only (`examples/suite-invoice-realdoc.yaml`): invoice number, PO number (labelled on 85) and
+  amount payable, matched ignoring case/spaces/punctuation, amounts to the cent. Unlabelled fields
+  are not scored; a label that PII redaction removed from the input is dropped and counted; a value
+  the OCR lost stays scored (OCR is part of the pipeline). `set_invcdip.json` records the **OCR
+  ceiling** per field (share of labels present in the OCR text), so a miss can be attributed to the
+  OCR or to the model. **License: annotations CC BY-NC 4.0, documents under UCSF terms: internal
+  evidence only**; nothing is redistributed.
+
+Both are built on the CPU before vLLM starts and cached in `/workspace/mccp-cache`, so the slow part
+(about 2-3 s of OCR per page) is paid once across runs and machines.
+
 ## Serving
 
 `mccp.agent.extract.triage_extract(chat, text, model=..., lookup_po=..., lookup_vendor=...)`: one

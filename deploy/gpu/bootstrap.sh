@@ -47,7 +47,7 @@ fi
 [ "${BOOTSTRAP_NO_GIT:-0}" = 1 ] || say "repo at $(git -C "$REPO" log -1 --format='%h %s')"
 
 say "control-plane environment (uv.lock)"
-(cd "$REPO" && uv sync --frozen --no-dev >>"$LOG" 2>&1) || die "uv sync failed; see $LOG"
+(cd "$REPO" && uv sync --frozen --no-dev --extra docs >>"$LOG" 2>&1) || die "uv sync failed; see $LOG"
 
 if [ ! -x "$TRAINER_PY" ]; then
   say "trainer venv (hash-locked; ~2.5 GB of CUDA wheels)"

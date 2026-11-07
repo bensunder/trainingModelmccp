@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -64,7 +65,15 @@ from mccp.training.backends import TrainContext, prepare_workdir
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_PROFILE = "qwen3-8b@v1"
-SET_FILES = {"in_dist": "golden.jsonl", "ood": "golden_ood.jsonl", "messy": "golden_messy.jsonl"}
+SET_FILES = {
+    "in_dist": "golden.jsonl",
+    "ood": "golden_ood.jsonl",
+    "messy": "golden_messy.jsonl",
+    "docs": "golden_docs.jsonl",  # rendered PDF -> scan -> OCR (mccp.examples.documents)
+    "invcdip": "golden_invcdip.jsonl",  # real scanned invoices, extraction only (mccp.examples.invcdip)
+}
+# Sets scored with their own suite instead of the workdir's task suite.
+SET_SUITES = {"invcdip": "examples/suite-invoice-realdoc.yaml"}
 
 
 def _jsonl(b: bytes) -> list[dict[str, Any]]:
@@ -592,7 +601,14 @@ async def _evaluate(args: argparse.Namespace) -> int:
     profile = load_profile(pilot_meta.get("profile", DEFAULT_PROFILE))
     base_served = served_base_name(profile)
     xbody = extra_body(profile)
-    suite = load_suite(pilot_meta.get("task", "agent"))
+    own = {SET_SUITES[s] for s in sets if s in SET_SUITES}
+    if own and (len(own) > 1 or any(s not in SET_SUITES for s in sets)):
+        print("score invcdip on its own (--sets invcdip): it uses a different suite", file=sys.stderr)
+        return 2
+    if own:
+        suite = EvalSuite.model_validate(yaml.safe_load((REPO / own.pop()).read_text(encoding="utf-8")))
+    else:
+        suite = load_suite(pilot_meta.get("task", "agent"))
     vllm = VllmClient(args.vllm_url, args.vllm_api_key, timeout=args.timeout)
     static = live = None
     frontier = None
@@ -938,14 +954,64 @@ def curve(args: argparse.Namespace) -> int:
 
 def add_messy(args: argparse.Namespace) -> int:
     """Write the messy-invoice set into an existing workdir (no retraining needed)."""
+    args.set = "messy"
+    return add_set(args)
+
+
+DEFAULT_SET_SEEDS = {"messy": 4242, "docs": 5151}
+
+
+def add_set(args: argparse.Namespace) -> int:
+    """Write an extra test set into an existing workdir (no retraining needed):
+    messy (clean-text variants), docs (rendered PDF -> scan -> OCR) or invcdip (real
+    scanned invoices; extraction only). docs and invcdip are generated once into
+    --cache (OCR is the slow part), so every run and machine reuses them."""
     workdir = Path(args.workdir).resolve()
     if not (workdir / "pilot.json").exists():
         print(f"{workdir} is not a prepared workdir", file=sys.stderr)
         return 2
+    (workdir / "data").mkdir(parents=True, exist_ok=True)
     task = json.loads((workdir / "pilot.json").read_text(encoding="utf-8")).get("task", "agent")
-    rows, pii = redact_records(generate_messy(args.n, seed=args.seed, task=task))
-    _write_jsonl(workdir / "data" / SET_FILES["messy"], rows)
-    print(json.dumps({"workdir": str(workdir), "messy_records": len(rows), "seed": args.seed, "pii_placeholders": pii}))
+    seed = args.seed if args.seed is not None else DEFAULT_SET_SEEDS.get(args.set)
+    summary: dict[str, Any] = {"workdir": str(workdir), "set": args.set, "task": task, "seed": seed}
+    cache = Path(args.cache)
+    if args.set == "messy":
+        rows, pii = redact_records(generate_messy(args.n, seed=seed, task=task))
+    elif args.set == "docs":
+        from mccp.examples import documents
+
+        key = hashlib.sha256(Path(documents.__file__).read_bytes()).hexdigest()[:12]
+        cached = cache / f"docs-{task}-n{args.n}-s{seed}-{key}.jsonl"
+        if cached.exists():
+            raw = _jsonl(cached.read_bytes())
+            summary["cache"] = "hit"
+        else:
+            print(f"rendering, scanning and OCR-ing {args.n} invoices (about 1-3 s each, CPU)", file=sys.stderr)
+            raw = documents.generate_documents(args.n, seed=seed, task=task)
+            cache.mkdir(parents=True, exist_ok=True)
+            _write_jsonl(cached, raw)
+            summary["cache"] = f"written {cached}"
+        rows, pii = redact_records(raw)
+    else:  # invcdip
+        from mccp.examples import invcdip
+
+        raw, info = invcdip.generate_invcdip(
+            cache / "invcdip", n=args.n or None, log=lambda s: print(s, file=sys.stderr)
+        )
+        rows, pii = redact_records(raw)
+        summary["labels_dropped_by_redaction"] = invcdip.drop_redacted_labels(raw, rows)
+        summary["ocr_ceiling"] = invcdip.ocr_ceiling(raw)
+        summary.update({k: v for k, v in info.items() if k != "failed_downloads"})
+        summary["failed_downloads"] = len(info["failed_downloads"])
+        if info["failed_downloads"]:
+            print(f"failed downloads: {info['failed_downloads'][:5]}", file=sys.stderr)
+        if not rows:
+            print("no INV-CDIP documents could be prepared", file=sys.stderr)
+            return 3
+    _write_jsonl(workdir / "data" / SET_FILES[args.set], rows)
+    summary.update({"records": len(rows), "pii_placeholders": pii})
+    (workdir / f"set_{args.set}.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary))
     return 0
 
 
@@ -1032,6 +1098,14 @@ def main() -> int:
     am.add_argument("--workdir", required=True)
     am.add_argument("--n", type=int, default=300)
     am.add_argument("--seed", type=int, default=4242)
+    am.add_argument("--cache", default="/workspace/mccp-cache")
+
+    ast = sub.add_parser("add-set", help="add an extra test set (messy, docs, invcdip) to an existing workdir")
+    ast.add_argument("--workdir", required=True)
+    ast.add_argument("--set", required=True, choices=["messy", "docs", "invcdip"])
+    ast.add_argument("--n", type=int, default=300, help="records (invcdip: 0 = all 350 labelled documents)")
+    ast.add_argument("--seed", type=int, default=None)
+    ast.add_argument("--cache", default="/workspace/mccp-cache", help="generated sets and downloads, reused")
 
     cv = sub.add_parser("curve", help="learning curve across methods and training sizes")
     cv.add_argument("reports", nargs="+", help="report.json files")
@@ -1054,6 +1128,8 @@ def main() -> int:
         return curve(args)
     if args.cmd == "add-messy":
         return add_messy(args)
+    if args.cmd == "add-set":
+        return add_set(args)
     if args.cmd == "profile-env":
         return profile_env(args)
     print(secrets.token_urlsafe(32))

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -71,6 +71,10 @@ class EvalSuite(BaseModel):
     # Deterministic canonicalization applied to the parsed output before the schema
     # check (e.g. id formats). Raw format validity is still reported separately.
     output_normalizer: str | None = None
+    # exact: every compare field must equal the label. normalized (real documents):
+    # ids ignore case/spaces/punctuation, amounts match to the cent, and a field the
+    # label leaves null is not scored (unlabelled is not the same as absent).
+    field_match: Literal["exact", "normalized"] = "exact"
 
     @model_validator(mode="after")
     def _known_rules(self) -> "EvalSuite":

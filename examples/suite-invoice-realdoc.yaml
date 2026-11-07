@@ -1,0 +1,25 @@
+# Eval suite for real scanned invoices (INV-CDIP): extraction only, no decision
+# (these documents have no PO records or vendor master). Fields are matched
+# ignoring case, spaces and punctuation; amounts to the cent; a field the
+# annotators left unlabelled is not scored. output_schema must equal
+# mccp.examples.invcdip.REALDOC_SCHEMA (tested).
+name: invoice-realdoc-suite
+version: 1
+golden: finance-ops/invcdip-realdoc@v1:test
+compare_fields: [invoice_number, po_number, total_amount]
+field_match: normalized
+max_items: 500
+effect_probes: 5
+sampling: {temperature: 0.0, max_tokens: 256, seed: 0}
+output_schema:
+  type: object
+  additionalProperties: false
+  required: [invoice_number, po_number, total_amount]
+  properties:
+    invoice_number: {type: [string, "null"]}
+    po_number: {type: [string, "null"]}
+    total_amount: {type: [number, "null"]}
+safety:
+  guard_model: Qwen/Qwen3Guard-Gen-4B
+  guard_base_url: http://vllm-guard:8001
+performance: {requests: 32, concurrency: 4}

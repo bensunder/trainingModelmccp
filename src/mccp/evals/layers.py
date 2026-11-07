@@ -99,6 +99,7 @@ def score_item(
     schema: dict[str, Any],
     fields: list[str],
     normalize: Callable[[Any], tuple[Any, list[dict[str, Any]]]] | None = None,
+    match: str = "exact",
 ) -> dict[str, Any]:
     msg = response["choices"][0]["message"]
     got_calls = msg.get("tool_calls") or []
@@ -134,12 +135,18 @@ def score_item(
         obj, changes = normalize(obj)
     valid = _valid(obj, schema) if obj is not None else False
     expected = json.loads(item.expected["content"])
-    matches = [bool(valid and obj.get(f) == expected.get(f)) for f in fields]
+    if match == "normalized":
+        from mccp.examples.invcdip import normalized_equal
+
+        scored = [f for f in fields if expected.get(f) is not None]
+        hits = {f: bool(valid and normalized_equal(expected[f], obj.get(f))) for f in scored}
+    else:
+        hits = {f: bool(valid and obj.get(f) == expected.get(f)) for f in fields}
     out = {
         "kind": "final",
-        "score": float(valid) * (sum(matches) / len(fields)),
+        "score": float(valid) * (sum(hits.values()) / len(hits)) if hits else float(valid),
         "json_valid": valid,
-        "fields": dict(zip(fields, matches, strict=True)),
+        "fields": hits,
         "content": content[:4000],
     }
     if normalize is not None:
@@ -180,7 +187,7 @@ async def run_items(
                 resp = await chat(payload)
             except Exception as e:  # noqa: BLE001 - an endpoint error scores 0, recorded
                 return {"kind": it.kind, "score": 0.0, "error": str(e)[:200], "parsed": False, "json_valid": False}
-        return score_item(it, resp, suite.output_schema, suite.compare_fields, normalize)
+        return score_item(it, resp, suite.output_schema, suite.compare_fields, normalize, suite.field_match)
 
     from mccp.rules import NORMALIZERS
 
@@ -205,6 +212,8 @@ def summarize_l1(scores: list[dict[str, Any]]) -> dict[str, Any]:
             else None
         ),
         "normalized_answers": sum(1 for s in finals if s.get("normalized")),
+        # every scored field right (for real documents: every labelled field)
+        "exact_record_rate": mean([float(s.get("score") == 1.0) for s in finals]) if finals else None,
         "field_accuracy": mean([s["score"] for s in finals]) if finals else None,
         "errors": sum(1 for s in scores if "error" in s),
     }
