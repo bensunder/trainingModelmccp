@@ -33,7 +33,9 @@ ensure_key || die "could not read the vLLM API key"
 # Build the test set first: rendering/OCR (docs) and downloads/OCR (invcdip) run on the
 # CPU, so the GPU is not held by an idle vLLM meanwhile. Cached in $CACHE for reuse.
 for W in "${WORKDIRS[@]}"; do
-  if [ ! -f "$W/data/golden_$SET.jsonl" ]; then
+  # RESCORE=1 rebuilds the set too: prompts and labels come from the current code
+  # (the OCR is cached, so this costs seconds), never from an older set file.
+  if [ ! -f "$W/data/golden_$SET.jsonl" ] || [ "${RESCORE:-0}" = 1 ]; then
     say "building the $SET set for $(basename "$W") (CPU; cached in $CACHE)"
     (cd "$REPO" && uv run python deploy/gpu/pilot.py add-set --set "$SET" --workdir "$W" --n "$MESSY_N" --cache "$CACHE") 2>&1 | tee -a "$LOG"
     [ "${PIPESTATUS[0]}" = 0 ] || die "could not build the $SET set for $W (log above)"
