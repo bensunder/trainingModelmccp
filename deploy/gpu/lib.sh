@@ -147,3 +147,18 @@ save_run() {  # $1 workdir, $2 destination (under /workspace, which GridShare ke
   done
   return 0
 }
+
+drop_mirror() {  # $1 workdir, $2 saved run dir: delete the checkpoint mirror once the adapter is safely saved
+  local ptr="$1/.ckpt-mirror" dir
+  [ -f "$ptr" ] || return 0
+  dir="$(head -1 "$ptr")"
+  # Only once the saved adapter is byte-identical to the trained one.
+  cmp -s "$1/output/adapter_model.safetensors" "$2/adapter_model.safetensors" \
+    || { say "kept checkpoint mirror $dir (adapter not confirmed saved in $2)"; return 0; }
+  case "$dir" in
+    */mccp-ckpt/[0-9a-f]*) ;;   # never delete anything outside a mirror root
+    *) say "refusing to delete unexpected mirror path '$dir'"; return 0 ;;
+  esac
+  rm -rf -- "$dir" && rm -f -- "$ptr" && say "deleted checkpoint mirror $dir (adapter saved)"
+  return 0
+}

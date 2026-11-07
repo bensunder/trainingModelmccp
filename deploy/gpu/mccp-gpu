@@ -7,6 +7,7 @@
 #   mccp-gpu up [--queue PROFILE...] [--no-baseline]   set up the box, start the queue runner
 #   mccp-gpu queue add PROFILE [--n N] [--epochs E] [--seeds "42 7"]
 #   mccp-gpu queue add PROFILE --n 100,300,1000 --methods sft,rgt --seeds 42 --test-n 300 [--mix boundary]
+#   mccp-gpu queue add ... --commit SHA   run a specific commit (re-run a job exactly on a new machine)
 #                                   learning curve: standard fine-tuning vs Rationale-Guided Training
 #   mccp-gpu queue list | queue clear
 #   mccp-gpu status                 current run, progress, GPU, cost so far, queue, finished runs
@@ -23,8 +24,11 @@
 #
 # Guarantees:
 #   * one runner per box (flock); runs execute one after another
-#   * every run executes from its own frozen copy of the code (a release directory
-#     per commit), so updating `main` never changes a run that is in progress
+#   * every job is frozen to the commit that was newest when it was queued (or
+#     --commit): its release directory is built at queue time and kept while the
+#     job is queued, so pushing to `main` never changes a queued or running job
+#   * training keeps 2 local checkpoints and mirrors the newest to /workspace;
+#     a run re-queued on a new machine with the same commit resumes from it
 #   * the API key is read once from the terminal, verified for free, stored
 #     root-only, and never appears on a command line
 #   * waits for GPU work it did not start (e.g. a manual run_batch.sh) to finish
@@ -40,7 +44,8 @@ REPO_URL="${MCCP_REPO_URL:-https://github.com/bensunder/trainingModelmccp}"
 BRANCH="${MCCP_BRANCH:-main}"
 SESSION="${MCCP_SESSION:-mccp-gpu}"
 BIN_LINK="${MCCP_BIN_LINK:-/usr/local/bin/mccp-gpu}"
-QUEUE="$MCCP_HOME/queue.tsv"      # id profile sizes epochs seeds methods test_n mix (tab-separated)
+RUNNER_FORMAT=2                   # queue row layout this runner reads (2 = with the frozen commit)
+QUEUE="$MCCP_HOME/queue.tsv"      # id profile sizes epochs seeds methods test_n mix commit (tab-separated)
 DONE="$MCCP_HOME/done.tsv"        # id <TAB> profile <TAB> rc <TAB> results_dir <TAB> ended_utc
 CURRENT="$MCCP_HOME/current.env"
 CONFIG="$MCCP_HOME/config.env"    # baseline URL/model, GPU rate (not secret)
@@ -99,32 +104,63 @@ fi
 # ---------------------------------------------------------------- releases --
 release_for() {  # $1 commit -> prints a frozen, installed copy of that commit
   local sha="$1" rel="$RELEASES/$1"
-  if [ ! -f "$rel/.ready" ]; then
-    rm -rf "$rel" && mkdir -p "$rel"
-    git -C "$SRC" archive "$sha" | tar -x -C "$rel" || return 1
-    touch "$rel/.ready"   # bootstrap.sh installs its environment (uv sync --frozen)
-  fi
-  prune_releases "$sha"
+  git -C "$SRC" cat-file -e "$sha^{commit}" 2>/dev/null || return 1
+  mkdir -p "$RELEASES"
+  # One writer at a time (queue add and the runner can both cut releases). Extract
+  # into a temp dir and rename, so a crash never leaves a half release marked ready.
+  (
+    flock 7
+    if [ ! -f "$rel/.ready" ]; then
+      tmp="$RELEASES/.tmp-$sha-$$"
+      rm -rf "$tmp" && mkdir -p "$tmp" || exit 1
+      git -C "$SRC" archive "$sha" | tar -x -C "$tmp" || { rm -rf "$tmp"; exit 1; }
+      touch "$tmp/.ready"   # bootstrap.sh installs its environment (uv sync --frozen)
+      rm -rf "$rel" && mv "$tmp" "$rel" || exit 1
+    fi
+    prune_releases "$sha"
+  ) 7>"$RELEASES/.lock" || return 1
   echo "$rel"
 }
 
-prune_releases() {  # keep the newest 3 releases plus $1 (never the one a run is using)
-  local keep="$1" in_use="" d
+pinned_shas() {  # commits that queued jobs are frozen to (column 9)
+  [ -s "$QUEUE" ] && cut -f9 "$QUEUE" | grep -E '^[0-9a-f]{40}$'
+  return 0
+}
+
+prune_releases() {  # keep the newest 3 releases, $1, the running one and every queued job's commit
+  local keep="$1" in_use="" pinned d
   [ -f "$CURRENT" ] && in_use="$(grep -E '^RUN_RELEASE=' "$CURRENT" | cut -d= -f2)"
-  find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %f\n' 2>/dev/null | sort -rn | tail -n +4 \
+  pinned="$(pinned_shas)"
+  find "$RELEASES" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%T@ %f\n' 2>/dev/null | sort -rn | tail -n +4 \
     | while read -r _ d; do
-        [ "$d" = "$keep" ] || [ "$d" = "$in_use" ] || rm -rf "${RELEASES:?}/$d"
+        [ "$d" = "$keep" ] || [ "$d" = "$in_use" ] || grep -qx "$d" <<<"$pinned" || rm -rf "${RELEASES:?}/$d"
       done
+}
+
+resolve_commit() {  # $1 empty (= newest on the branch) or a commit -> full sha, fetched if needed
+  git -C "$SRC" fetch -q origin "$BRANCH" 2>/dev/null || c_warn "git fetch failed; using the local copy" >&2
+  local want="${1:-origin/$BRANCH}" sha
+  sha="$(git -C "$SRC" rev-parse --verify -q "$want^{commit}")" \
+    || { git -C "$SRC" fetch -q origin "$want" 2>/dev/null && sha="$(git -C "$SRC" rev-parse --verify -q "$want^{commit}")"; } \
+    || { [ -z "$1" ] && sha="$(git -C "$SRC" rev-parse HEAD)"; } \
+    || return 1
+  echo "$sha"
 }
 
 # ------------------------------------------------------------------- queue --
 with_queue_lock() { (flock 8; "$@") 8>"$MCCP_HOME/queue.lock"; }
 
-_queue_add() {  # profile sizes epochs seeds [methods] [test_n] [mix]
-  local id
-  id="$(date -u +%Y%m%d-%H%M%S)-$(printf '%s' "$1" | tr -c 'a-z0-9.-' '-' | sed 's/-*$//')"
+_queue_add() {  # profile sizes epochs seeds methods test_n mix commit
+  local id base k=1
+  base="$(date -u +%Y%m%d-%H%M%S)-$(printf '%s' "$1" | tr -c 'a-z0-9.-' '-' | sed 's/-*$//')"
+  id="$base"
+  # Unique even when several jobs are queued in the same second (the id names the
+  # results folder, so a collision would overwrite another job's results).
+  while cut -f1 "$QUEUE" "$DONE" 2>/dev/null | grep -qx "$id" || [ -e "$WORKSPACE/mccp-$id" ] || [ -e "$RUNS_ROOT/$id" ]; do
+    k=$((k + 1)); id="$base-$k"
+  done
   # test_n is written as "-" when unset: bash `read` collapses empty tab-separated fields.
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$1" "$2" "$3" "$4" "${5:-sft}" "${6:--}" "${7:-standard}" >> "$QUEUE"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$1" "$2" "$3" "$4" "${5:-sft}" "${6:--}" "${7:-standard}" "$8" >> "$QUEUE"
   echo "$id"
 }
 
@@ -135,7 +171,11 @@ _queue_pop_if() {  # remove the first line only if it is still item $1
   fi
 }
 
-valid_profile() {  # profile must exist in the source checkout
+valid_profile() {  # $1 profile must exist in the source checkout (or in commit $2)
+  if [ -n "${2:-}" ]; then
+    git -C "$SRC" cat-file -e "$2:profiles/$1.yaml" 2>/dev/null && return 0
+    fail "profile $1 does not exist at commit ${2:0:7}"
+  fi
   [ -f "$SRC/profiles/$1.yaml" ] || fail "unknown profile $1 (available: $(find "$SRC/profiles" -maxdepth 1 -name '*.yaml' -printf '%f ' | sed 's/\.yaml//g'))"
 }
 
@@ -143,8 +183,8 @@ cmd_queue() {
   case "${1:-list}" in
     add)
       shift
-      local profile="${1:-}" n=3000 epochs=1 seeds="42 7" methods=sft test_n="" mix=standard
-      [ -n "$profile" ] || fail "usage: mccp-gpu queue add PROFILE [--n N[,N...]] [--epochs E] [--seeds \"42 7\"] [--methods sft,rgt] [--test-n N]"
+      local profile="${1:-}" n=3000 epochs=1 seeds="42 7" methods=sft test_n="" mix=standard commit=""
+      [ -n "$profile" ] || fail "usage: mccp-gpu queue add PROFILE [--n N[,N...]] [--epochs E] [--seeds \"42 7\"] [--methods sft,rgt] [--test-n N] [--mix boundary] [--commit SHA]"
       shift
       while [ $# -gt 0 ]; do
         case "$1" in
@@ -154,6 +194,7 @@ cmd_queue() {
           --methods) methods="$2"; shift 2 ;;
           --test-n) test_n="$2"; shift 2 ;;
           --mix) mix="$2"; shift 2 ;;
+          --commit) commit="$2"; shift 2 ;;
           *) fail "unknown option $1" ;;
         esac
       done
@@ -163,15 +204,25 @@ cmd_queue() {
       [ -z "$test_n" ] || [[ "$test_n" =~ ^[0-9]+$ ]] || fail "--test-n must be a number"
       [[ "$mix" =~ ^(standard|boundary)$ ]] || fail "--mix must be standard or boundary"
       [[ "$n" != *,* ]] || [ -n "$test_n" ] || fail "several --n sizes need --test-n (one fixed test set for every size)"
-      valid_profile "$profile"
+      [ -z "$commit" ] || [[ "$commit" =~ ^[0-9a-fA-F]{7,40}$ ]] || fail "--commit must be a commit hash"
+      # Freeze the code now: the job runs this commit even if the branch moves later.
+      local sha
+      sha="$(resolve_commit "$commit")" || fail "commit $commit not found in $REPO_URL"
+      valid_profile "$profile" "$sha"
+      if runner_active && [ "$(cat "$MCCP_HOME/runner.format" 2>/dev/null)" != "$RUNNER_FORMAT" ]; then
+        fail "the active runner is from an older version of this tool and would misread a frozen-commit job. Let it finish (mccp-gpu status; it exits when its queue is empty), then queue again"
+      fi
+      release_for "$sha" >/dev/null || fail "could not prepare release ${sha:0:7}"
       local id
-      id="$(with_queue_lock _queue_add "$profile" "$n" "$epochs" "$seeds" "$methods" "$test_n" "$mix")"
+      id="$(with_queue_lock _queue_add "$profile" "$n" "$epochs" "$seeds" "$methods" "$test_n" "$mix" "$sha")"
       c_ok "queued $id ($profile, methods $methods, records $n x $epochs epoch, seeds $seeds${test_n:+, fixed test $test_n}, training mix $mix)"
+      c_ok "frozen to commit ${sha:0:12} ($(git -C "$SRC" log -1 --format='%s' "$sha" | cut -c1-60))"
+      echo "  to re-run this exact job on another machine: mccp-gpu queue add $profile --n $n --epochs $epochs --seeds \"$seeds\" --methods $methods${test_n:+ --test-n $test_n} --mix $mix --commit $sha"
       runner_active || start_runner
       ;;
     list)
       if [ -s "$QUEUE" ]; then
-        awk -F'\t' '{printf "  %d. %s  %s  %s n=%s e=%s seeds=[%s]%s%s\n", NR, $1, $2, ($6==""?"sft":$6), $3, $4, $5, (($7==""||$7=="-")?"":" test=" $7), (($8==""||$8=="standard")?"":" mix=" $8)}' "$QUEUE"
+        awk -F'\t' '{printf "  %d. %s  %s  %s n=%s e=%s seeds=[%s]%s%s  %s\n", NR, $1, $2, ($6==""?"sft":$6), $3, $4, $5, (($7==""||$7=="-")?"":" test=" $7), (($8==""||$8=="standard")?"":" mix=" $8), ($9==""?"commit: newest at start":"commit " substr($9,1,7))}' "$QUEUE"
       else
         echo "  (queue empty)"
       fi
@@ -317,6 +368,7 @@ cmd_run() {  # internal: the queue loop (exactly one per box)
     log "runner lock held by pids: $(fuser "$MCCP_HOME/runner.lock" 2>/dev/null); stop them (mccp-gpu stop) and run: mccp-gpu up"
     exit 1
   fi
+  echo "$RUNNER_FORMAT" > "$MCCP_HOME/runner.format"
   log "runner up (pid $$)"
   while true; do
     local item
@@ -325,18 +377,22 @@ cmd_run() {  # internal: the queue loop (exactly one per box)
       rm -f "$CURRENT"; log "queue empty; runner exiting"; exit 0
     fi
     local id profile n epochs seeds
-    local methods test_n mix
-    IFS=$'\t' read -r id profile n epochs seeds methods test_n mix <<<"$item"
+    local methods test_n mix pin
+    IFS=$'\t' read -r id profile n epochs seeds methods test_n mix pin <<<"$item"
     [ "$test_n" = "-" ] && test_n=""
     if foreign_gpu_work || bench_active; then
       log "waiting for other GPU work (a benchmark or a manual run) to finish (checks every 60 s)"
       while foreign_gpu_work || bench_active; do sleep 60; done
     fi
-    git -C "$SRC" fetch -q origin "$BRANCH" 2>/dev/null
-    local sha rel
-    sha="$(git -C "$SRC" rev-parse "origin/$BRANCH" 2>/dev/null || git -C "$SRC" rev-parse HEAD)"
-    log "run $id: $profile methods=${methods:-sft} mix=${mix:-standard} n=$n epochs=$epochs seeds=[$seeds]${test_n:+ test=$test_n} from commit ${sha:0:7}"
-    rel="$(release_for "$sha")" || { log "could not prepare release ${sha:0:7}"; break; }
+    local sha rel frozen
+    if [ -n "$pin" ]; then
+      sha="$pin" frozen="frozen at queue time"
+    else  # rows queued by older versions of this tool: newest commit at start, as before
+      git -C "$SRC" fetch -q origin "$BRANCH" 2>/dev/null
+      sha="$(git -C "$SRC" rev-parse "origin/$BRANCH" 2>/dev/null || git -C "$SRC" rev-parse HEAD)" frozen="newest at start (legacy row)"
+    fi
+    log "run $id: $profile methods=${methods:-sft} mix=${mix:-standard} n=$n epochs=$epochs seeds=[$seeds]${test_n:+ test=$test_n} from commit ${sha:0:7} ($frozen)"
+    rel="$(release_for "$sha")" || { log "could not prepare release ${sha:0:7}; queue paused"; break; }
     if [ "${MCCP_GPU_SKIP_BOOTSTRAP:-0}" != 1 ]; then
       if ! REPO="$rel" BOOTSTRAP_NO_GIT=1 LOG="$MCCP_HOME/bootstrap.log" bash "$rel/deploy/gpu/bootstrap.sh" >> "$RUNNER_LOG" 2>&1; then
         log "bootstrap failed (see $MCCP_HOME/bootstrap.log); queue paused"; break
@@ -581,7 +637,15 @@ cmd_up() {
     echo "baseline: $(grep -E '^BASELINE_(PROVIDER|MODEL|DISABLED)=' "$CONFIG" | tr '\n' ' ')  (change with: mccp-gpu baseline)"
   fi
   local p
-  for p in "${queue_profiles[@]}"; do valid_profile "$p"; with_queue_lock _queue_add "$p" 3000 1 "42 7" >/dev/null; done
+  if [ "${#queue_profiles[@]}" -gt 0 ]; then
+    local pin_sha
+    pin_sha="$(resolve_commit "")" || fail "could not resolve the current commit"
+    release_for "$pin_sha" >/dev/null || fail "could not prepare release ${pin_sha:0:7}"
+    for p in "${queue_profiles[@]}"; do
+      valid_profile "$p" "$pin_sha"
+      with_queue_lock _queue_add "$p" 3000 1 "42 7" sft "" standard "$pin_sha" >/dev/null
+    done
+  fi
   if [ ! -s "$QUEUE" ]; then
     c_warn "queue is empty. Add a run, e.g.: mccp-gpu queue add $DEFAULT_PROFILE"
     return 0
@@ -602,6 +666,6 @@ case "${1:-help}" in
   stop) shift; cmd_stop "$@" ;;
   update) ensure_src; install_link; c_ok "code updated to $(git -C "$SRC" log -1 --format='%h %s'); applies to future runs" ;;
   _run) cmd_run ;;
-  help|-h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) fail "unknown command $1 (see: mccp-gpu help)" ;;
 esac

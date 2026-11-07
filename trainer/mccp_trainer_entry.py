@@ -19,6 +19,10 @@ Contract with the control plane (run.json in, events.jsonl out):
 5. Token statistics: p50/p95/p99 sample length; refuse if p99 > max_length
    (truncation would cut the supervised assistant turn); trained_tokens.
 6. Write soup.yaml and run `soup train`, forwarding progress as JSON events.
+7. Checkpoint safety: keep only the newest MCCP_KEEP_CHECKPOINTS (2) complete
+   checkpoints; with MCCP_CKPT_MIRROR_ROOT set, mirror the newest one to
+   persistent storage keyed by run identity (run.json + training data), restore
+   it when this machine has none; the batch deletes it once the adapter is saved.
 
 Standalone on purpose: depends only on the stdlib, transformers,
 huggingface_hub and soup-cli, so the trainer image does not need the
@@ -33,10 +37,12 @@ import glob
 import hashlib
 import json
 import os
+import shutil
 import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -337,6 +343,164 @@ def _checkpoints(output: str) -> dict[int, str]:
     return out
 
 
+# ------------------------------------------------- checkpoint safety controls --
+KEEP_CHECKPOINTS = int(os.environ.get("MCCP_KEEP_CHECKPOINTS", "2"))
+MIRROR_ROOT = os.environ.get("MCCP_CKPT_MIRROR_ROOT", "")  # e.g. /workspace/mccp-ckpt; empty = no mirror
+
+
+def _complete(path: str) -> bool:
+    """The training library writes trainer_state.json last when it saves a checkpoint."""
+    return os.path.isfile(os.path.join(path, "trainer_state.json"))
+
+
+def _dir_bytes(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def prune_checkpoints(output: str, keep: int = KEEP_CHECKPOINTS) -> list[tuple[int, int]]:
+    """Delete all but the `keep` newest *complete* checkpoints. A checkpoint still
+    being written is never deleted and never counts toward `keep`. Returns
+    [(step, bytes_freed)] for what was removed."""
+    if keep < 1:
+        raise ValueError("keep must be >= 1")
+    complete = sorted(step for step, p in _checkpoints(output).items() if _complete(p))
+    removed = []
+    for step in complete[:-keep]:
+        path = os.path.join(output, f"checkpoint-{step}")
+        size = _dir_bytes(path)
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append((step, size))
+    return removed
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def run_identity(run_path: str, run: dict[str, Any]) -> str:
+    """What a checkpoint belongs to: the run contract plus the exact training data.
+    Independent of the workdir path and the queue job, so the same run re-queued on
+    a new machine finds its mirror, and a different run never does."""
+    h = hashlib.sha256()
+    h.update(_sha256_file(run_path).encode())
+    h.update(_sha256_file(run["soup_yaml"]["data"]["train"]).encode())
+    return h.hexdigest()[:32]
+
+
+class CheckpointMirror:
+    """Copies the newest complete checkpoint to persistent storage, off the hot path.
+
+    Layout: <root>/<identity>/ckpt-<step>/ plus LATEST (step number) and
+    IDENTITY.json. Copies land in a temp dir and are renamed into place, and
+    LATEST is replaced atomically, so a crash never leaves a partial checkpoint
+    that looks valid. Only the newest mirrored checkpoint is kept."""
+
+    def __init__(self, root: str, identity: str, ev: Events) -> None:
+        self.dir = os.path.join(root, identity)
+        self.identity = identity
+        self.ev = ev
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._pending: tuple[int, str] | None = None
+
+    def latest(self) -> tuple[int, str] | None:
+        try:
+            with open(os.path.join(self.dir, "LATEST"), encoding="utf-8") as f:
+                step = int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+        path = os.path.join(self.dir, f"ckpt-{step}")
+        return (step, path) if _complete(path) else None
+
+    def _write_identity(self, run_path: str) -> None:
+        meta = {"identity": self.identity, "run_json_sha256": _sha256_file(run_path), "written_at": time.time()}
+        tmp = os.path.join(self.dir, ".IDENTITY.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        os.replace(tmp, os.path.join(self.dir, "IDENTITY.json"))
+
+    def _copy(self, step: int, src: str) -> None:
+        tmp = os.path.join(self.dir, f".tmp-ckpt-{step}")
+        dst = os.path.join(self.dir, f"ckpt-{step}")
+        try:
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.copytree(src, tmp)
+            shutil.rmtree(dst, ignore_errors=True)
+            os.replace(tmp, dst)
+            ptr = os.path.join(self.dir, ".LATEST.tmp")
+            with open(ptr, "w", encoding="utf-8") as f:
+                f.write(str(step))
+            os.replace(ptr, os.path.join(self.dir, "LATEST"))
+            for old in glob.glob(os.path.join(self.dir, "ckpt-*")):
+                if old != dst:
+                    shutil.rmtree(old, ignore_errors=True)
+            self.ev.emit("checkpoint_mirrored", step=step, path=dst, bytes=_dir_bytes(dst))
+        except OSError as e:  # mirroring is a safety net: report, never fail training
+            shutil.rmtree(tmp, ignore_errors=True)
+            self.ev.emit("checkpoint_mirror_failed", step=step, error=f"{type(e).__name__}: {e}"[:300])
+
+    def _worker(self) -> None:
+        while True:
+            with self._lock:
+                job, self._pending = self._pending, None
+                if job is None:
+                    self._thread = None
+                    return
+            self._copy(*job)
+
+    def submit(self, step: int, src: str, run_path: str) -> None:
+        """Mirror `src` in the background; a newer submit supersedes a queued older one."""
+        os.makedirs(self.dir, exist_ok=True)
+        if not os.path.exists(os.path.join(self.dir, "IDENTITY.json")):
+            self._write_identity(run_path)
+        with self._lock:
+            self._pending = (step, src)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._worker, name="ckpt-mirror", daemon=True)
+                self._thread.start()
+
+    def wait(self, timeout: float = 600.0) -> None:
+        t = self._thread
+        if t is not None:
+            t.join(timeout)
+
+    def restore_into(self, output: str) -> int | None:
+        """Copy the mirrored checkpoint into `output` when `output` has none.
+        Only called after the identity matched (same run contract and data)."""
+        if _checkpoints(output):
+            return None
+        found = self.latest()
+        if found is None:
+            return None
+        step, src = found
+        os.makedirs(output, exist_ok=True)
+        tmp = os.path.join(output, f".restore-{step}")
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.copytree(src, tmp)
+        os.replace(tmp, os.path.join(output, f"checkpoint-{step}"))
+        return step
+
+    def discard(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def _write_mirror_pointer(mirror: CheckpointMirror) -> None:
+    """Tell the batch where this run's mirror lives, so it can delete it after save."""
+    with open(".ckpt-mirror", "w", encoding="utf-8") as f:
+        f.write(mirror.dir + "\n")
+
+
 def train(run: dict[str, Any], ev: Events, preflight_result: dict[str, Any]) -> int:
     import yaml  # type: ignore[import-not-found]
 
@@ -354,6 +518,15 @@ def train(run: dict[str, Any], ev: Events, preflight_result: dict[str, Any]) -> 
     if os.environ.get("MLFLOW_TRACKING_URI"):
         cmd += ["--tracker", "mlflow"]
     output = os.path.abspath(cfg["output"])
+    run_path = os.path.abspath(run.get("_path", "run.json"))
+    mirror = None
+    if MIRROR_ROOT:
+        mirror = CheckpointMirror(MIRROR_ROOT, run_identity(run_path, run), ev)
+        _write_mirror_pointer(mirror)
+        ev.emit("checkpoint_mirror", dir=mirror.dir, keep_local=KEEP_CHECKPOINTS)
+        restored = mirror.restore_into(output)
+        if restored is not None:
+            ev.emit("checkpoint_restored", step=restored, source=mirror.dir)
     if _checkpoints(output):
         cmd += ["--resume", "auto"]
     ev.emit("started", command=cmd)
@@ -372,23 +545,16 @@ def train(run: dict[str, Any], ev: Events, preflight_result: dict[str, Any]) -> 
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
 
-    seen_ckpt: set[int] = set()
+    # Checkpoints present at launch (a local resume or a restore) are already
+    # mirrored; only new ones are reported, mirrored and trigger pruning.
+    seen_ckpt: set[int] = {st for st, p in _checkpoints(output).items() if _complete(p)}
     seen_step = -1
     while child.poll() is None:
         time.sleep(5)
-        for step, path in sorted(_checkpoints(output).items()):
-            if step in seen_ckpt:
-                continue
-            seen_ckpt.add(step)
-            ev.emit("checkpoint", step=step, path=os.path.relpath(path))
-            state = os.path.join(path, "trainer_state.json")
-            if os.path.exists(state):
-                with open(state, encoding="utf-8") as f:
-                    for entry in json.load(f).get("log_history", []):
-                        s = int(entry.get("step", -1))
-                        if s > seen_step:
-                            seen_step = s
-                            ev.emit("metrics", step=s, metrics={k: v for k, v in entry.items() if k != "step"})
+        seen_step = _scan_checkpoints(output, seen_ckpt, seen_step, ev, mirror, run_path)
+    seen_step = _scan_checkpoints(output, seen_ckpt, seen_step, ev, mirror, run_path)  # final save
+    if mirror is not None:
+        mirror.wait()
     rc = child.returncode
     if interrupted["flag"]:
         ev.emit("interrupted", returncode=rc)
@@ -398,8 +564,50 @@ def train(run: dict[str, Any], ev: Events, preflight_result: dict[str, Any]) -> 
     for required in ("adapter_config.json", "adapter_model.safetensors"):
         if not os.path.exists(os.path.join(output, required)):
             return _fail(ev, EXIT_TRAIN, f"training finished but {required} is missing in {output}")
-    ev.emit("done", adapter_dir=os.path.relpath(output), trained_tokens=preflight_result["trained_tokens"])
+    ev.emit(
+        "done",
+        adapter_dir=os.path.relpath(output),
+        trained_tokens=preflight_result["trained_tokens"],
+        checkpoint_mirror=mirror.dir if mirror is not None else None,
+    )
+    # The mirror is kept until the batch has copied the adapter to persistent
+    # storage (run_batch.sh deletes it after save_run): a host lost between
+    # training and that copy then resumes from the last checkpoint, not step 0.
     return EXIT_OK
+
+
+def _scan_checkpoints(
+    output: str,
+    seen_ckpt: set[int],
+    seen_step: int,
+    ev: Events,
+    mirror: CheckpointMirror | None,
+    run_path: str,
+) -> int:
+    """Report new complete checkpoints (and their metrics), mirror the newest, prune old ones."""
+    newest = None
+    for step, path in sorted(_checkpoints(output).items()):
+        if step in seen_ckpt or not _complete(path):
+            continue
+        seen_ckpt.add(step)
+        newest = (step, path)
+        ev.emit("checkpoint", step=step, path=os.path.relpath(path))
+        with open(os.path.join(path, "trainer_state.json"), encoding="utf-8") as f:
+            for entry in json.load(f).get("log_history", []):
+                s = int(entry.get("step", -1))
+                if s > seen_step:
+                    seen_step = s
+                    ev.emit("metrics", step=s, metrics={k: v for k, v in entry.items() if k != "step"})
+    if newest is not None:
+        if mirror is not None:
+            # Wait for the previous copy before pruning, so the mirror never reads a
+            # checkpoint that pruning is deleting.
+            mirror.wait()
+            mirror.submit(newest[0], newest[1], run_path)
+            mirror.wait()
+        for step, freed in prune_checkpoints(output):
+            ev.emit("checkpoint_pruned", step=step, bytes_freed=freed)
+    return seen_step
 
 
 def main() -> int:
@@ -408,6 +616,7 @@ def main() -> int:
     args = ap.parse_args()
     with open(args.run, encoding="utf-8") as f:
         run = json.load(f)
+    run["_path"] = os.path.abspath(args.run)
     ev = Events("events.jsonl")
     # The flock must live as long as this process: it is what stops a second
     # worker from training in the same directory.

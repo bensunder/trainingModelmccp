@@ -38,6 +38,13 @@ OOD_N="${OOD_N:-200}"
 SAVE_STEPS="${SAVE_STEPS:-100}"
 GPU_USD_PER_HOUR="${GPU_USD_PER_HOUR:-0.35}"
 RUNS="${RUNS:-/root/mccp-runs}"
+# Checkpoint mirror on persistent storage (only /workspace survives a Stop or a
+# lost host). CKPT_MIRROR=0 turns it off; the trainer keeps 2 local checkpoints either way.
+if [ "${CKPT_MIRROR:-1}" = 1 ] && [ -d /workspace ]; then
+  CKPT_MIRROR_ROOT="${CKPT_MIRROR_ROOT:-/workspace/mccp-ckpt}"
+else
+  CKPT_MIRROR_ROOT=""
+fi
 REPO="${REPO:-/root/mccp}"
 export PATH="$HOME/.local/bin:$PATH"
 eval "$(cd "$REPO" && uv run python deploy/gpu/pilot.py profile-env --profile "$PROFILE")" \
@@ -165,7 +172,8 @@ for V in "${VARIANTS[@]}"; do
   else
     say "training $M n=$S seed $SEED (resumes from the last checkpoint if interrupted)"
     T0=$(date +%s)
-    (cd "$W" && nohup "$TRAINER_PY" "$REPO/trainer/mccp_trainer_entry.py" --run run.json > trainer.out 2>&1 &)
+    (cd "$W" && MCCP_CKPT_MIRROR_ROOT="$CKPT_MIRROR_ROOT" MCCP_KEEP_CHECKPOINTS="${KEEP_CHECKPOINTS:-2}" \
+       nohup "$TRAINER_PY" "$REPO/trainer/mccp_trainer_entry.py" --run run.json > trainer.out 2>&1 &)
     sleep 20
   fi
   wait_training "$W" || die "training failed for $M n=$S seed $SEED (details above)"
@@ -225,6 +233,7 @@ for V in "${VARIANTS[@]}"; do
   IFS=: read -r M S SEED <<<"$V"
   W="$(wdir "$M" "$S" "$SEED")"
   save_run "$W" "$DEST/$(basename "$W")"
+  drop_mirror "$W" "$DEST/$(basename "$W")"
 done
 cp "$LOG" "$DEST/batch.log.txt" 2>/dev/null
 cp "$RUNS/vllm-$TAG.log" "$DEST/vllm.log.txt" 2>/dev/null

@@ -37,6 +37,40 @@ spent, GPU work started by hand is waited for, and results land in `/workspace/m
 Stop). The key is stored in `/root/.mccp/secrets.env` (mode 600) and never appears on a command line or in a log.
 State lives in `/root/.mccp` (queue, finished runs, runner log).
 
+## Long runs: checkpoint safety and frozen code
+
+Three controls make multi-hour runs (10k+ records) safe on a rented box:
+
+* **Local disk is capped.** The trainer keeps only the **2 newest complete**
+  checkpoints and deletes older ones as training goes (`checkpoint_pruned`
+  events with bytes freed). A checkpoint counts as complete once
+  `trainer_state.json` exists, which the training library writes last, so one
+  still being saved is never deleted and never counted. `KEEP_CHECKPOINTS=N`
+  changes the count. The disk used is 2 x the size of one checkpoint.
+* **The newest checkpoint is mirrored to `/workspace`** (`/workspace/mccp-ckpt/<run identity>/`),
+  which survives a Stop or a lost host. The copy lands in a temporary folder and
+  is renamed into place, and the `LATEST` pointer is replaced the same way, so a
+  crash mid-copy never leaves a broken checkpoint that looks valid. Only one
+  mirrored checkpoint is kept per run. The **run identity** is a hash of
+  `run.json` and the training data: a different config or different data looks
+  in a different folder, so a run can never resume from another run's
+  checkpoint. The mirror is deleted once the batch has saved the adapter and
+  confirmed the saved copy is byte-identical. `CKPT_MIRROR=0` turns mirroring off.
+* **Each job is frozen to a commit at queue time.** `queue add` records the
+  newest commit on `main` (or `--commit SHA`) and builds that release
+  immediately. The runner executes the job on that commit, and release cleanup
+  never deletes a release a queued job needs. Pushing to `main` changes only
+  jobs queued afterwards. Rows queued by older versions of the tool still run
+  the newest commit at start.
+
+**If the host is lost mid-run** (the queue lives on the lost machine; `/workspace`
+does not): on the new machine, run the `--commit` line that `queue add` printed
+(`mccp-gpu queue add ... --commit <sha>`). Same commit, same options, so the
+data is rebuilt byte-for-byte. The trainer finds the mirror with a matching
+identity, copies it in and resumes from that step (`checkpoint_restored` in
+`events.jsonl`). At most one checkpoint interval (100 steps, about 30 minutes on
+an RTX 4000 Ada) is redone.
+
 ## Run it by hand (advanced)
 
 ```bash
