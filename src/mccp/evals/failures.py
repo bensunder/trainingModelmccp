@@ -97,6 +97,12 @@ def classify_id(expected: Any, got: Any, text: str, digits_only: bool) -> str:
     return "wrong_value_on_page" if got_on else "invented_or_misread"
 
 
+def _field_ok(suite: Any, e: Any, g: Any) -> bool:
+    from mccp.examples.invcdip import normalized_equal
+
+    return normalized_equal(e, g) if suite.field_match == "normalized" else g == e
+
+
 def classify_rows(
     rows: list[dict[str, Any]],
     suite: Any,
@@ -104,18 +110,22 @@ def classify_rows(
     texts: dict[str, str] | None = None,
     validator: Any = None,
 ) -> dict[str, Any]:
-    """Classify the wrong fields of saved answers (`<report>.<set>.<target>.outputs.jsonl`).
-    `texts` ({source_id: model input}) fills in rows saved before inputs were recorded;
-    `validator` re-validates rows saved before validation existed, so their outcome is
-    what the current pipeline would do, not counted as undetected."""
-    from mccp.examples.invcdip import normalized_equal
+    """Re-score saved answers (`<report>.<set>.<target>.outputs.jsonl`) under the
+    CURRENT parser, schema and validator (the model's answers do not change when
+    that code does, so this is exact and needs no GPU), classify every wrong field,
+    and simulate flag-based blocking policies.
+
+    `texts` ({source_id: model input}) fills in rows saved before inputs were recorded."""
+    import jsonschema
 
     texts = texts or {}
     causes: dict[str, Counter] = defaultdict(Counter)
     caught: dict[str, Counter] = defaultdict(Counter)
     examples: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     outcomes: Counter = Counter()
-    flag_hits: dict[str, Counter] = defaultdict(Counter)  # flag -> {correct, wrong}
+    flag_hits: dict[str, Counter] = defaultdict(Counter)  # flag -> {correct, wrong} among auto-decided
+    refused_shapes: Counter = Counter()  # what the parser refused, digits as 9
+    passed: list[tuple[str, bool, frozenset[str]]] = []  # (source_id, correct, flags) of auto-decided rows
     missing_text = 0
     for r in rows:
         if r.get("kind") != "final":
@@ -129,39 +139,37 @@ def classify_rows(
             got_raw = json.loads(r.get("content") or "")
         except json.JSONDecodeError:
             got_raw = None
-        valid = bool(r.get("json_valid")) and isinstance(got_raw, dict)
-        verdict = r.get("validation")
-        if verdict is None and validator is not None and valid and text:
-            verdict = validator(got_raw, normalize(got_raw)[0] if normalize else got_raw, text).to_dict()
-        blocked = bool((verdict or {}).get("blocking"))
-        outcome = (
-            "human_review"
-            if (not valid or blocked)
-            else ("auto_correct" if (r.get("score") or 0) >= 1 else "auto_wrong")
-        )
-        outcomes[outcome] += 1
-        for f in (verdict or {}).get("flags", []):
-            if f.startswith("arithmetic_"):
-                continue
-            flag_hits[f]["on_correct" if (r.get("score") or 0) >= 1 else "on_wrong"] += 1
-        if not isinstance(got_raw, dict):
-            if (r.get("score") or 0) < 1:
-                causes["(whole answer)"]["invalid_json"] += 1
-                caught["(whole answer)"]["invalid_json"] += 1
+        if not isinstance(got_raw, dict) or r.get("error"):
+            outcomes["human_review"] += 1
+            causes["(whole answer)"]["invalid_json_or_error"] += 1
+            caught["(whole answer)"]["invalid_json_or_error"] += 1
             continue
         got = normalize(got_raw)[0] if normalize else got_raw
-        for f in suite.compare_fields:
-            e = exp.get(f)
-            if e is None and suite.field_match == "normalized":
-                continue  # unlabelled: not scored
-            g = got.get(f)
-            same = normalized_equal(e, g) if suite.field_match == "normalized" else (g == e)
-            if same:
-                continue
+        try:
+            jsonschema.validate(got, suite.output_schema)
+            valid = True
+        except jsonschema.ValidationError:
+            valid = False
+        scored = [f for f in suite.compare_fields if not (exp.get(f) is None and suite.field_match == "normalized")]
+        wrong = [f for f in scored if not (valid and _field_ok(suite, exp.get(f), got.get(f)))]
+        correct = not wrong
+        verdict = validator(got_raw, got, text).to_dict() if (validator is not None and valid and text) else None
+        blocked = (not valid) or bool((verdict or {}).get("blocking"))
+        outcome = "human_review" if blocked else ("auto_correct" if correct else "auto_wrong")
+        outcomes[outcome] += 1
+        flags = frozenset(f for f in (verdict or {}).get("flags", []) if not f.startswith("arithmetic_"))
+        if not blocked:
+            passed.append((str(r.get("source_id")), correct, flags))
+            for f in flags:
+                flag_hits[f]["on_correct" if correct else "on_wrong"] += 1
+        for f in wrong:
+            e, g = exp.get(f), got.get(f)
             if f in AMOUNT_FIELDS:
                 cause = classify_amount(float(e), g, got_raw.get(AMOUNT_FIELDS[f]), text)
                 if cause == "wrong_amount_on_page":
                     cause += f" ({line_kind(float(g), text)})"
+                if cause == "unparseable_copy":
+                    refused_shapes[re.sub(r"\d", "9", str(got_raw.get(AMOUNT_FIELDS[f])))[:40]] += 1
             elif f == "billed_qty":
                 cause = (
                     "missing"
@@ -173,12 +181,8 @@ def classify_rows(
                     )
                 )
             else:
-                cause = classify_id(
-                    e,
-                    g,
-                    text,
-                    digits_only=f in ("invoice_id", "po_number", "vendor_id") and suite.field_match == "exact",
-                )
+                digits = f in ("invoice_id", "po_number", "vendor_id") and suite.field_match == "exact"
+                cause = classify_id(e, g, text, digits_only=digits)
             causes[f][cause] += 1
             if outcome == "human_review":
                 caught[f][cause] += 1
@@ -189,8 +193,8 @@ def classify_rows(
                         "expected": e,
                         "got": got_raw.get(AMOUNT_FIELDS.get(f, f), g),
                         "outcome": outcome,
-                        "blocking": (verdict or {}).get("blocking", []),
-                        "flags": (verdict or {}).get("flags", []),
+                        "blocking": (verdict or {}).get("blocking", []) or ([] if valid else ["schema"]),
+                        "flags": sorted(flags),
                         "line": _line_with(e, text),
                         "answer": got_raw,
                     }
@@ -202,10 +206,50 @@ def classify_rows(
         "caught_by_validation": {f: dict(c) for f, c in caught.items()},
         "examples": {f"{f} | {c}": v for (f, c), v in examples.items()},
         "rows_without_input_text": missing_text,
-        # Would a flag make a good blocking rule? Hits on correct answers = extra human
-        # review if it blocked; hits on wrong answers = errors it would stop.
+        # Hits on correct answers = extra human reviews if the flag blocked; on wrong
+        # answers = errors it would stop. Counted among auto-decided answers only.
         "flags": {f: dict(c) for f, c in flag_hits.items()},
+        "refused_amount_shapes": dict(refused_shapes.most_common(15)),
+        "policies": simulate_policies(passed, dict(outcomes)),
     }
+
+
+def simulate_policies(passed: list[tuple[str, bool, frozenset[str]]], outcomes: dict[str, int]) -> list[dict[str, Any]]:
+    """For every combination of flags (as one blocking rule: block when ANY flag in
+    the combination is raised), on the union of flagged invoices (never summed):
+    wrong invoices stopped, correct ones sent to a person, and the resulting rates."""
+    from itertools import combinations
+
+    n = sum(outcomes.values()) or 1
+    base_wrong = sum(1 for _, ok, _ in passed if not ok)
+    base_human = outcomes.get("human_review", 0)
+    names = sorted({f for _, _, fl in passed for f in fl})
+    out = [
+        {
+            "block_on": [],
+            "stops_wrong": 0,
+            "extra_reviews_of_correct": 0,
+            "auto_correct": round((len(passed) - base_wrong) / n, 4),
+            "human_review": round(base_human / n, 4),
+            "auto_wrong": round(base_wrong / n, 4),
+        }
+    ]
+    for k in range(1, len(names) + 1):
+        for combo in combinations(names, k):
+            hit = [(sid, ok) for sid, ok, fl in passed if fl & set(combo)]  # union of flagged invoices
+            stops = sum(1 for _, ok in hit if not ok)
+            extra = sum(1 for _, ok in hit if ok)
+            out.append(
+                {
+                    "block_on": list(combo),
+                    "stops_wrong": stops,
+                    "extra_reviews_of_correct": extra,
+                    "auto_correct": round((len(passed) - base_wrong - extra) / n, 4),
+                    "human_review": round((base_human + len(hit)) / n, 4),
+                    "auto_wrong": round((base_wrong - stops) / n, 4),
+                }
+            )
+    return out
 
 
 def _line_with(expected: Any, text: str) -> str | None:

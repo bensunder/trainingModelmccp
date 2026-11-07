@@ -85,7 +85,13 @@ def normalize_extraction(obj: Any) -> tuple[Any, list[dict[str, Any]]]:
 EXTRACT_NORMALIZER_ID = "invoice-extract@v2"  # ids (v1 rules) + unit_price_raw -> unit_price_billed
 REALDOC_NORMALIZER_ID = "realdoc-amounts@v1"  # total_amount_raw -> total_amount
 
-_CURRENCY = re.compile(r"^(?:usd|us\$|\$|us\s*\$)\s*|\s*(?:usd|dollars?)$", re.IGNORECASE)
+# Currency written out around the amount ("U.S. DOLLARS 62000.00", "$", "USD"). A credit
+# marker ("CR", "-", parentheses) is deliberately NOT accepted: it flips the sign, so such
+# an amount is refused and goes to a person.
+_CURRENCY = re.compile(
+    r"^(?:u\.?\s*s\.?\s*(?:dollars?|\$)|us\s*\$|usd|dollars?|\$)\s*|\s*(?:usd|u\.?\s*s\.?\s*dollars?|dollars?)$",
+    re.IGNORECASE,
+)
 _PER_UNIT = re.compile(r"\s*(?:/\s*(?:ea|each|unit|pc|pcs)\.?|each|per\s+unit|ea\.?)$", re.IGNORECASE)
 _MONEY = re.compile(r"^(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{0,2}))?$")
 

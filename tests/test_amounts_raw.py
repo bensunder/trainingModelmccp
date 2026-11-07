@@ -37,6 +37,14 @@ REALDOC = EvalSuite.model_validate(yaml.safe_load((ROOT / "examples/suite-invoic
         ("$3,000.", 3000.0),
         ("8,333.00~", 8333.0),
         ("****49140.00", 49140.0),
+        ("U.S.DOLLARS  62000.00", 62000.0),  # seen on real scans
+        ("U.S. DOLLARS 60,000.00", 60000.0),
+        ("62000.00 U.S. Dollars", 62000.0),
+        # credit markers flip the sign: never accepted, a person reads them
+        ("316:77 CR", None),
+        ("316.77 CR", None),
+        ("(316.77)", None),
+        ("-316.77", None),
         (857.74, 857.74),
         # refused: a human must read these
         ("$35.805.60", None),

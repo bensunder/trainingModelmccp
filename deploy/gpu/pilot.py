@@ -1090,6 +1090,21 @@ def failures(args: argparse.Namespace) -> int:
                 for c, k in cs.items():
                     got_caught = res["caught_by_validation"].get(f, {}).get(c, 0)
                     print(f"      {c:44} {k:4}   caught {got_caught:4}   auto_wrong {k - got_caught:4}")
+            pols = res.get("policies") or []
+            if len(pols) > 1:
+                print("   policy simulation (block when ANY listed flag is raised; union of invoices, not sums):")
+                print(
+                    f"      {'block on':52} {'stops wrong':>11} {'extra reviews':>13} {'auto_correct':>12} {'human':>7} {'auto_wrong':>10}"
+                )
+                for p in pols:
+                    name = " + ".join(p["block_on"]) or "(nothing: current)"
+                    print(
+                        f"      {name:52} {p['stops_wrong']:11} {p['extra_reviews_of_correct']:13}"
+                        f" {p['auto_correct'] * 100:11.1f}% {p['human_review'] * 100:6.1f}% {p['auto_wrong'] * 100:9.1f}%"
+                    )
+            shapes = res.get("refused_amount_shapes") or {}
+            if shapes:
+                print("   refused amount copies by shape: " + "  ".join(f"{k!r}x{v}" for k, v in shapes.items()))
             for f, c in (res.get("flags") or {}).items():
                 print(
                     f"   flag {f}: on correct answers {c.get('on_correct', 0)}, on wrong answers {c.get('on_wrong', 0)}"

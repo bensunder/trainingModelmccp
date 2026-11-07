@@ -295,3 +295,39 @@ def test_invoice_number_label_flag():
     near = vr(None, {"invoice_number": "951695", "po_number": None, "total_amount": None}, page)
     far = vr(None, {"invoice_number": "0000000500", "po_number": None, "total_amount": None}, page)
     assert "invoice_number_not_near_label" not in near.flags and "invoice_number_not_near_label" in far.flags
+
+
+def test_policy_simulation_uses_the_union_of_flagged_invoices():
+    from mccp.evals.failures import simulate_policies
+
+    passed = [
+        ("a", True, frozenset()),
+        ("b", True, frozenset({"x"})),
+        ("c", False, frozenset({"x", "y"})),  # flagged by both: stopped once, not twice
+        ("d", False, frozenset({"y"})),
+        ("e", False, frozenset()),
+    ]
+    pols = {
+        tuple(p["block_on"]): p
+        for p in simulate_policies(passed, {"auto_correct": 2, "auto_wrong": 3, "human_review": 5})
+    }
+    assert pols[()]["auto_wrong"] == 0.3 and pols[()]["human_review"] == 0.5
+    assert (pols[("x",)]["stops_wrong"], pols[("x",)]["extra_reviews_of_correct"]) == (1, 1)
+    both = pols[("x", "y")]
+    assert (both["stops_wrong"], both["extra_reviews_of_correct"]) == (2, 1)  # c counted once
+    assert both["auto_wrong"] == 0.1 and both["human_review"] == 0.8 and both["auto_correct"] == 0.1
+
+
+def test_classifier_rescores_with_current_code_not_saved_scores():
+    """A saved row marked invalid/wrong at evaluation time is judged by today's parser:
+    'U.S.DOLLARS 62000.00' was refused then and parses now."""
+    exp = {"invoice_number": "77", "po_number": None, "total_amount_raw": "62000.00"}
+    page = "INVOICE 77\nTOTAL U.S.DOLLARS 62000.00"
+    row = {
+        "kind": "final", "source_id": "fklk0189", "expected": json.dumps(exp), "json_valid": False, "score": 0.0,
+        "content": json.dumps({**exp, "total_amount_raw": "U.S.DOLLARS  62000.00"}), "input": page,
+    }  # fmt: skip
+    from mccp.rules.validation import validate_realdoc as v
+
+    res = classify_rows([row], REALDOC, normalize_realdoc, validator=v)
+    assert res["outcomes"] == {"auto_correct": 1}
