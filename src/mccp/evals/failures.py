@@ -184,7 +184,10 @@ def classify_rows(
                         "expected": e,
                         "got": got_raw.get(AMOUNT_FIELDS.get(f, f), g),
                         "outcome": outcome,
+                        "blocking": (verdict or {}).get("blocking", []),
+                        "flags": (verdict or {}).get("flags", []),
                         "line": _line_with(e, text),
+                        "answer": got_raw,
                     }
                 )
     return {
