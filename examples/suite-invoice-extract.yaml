@@ -2,15 +2,18 @@
 # returns its facts; the policy in mccp.rules.invoice_triage looks up the PO and
 # vendor by the extracted ids and makes the decision. `compare_fields` scores the
 # extraction field by field; decision accuracy is scored on the policy's output.
-# output_schema must equal mccp.examples.invoices.EXTRACT_SCHEMA (tested).
+# output_schema must equal mccp.examples.invoices.EXTRACT_SCHEMA and raw_output_schema
+# EXTRACT_RAW_SCHEMA (tested). v2: the model copies the unit price as printed
+# (unit_price_raw); code parses it (v1 asked the model for a number and it dropped
+# decimal points on real scans).
 name: invoice-extract-suite
-version: 1
+version: 2
 golden: finance-ops/invoice-exceptions-extract@v1:test
 compare_fields: [invoice_id, po_number, vendor_id, billed_qty, unit_price_billed]
 decision_rules: invoice-triage-rules@v1
 # Canonical id formats (P.O. 4500... -> PO-4500...) are applied in code before the schema
 # check, exactly as in serving; json_validity_raw still reports what the model wrote.
-output_normalizer: invoice-extract-ids@v1
+output_normalizer: invoice-extract@v2
 max_items: 500
 effect_probes: 5
 sampling: {temperature: 0.0, max_tokens: 256, seed: 0}
@@ -24,6 +27,16 @@ output_schema:
     vendor_id: {type: string, pattern: "^V-[0-9]+$"}
     billed_qty: {type: integer, minimum: 0}
     unit_price_billed: {type: number, minimum: 0}
+raw_output_schema:
+  type: object
+  additionalProperties: false
+  required: [invoice_id, po_number, vendor_id, billed_qty, unit_price_raw]
+  properties:
+    invoice_id: {type: string, pattern: "^INV-[0-9]+$"}
+    po_number: {type: string, pattern: "^PO-[0-9]+$"}
+    vendor_id: {type: string, pattern: "^V-[0-9]+$"}
+    billed_qty: {type: integer, minimum: 0}
+    unit_price_raw: {type: string, minLength: 1}
 safety:
   guard_model: Qwen/Qwen3Guard-Gen-4B
   guard_base_url: http://vllm-guard:8001

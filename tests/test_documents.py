@@ -51,7 +51,7 @@ def test_clean_scan_ocr_contains_the_facts(docs):
     facts = json.loads(clean["messages"][2]["content"])
     for k in ("invoice_id", "po_number", "vendor_id"):
         assert facts[k].split("-")[1] in text, k
-    assert f"{facts['unit_price_billed']:,.2f}" in text
+    assert facts["unit_price_raw"].replace(" ", "") in text  # the label is the printed price
 
 
 def test_documents_are_deterministic():
@@ -83,7 +83,7 @@ def test_add_set_docs_cli_caches_the_generated_set(tmp_path):
     assert json.loads(first.stdout.strip().splitlines()[-1])["cache"].startswith("written")
     second = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     summary = json.loads(second.stdout.strip().splitlines()[-1])
-    assert summary["cache"] == "hit" and summary["records"] == 2
+    assert summary["cache"].startswith("hit") and summary["records"] == 2 and summary["ocr_reused"] == 2
     rows = [json.loads(x) for x in (w / "data/golden_docs.jsonl").read_text().splitlines()]
     assert all(r["meta"]["task"] == "extract" for r in rows)
     assert (w / "set_docs.json").exists()
@@ -113,9 +113,11 @@ def _ann(**fields):
 
 def test_labels_use_total_then_amount_due_and_leave_unlabelled_as_none():
     a = invcdip.labels(_ann(Invoice_number="9765-3009", total_amount="$755.00"))
-    assert a == {"invoice_number": "9765-3009", "po_number": None, "total_amount": 755.0}
+    assert a == {"invoice_number": "9765-3009", "po_number": None, "total_amount_raw": "$755.00"}
     b = invcdip.labels(_ann(Invoice_number="1", amount_due="$5,450.00", Purchase_order="M11794"))
-    assert b == {"invoice_number": "1", "po_number": "M11794", "total_amount": 5450.0}
+    assert b == {"invoice_number": "1", "po_number": "M11794", "total_amount_raw": "$5,450.00"}
+    c = invcdip.labels(_ann(Invoice_number="2", total_amount="1,66667"))  # unreadable label: not scored
+    assert c["total_amount_raw"] is None
 
 
 @pytest.mark.parametrize(
@@ -188,7 +190,7 @@ def test_generate_invcdip_downloads_ocrs_caches_and_reports_failures(tmp_path):
     assert all(r["meta"]["license"] == "cc-by-nc-4.0" for r in recs)
     assert f"{invcdip.doc_path(ids[0])}/{ids[0]}/{ids[0]}.pdf" in calls[1]
     exp = json.loads(recs[0]["messages"][2]["content"])
-    assert exp == {"invoice_number": "770000-A", "po_number": "PO00000", "total_amount": 1000.0}
+    assert exp == {"invoice_number": "770000-A", "po_number": "PO00000", "total_amount_raw": "$1,000.00"}
     assert invcdip.ocr_ceiling(recs)["invoice_number"] == 1.0
     n_calls = len(calls)
     again, info2 = invcdip.generate_invcdip(tmp_path, n=4, opener=opener)
@@ -266,3 +268,42 @@ def test_evaluate_refuses_to_mix_invcdip_with_other_sets(tmp_path, capsys):
     )
     assert asyncio.run(pilot._evaluate(args)) == 2
     assert "score invcdip on its own" in capsys.readouterr().err
+
+
+def test_ocr_reuse_rebuilds_records_without_rendering(monkeypatch):
+    from mccp.examples import documents
+
+    fresh = generate_documents(3, seed=21)
+    texts = documents.ocr_texts_from_records(fresh)
+
+    def no_render(*a, **k):
+        raise AssertionError("rendered although the OCR text was cached")
+
+    monkeypatch.setattr(documents, "render_pdf", no_render)
+    assert generate_documents(3, seed=21, ocr_texts=texts) == fresh  # same cases, labels, prompts
+
+
+def test_add_set_docs_reuses_a_legacy_ocr_cache(tmp_path):
+    """The box holds docs-<task>-n<N>-s<seed>-<hash>.jsonl from the first docs run;
+    its OCR text must be reused (no re-OCR) and the records rebuilt by current code."""
+    from mccp.examples import documents
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    old = generate_documents(2, seed=5151)
+    for r in old:  # mark the cached text so reuse is visible
+        r["messages"][1]["content"] += "\nCACHED-MARK"
+    legacy = cache / f"docs-extract-n2-s5151-{documents.LEGACY_RENDER_HASHES[0]}.jsonl"
+    legacy.write_text("".join(json.dumps(r) + "\n" for r in old))
+    w = tmp_path / "w"
+    (w / "data").mkdir(parents=True)
+    (w / "pilot.json").write_text(json.dumps({"profile": "qwen3-8b@v1", "task": "extract"}))
+    cmd = [sys.executable, str(ROOT / "deploy/gpu/pilot.py"), "add-set", "--set", "docs", "--workdir", str(w)]
+    r = subprocess.run([*cmd, "--n", "2", "--cache", str(cache)], capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    summary = json.loads(r.stdout.strip().splitlines()[-1])
+    assert summary["ocr_reused"] == 2 and legacy.name in summary["cache"]
+    rows = [json.loads(x) for x in (w / "data/golden_docs.jsonl").read_text().splitlines()]
+    assert all("CACHED-MARK" in x["messages"][1]["content"] for x in rows)
+    assert all("unit_price_raw" in json.loads(x["messages"][2]["content"]) for x in rows)  # rebuilt, v2 labels
+    assert (cache / f"docs-ocr-r{documents.RENDER_VERSION}-n2-s5151.jsonl").exists()

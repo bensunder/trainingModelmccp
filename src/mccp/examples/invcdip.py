@@ -37,14 +37,25 @@ ANNOTATIONS_URL = f"https://codeload.github.com/salesforce/inv-cdip/tar.gz/{ANNO
 DOC_URL = "https://ucsf-idl-dataset.s3.amazonaws.com/{path}/{id}/{id}.pdf"
 LICENSE_NOTE = "INV-CDIP annotations CC BY-NC 4.0; documents under UCSF IDL copyright/fair-use terms; internal use"
 
-REALDOC_FIELDS = ["invoice_number", "po_number", "total_amount"]
+REALDOC_FIELDS = ["invoice_number", "po_number", "total_amount"]  # canonical, scored
+REALDOC_MODEL_FIELDS = ["invoice_number", "po_number", "total_amount_raw"]  # what the model writes
 REALDOC_SYSTEM_PROMPT = (
     "You read the OCR text of a scanned vendor invoice and extract three facts. Reply with only a JSON "
-    "object with keys invoice_number, po_number and total_amount. Copy invoice_number and po_number "
+    "object with keys invoice_number, po_number and total_amount_raw. Copy invoice_number and po_number "
     "exactly as printed (the buyer's purchase order number, not a PO Box); use null when the invoice does "
-    "not show one. total_amount is the total amount payable as a number without currency symbols or "
-    "thousands separators, or null."
+    "not show one. For total_amount_raw copy the total amount payable exactly as printed, as text, "
+    "including any currency symbol, or null; do not reformat it."
 )
+REALDOC_RAW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": REALDOC_MODEL_FIELDS,
+    "properties": {
+        "invoice_number": {"type": ["string", "null"]},
+        "po_number": {"type": ["string", "null"]},
+        "total_amount_raw": {"type": ["string", "null"]},
+    },
+}
 REALDOC_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -56,29 +67,28 @@ REALDOC_SCHEMA: dict[str, Any] = {
     },
 }
 _LABELS = {"Invoice_number": "invoice_number", "Purchase_order": "po_number"}
-_AMOUNT = re.compile(r"^\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{0,2}))?$")
 
 
 def parse_amount(text: str) -> float | None:
     """'$1,533.54' -> 1533.54, '62000.00' -> 62000.0, '$3,000.' -> 3000.0.
-    Anything ambiguous ('1,66667', '.00') -> None (that label is not scored)."""
-    m = _AMOUNT.match(text.strip())
-    if not m:
-        return None
-    whole = m.group(1).replace(",", "")
-    cents = (m.group(2) or "").ljust(2, "0")
-    return round(float(f"{whole}.{cents}"), 2)
+    Anything ambiguous ('1,66667', '.00') -> None (that label is not scored).
+    The one amount parser is mccp.rules.extraction.parse_money; this is its name here."""
+    from mccp.rules.extraction import parse_money
+
+    return parse_money(text)
 
 
 def labels(annotation: dict[str, Any]) -> dict[str, Any]:
-    """Expected values from one annotation file; None = not labelled (not scored).
-    total_amount uses the 'total amount' label, else 'amount due'."""
+    """Expected values in the model's format; None = not labelled (not scored).
+    total_amount_raw is the annotated text of the 'total amount' label, else of
+    'amount due'; scoring parses it with the same code as the model's answer, and
+    an annotation the parser cannot read ('1,66667') is simply not scored."""
     found: dict[str, str] = {}
     for f in annotation["Fields"]:
         found.setdefault(f["value"]["label"], f["value"]["tag"])
     out: dict[str, Any] = {name: found.get(label) for label, name in _LABELS.items()}
     raw_total = found.get("total_amount") or found.get("amount_due")
-    out["total_amount"] = parse_amount(raw_total) if raw_total else None
+    out["total_amount_raw"] = raw_total if raw_total and parse_amount(raw_total) is not None else None
     return out
 
 

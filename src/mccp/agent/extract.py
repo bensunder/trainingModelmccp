@@ -28,7 +28,7 @@ import jsonschema
 
 from mccp.examples.invoices import EXTRACT_SCHEMA, EXTRACT_SYSTEM_PROMPT
 from mccp.rules import invoice_triage
-from mccp.rules.extraction import normalize_extraction
+from mccp.rules.extraction import normalize_extraction_v2
 
 ChatFn = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 LookupFn = Callable[[str], Any]  # returns a record, None / {"error": ...} when not found; may be async
@@ -39,9 +39,14 @@ ROUTE_HUMAN = "human_review"
 
 def parse_extraction(content: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Strict JSON (the model is trained to answer with the bare object), then the
-    deterministic id canonicalization (`invoice-extract-ids@v1`, digits never
-    changed), then the schema. Returns the facts and the canonicalizations made."""
-    obj, changes = normalize_extraction(json.loads(content))
+    deterministic `invoice-extract@v2` step (canonical ids, digits never changed;
+    the printed unit price parsed by code), then the schema. Returns the facts and
+    the changes made. A price the parser cannot read fails the schema, so the
+    invoice goes to a human instead of to a guessed number."""
+    obj, changes = normalize_extraction_v2(json.loads(content))
+    bad = [c for c in changes if c.get("error")]
+    if bad:
+        raise jsonschema.ValidationError(f"{bad[0]['error']}: {bad[0]['from']!r}")
     jsonschema.validate(obj, EXTRACT_SCHEMA)
     return obj, changes
 

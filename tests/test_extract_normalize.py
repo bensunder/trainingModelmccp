@@ -23,7 +23,13 @@ from mccp.evals.suite import EvalSuite
 from mccp.examples.invoices import generate
 from mccp.examples.messy import _po_text, _vid_text, generate_messy, make_case
 from mccp.rules import NORMALIZERS
-from mccp.rules.extraction import NORMALIZER_ID, canonical_id, normalize_extraction
+from mccp.rules.extraction import (
+    EXTRACT_NORMALIZER_ID,
+    NORMALIZER_ID,
+    canonical_id,
+    normalize_extraction,
+    normalize_extraction_v2,
+)
 from tests.conftest import ROOT
 
 SUITE = EvalSuite.model_validate(yaml.safe_load((ROOT / "examples/suite-invoice-extract.yaml").read_text()))
@@ -86,7 +92,8 @@ def test_normalize_records_changes_and_leaves_other_fields_alone():
     assert obj["po_number"] == "P.O. 45"  # input not mutated
     assert normalize_extraction(["not", "a", "dict"]) == (["not", "a", "dict"], [])
     assert NORMALIZERS[NORMALIZER_ID] is normalize_extraction
-    assert SUITE.output_normalizer == NORMALIZER_ID
+    assert NORMALIZERS[EXTRACT_NORMALIZER_ID] is normalize_extraction_v2
+    assert SUITE.output_normalizer == EXTRACT_NORMALIZER_ID
 
 
 def test_unknown_normalizer_is_rejected():
@@ -192,7 +199,7 @@ async def test_serving_canonicalizes_ids_and_records_the_change():
     lk = rec["meta"]["lookups"]
     out = await triage_extract(chat, "x", model="m", lookup_po=lk["po"].get, lookup_vendor=lk["vendor"].get)
     assert out["route"] == ROUTE_DECIDED and out["decision"] == rec["meta"]["expected"]
-    assert {c["field"] for c in out["normalized"]} == {"po_number", "vendor_id"}
+    assert {c["field"] for c in out["normalized"]} == {"po_number", "vendor_id", "unit_price_raw"}
     assert out["extracted"]["po_number"] == facts["po_number"]
 
 

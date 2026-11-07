@@ -94,7 +94,9 @@ async def test_lookup_outage_is_not_treated_as_not_found():
 
     out = await triage_extract(chat, "x", model="m", lookup_po=_lookups(rec)[0], lookup_vendor=down)
     assert out["route"] == ROUTE_HUMAN and "ConnectionError" in out["reason"]
-    assert out["extracted"] == json.loads(rec["messages"][2]["content"])  # kept for the reviewer
+    from mccp.rules.extraction import normalize_extraction_v2
+
+    assert out["extracted"] == normalize_extraction_v2(json.loads(rec["messages"][2]["content"]))[0]  # for the reviewer
 
 
 async def test_unknown_ids_hold_the_invoice():

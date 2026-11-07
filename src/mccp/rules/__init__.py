@@ -18,4 +18,6 @@ RULESETS: dict[str, Callable[[dict[str, Any], dict[str, Any]], invoice_triage.Ru
 # output schema check, identically in scoring and in serving.
 NORMALIZERS: dict[str, Callable[[Any], tuple[Any, list[dict[str, Any]]]]] = {
     extraction.NORMALIZER_ID: extraction.normalize_extraction,
+    extraction.EXTRACT_NORMALIZER_ID: extraction.normalize_extraction_v2,
+    extraction.REALDOC_NORMALIZER_ID: extraction.normalize_realdoc,
 }

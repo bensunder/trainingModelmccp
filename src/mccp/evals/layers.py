@@ -100,6 +100,7 @@ def score_item(
     fields: list[str],
     normalize: Callable[[Any], tuple[Any, list[dict[str, Any]]]] | None = None,
     match: str = "exact",
+    raw_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     msg = response["choices"][0]["message"]
     got_calls = msg.get("tool_calls") or []
@@ -129,12 +130,16 @@ def score_item(
         obj = json.loads(content)
     except json.JSONDecodeError:
         obj = None
-    raw_valid = _valid(obj, schema) if obj is not None else False
+    raw_valid = _valid(obj, raw_schema or schema) if obj is not None else False
     changes: list[dict[str, Any]] = []
     if obj is not None and normalize is not None:
         obj, changes = normalize(obj)
     valid = _valid(obj, schema) if obj is not None else False
     expected = json.loads(item.expected["content"])
+    if normalize is not None:
+        # The gold label is written in the model's format too (e.g. a printed amount):
+        # the same normalizer makes it canonical, so both sides are parsed identically.
+        expected = normalize(expected)[0]
     if match == "normalized":
         from mccp.examples.invcdip import normalized_equal
 
@@ -187,7 +192,9 @@ async def run_items(
                 resp = await chat(payload)
             except Exception as e:  # noqa: BLE001 - an endpoint error scores 0, recorded
                 return {"kind": it.kind, "score": 0.0, "error": str(e)[:200], "parsed": False, "json_valid": False}
-        return score_item(it, resp, suite.output_schema, suite.compare_fields, normalize, suite.field_match)
+        return score_item(
+            it, resp, suite.output_schema, suite.compare_fields, normalize, suite.field_match, suite.raw_output_schema
+        )
 
     from mccp.rules import NORMALIZERS
 
@@ -211,7 +218,12 @@ def summarize_l1(scores: list[dict[str, Any]]) -> dict[str, Any]:
             if finals and any("json_valid_raw" in s for s in finals)
             else None
         ),
-        "normalized_answers": sum(1 for s in finals if s.get("normalized")),
+        # answers whose ids code had to rewrite (amount parsing is not a rewrite)
+        "normalized_answers": sum(
+            1 for s in finals if any(not c["field"].endswith("_raw") for c in s.get("normalized") or [])
+        ),
+        # printed amounts the parser refused (routed to a human in serving)
+        "unparseable_amounts": sum(1 for s in finals if any(c.get("error") for c in s.get("normalized") or [])),
         # every scored field right (for real documents: every labelled field)
         "exact_record_rate": mean([float(s.get("score") == 1.0) for s in finals]) if finals else None,
         "field_accuracy": mean([s["score"] for s in finals]) if finals else None,

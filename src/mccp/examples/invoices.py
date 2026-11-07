@@ -303,13 +303,31 @@ def to_record(c: Case, user_text: str | None = None, meta: dict[str, Any] | None
 # The model reads the invoice and returns its facts; code does the lookups and
 # applies `mccp.rules.invoice_triage`. One model call per invoice, no tool calls.
 TASKS = ("agent", "extract")
+# Canonical facts (what the rules and the scoring use) ...
 EXTRACT_FIELDS = ["invoice_id", "po_number", "vendor_id", "billed_qty", "unit_price_billed"]
+# ... and what the model writes: the unit price exactly as printed. Code parses it
+# (mccp.rules.extraction, invoice-extract@v2); asking the model to strip symbols and
+# separators itself made it drop decimal points on real scans.
+EXTRACT_MODEL_FIELDS = ["invoice_id", "po_number", "vendor_id", "billed_qty", "unit_price_raw"]
 EXTRACT_SYSTEM_PROMPT = (
     "You read accounts-payable invoice exceptions and extract their facts. Reply with only a JSON object "
-    "with keys invoice_id, po_number, vendor_id, billed_qty and unit_price_billed. Write ids in canonical "
-    "form (INV-<digits>, PO-<digits>, V-<digits>), billed_qty as an integer and unit_price_billed as a "
-    "number in US dollars, without currency symbols or thousands separators."
+    "with keys invoice_id, po_number, vendor_id, billed_qty and unit_price_raw. Write ids in canonical "
+    "form (INV-<digits>, PO-<digits>, V-<digits>) and billed_qty as an integer. For unit_price_raw copy "
+    "the unit price exactly as printed on the invoice, as text, including any currency symbol; do not "
+    "reformat it."
 )
+EXTRACT_RAW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": EXTRACT_MODEL_FIELDS,
+    "properties": {
+        "invoice_id": {"type": "string", "pattern": "^INV-[0-9]+$"},
+        "po_number": {"type": "string", "pattern": "^PO-[0-9]+$"},
+        "vendor_id": {"type": "string", "pattern": "^V-[0-9]+$"},
+        "billed_qty": {"type": "integer", "minimum": 0},
+        "unit_price_raw": {"type": "string", "minLength": 1},
+    },
+}
 EXTRACT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -325,13 +343,15 @@ EXTRACT_SCHEMA: dict[str, Any] = {
 
 
 def extraction(c: Case) -> dict[str, Any]:
-    """The facts the model must read from the invoice text (the extract task's label)."""
+    """What the model must write for this invoice (the extract task's label). The
+    price is in the form every generator prints it; scoring compares the parsed
+    value, so other printed forms of the same amount ("USD 1,234.50") match too."""
     return {
         "invoice_id": c.invoice_id,
         "po_number": c.po_number,
         "vendor_id": c.vendor_id,
         "billed_qty": c.billed_qty,
-        "unit_price_billed": c.unit_price_billed,
+        "unit_price_raw": f"${c.unit_price_billed:,.2f}",
     }
 
 

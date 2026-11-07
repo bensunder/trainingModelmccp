@@ -23,6 +23,8 @@ from mccp.evals.benchmark import Target, run_benchmark
 from mccp.evals.suite import EvalSuite
 from mccp.examples.invoices import (
     EXTRACT_FIELDS,
+    EXTRACT_MODEL_FIELDS,
+    EXTRACT_RAW_SCHEMA,
     EXTRACT_SCHEMA,
     TASKS,
     fixtures,
@@ -31,6 +33,7 @@ from mccp.examples.invoices import (
 )
 from mccp.examples.messy import generate_messy
 from mccp.rules import RULESETS, invoice_triage
+from mccp.rules.extraction import normalize_extraction_v2
 from tests.conftest import ROOT
 
 _spec = importlib.util.spec_from_file_location("gpu_pilot_extract", ROOT / "deploy/gpu/pilot.py")
@@ -92,9 +95,12 @@ def test_extract_records_are_one_call_and_the_policy_reproduces_every_label(name
         assert [m["role"] for m in r["messages"]] == ["system", "user", "assistant"]
         assert "tools" not in r and not any(m.get("tool_calls") for m in r["messages"])
         facts = json.loads(r["messages"][2]["content"])
-        jsonschema.validate(facts, EXTRACT_SCHEMA)
-        assert list(facts) == EXTRACT_FIELDS
-        got = invoice_triage.decide_from_record(r["meta"], facts)
+        jsonschema.validate(facts, EXTRACT_RAW_SCHEMA)  # what the model writes
+        assert list(facts) == EXTRACT_MODEL_FIELDS
+        canon, _ = normalize_extraction_v2(facts)  # what the rules see
+        jsonschema.validate(canon, EXTRACT_SCHEMA)
+        assert set(canon) == set(EXTRACT_FIELDS)
+        got = invoice_triage.decide_from_record(r["meta"], canon)
         assert got.answer() == r["meta"]["expected"]
         assert got.policy == invoice_triage.POLICY_ID and got.trace[-1]["fired"] in (True, False)
 
@@ -137,7 +143,7 @@ def test_policy_thresholds_and_precedence(po, vendor, inv, qty, price, code):
 
 def test_wrong_extracted_facts_give_the_decision_production_would_make():
     r = generate(1, seed=3, task="extract")[0]
-    facts = json.loads(r["messages"][2]["content"])
+    facts, _ = normalize_extraction_v2(json.loads(r["messages"][2]["content"]))
     assert invoice_triage.decide_from_record(r["meta"], {**facts, "po_number": "PO-1"}).reason_code == "MISSING_PO"
     wrong_vendor = {**facts, "vendor_id": "V-1"}
     assert invoice_triage.decide_from_record(r["meta"], wrong_vendor).reason_code == "VENDOR_NOT_FOUND"
@@ -188,7 +194,11 @@ async def test_a_wrong_id_or_invalid_json_costs_the_decision():
 
 async def test_a_wrong_price_changes_only_the_decisions_it_should():
     recs = generate_ood(60, task="extract")
-    l1 = await _score(recs, lambda f: json.dumps({**f, "unit_price_billed": round(f["unit_price_billed"] * 1.5, 2)}))
+    from mccp.rules.extraction import parse_money
+
+    l1 = await _score(
+        recs, lambda f: json.dumps({**f, "unit_price_raw": f"${parse_money(f['unit_price_raw']) * 1.5:,.2f}"})
+    )
     assert 0.0 < l1["decision_accuracy"]["mean"] < 1.0  # missing PO / duplicate / bank still decided right
     assert l1["by_ood_kind"]["missing_po"]["accuracy"] == 1.0
     assert l1["by_ood_kind"]["clean"]["accuracy"] == 0.0

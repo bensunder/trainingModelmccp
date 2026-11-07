@@ -1,13 +1,15 @@
 # Eval suite for real scanned invoices (INV-CDIP): extraction only, no decision
 # (these documents have no PO records or vendor master). Fields are matched
 # ignoring case, spaces and punctuation; amounts to the cent; a field the
-# annotators left unlabelled is not scored. output_schema must equal
-# mccp.examples.invcdip.REALDOC_SCHEMA (tested).
+# annotators left unlabelled is not scored. output_schema / raw_output_schema must
+# equal mccp.examples.invcdip.REALDOC_SCHEMA / REALDOC_RAW_SCHEMA (tested). v2: the
+# model copies the total as printed (total_amount_raw); code parses it.
 name: invoice-realdoc-suite
-version: 1
+version: 2
 golden: finance-ops/invcdip-realdoc@v1:test
 compare_fields: [invoice_number, po_number, total_amount]
 field_match: normalized
+output_normalizer: realdoc-amounts@v1
 max_items: 500
 effect_probes: 5
 sampling: {temperature: 0.0, max_tokens: 256, seed: 0}
@@ -19,6 +21,14 @@ output_schema:
     invoice_number: {type: [string, "null"]}
     po_number: {type: [string, "null"]}
     total_amount: {type: [number, "null"]}
+raw_output_schema:
+  type: object
+  additionalProperties: false
+  required: [invoice_number, po_number, total_amount_raw]
+  properties:
+    invoice_number: {type: [string, "null"]}
+    po_number: {type: [string, "null"]}
+    total_amount_raw: {type: [string, "null"]}
 safety:
   guard_model: Qwen/Qwen3Guard-Gen-4B
   guard_base_url: http://vllm-guard:8001

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import re
@@ -980,6 +979,7 @@ def summary(args: argparse.Namespace) -> int:
                     f"  exact_record={'n/a' if ex is None else f'{ex * 100:.1f}%'}"
                     f"  valid={(a.get('json_validity') or 0) * 100:.1f}%"
                     + ("" if raw is None else f"  raw_valid={raw * 100:.1f}%")
+                    + (f"  unparseable_amounts={a['unparseable_amounts']}" if a.get("unparseable_amounts") else "")
                     + f"  errors={a.get('errors')}"
                 )
                 fields = a.get("field_accuracy_by_field") or {}
@@ -1032,17 +1032,33 @@ def add_set(args: argparse.Namespace) -> int:
     elif args.set == "docs":
         from mccp.examples import documents
 
-        key = hashlib.sha256(Path(documents.__file__).read_bytes()).hexdigest()[:12]
-        cached = cache / f"docs-{task}-n{args.n}-s{seed}-{key}.jsonl"
-        if cached.exists():
-            raw = _jsonl(cached.read_bytes())
-            summary["cache"] = "hit"
-        else:
-            print(f"rendering, scanning and OCR-ing {args.n} invoices (about 1-3 s each, CPU)", file=sys.stderr)
-            raw = documents.generate_documents(args.n, seed=seed, task=task)
-            cache.mkdir(parents=True, exist_ok=True)
-            _write_jsonl(cached, raw)
-            summary["cache"] = f"written {cached}"
+        # OCR (2-3 s a page) is the only expensive part and depends only on the
+        # rendering, so it is cached as text; cases, prompts and labels are always
+        # rebuilt by the current code.
+        cache.mkdir(parents=True, exist_ok=True)
+        key = cache / f"docs-ocr-r{documents.RENDER_VERSION}-n{args.n}-s{seed}.jsonl"
+        legacy = [
+            cache / f"docs-{t}-n{args.n}-s{seed}-{h}.jsonl" for h in documents.LEGACY_RENDER_HASHES for t in TASKS
+        ]
+        texts: dict[str, str] = {}
+        source = next((p for p in [key, *legacy] if p.exists()), None)
+        if source is not None:
+            cached_rows = _jsonl(source.read_bytes())
+            if all(r["meta"].get("ocr") == documents.ocr_version() for r in cached_rows):
+                texts = documents.ocr_texts_from_records(cached_rows)
+            else:
+                print(f"ignoring {source}: made with another OCR engine version", file=sys.stderr)
+        todo = args.n - sum(1 for i in range(args.n) if f"INV-{200000 + documents.DOC_ID_OFFSET + i}" in texts)
+        if todo:
+            print(f"rendering, scanning and OCR-ing {todo} invoices (about 1-3 s each, CPU)", file=sys.stderr)
+        raw = documents.generate_documents(args.n, seed=seed, task=task, ocr_texts=texts)
+        reused = sum(1 for r in raw if r["meta"]["source_id"] in texts)
+        if reused < len(raw) or not key.exists():
+            _write_jsonl(key, raw)
+        summary["ocr_reused"] = reused
+        summary["cache"] = f"{'hit' if reused == len(raw) else 'written'} {key.name}" + (
+            f" (from {source.name})" if source is not None and source != key else ""
+        )
         rows, pii = redact_records(raw)
     else:  # invcdip
         from mccp.examples import invcdip

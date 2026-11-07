@@ -194,18 +194,30 @@ def rasterize(pdf: bytes, dpi: int = 150):
     return Image.frombytes("L", (pix.width, pix.height), pix.samples)
 
 
-def degrade(img, level: str, rng: random.Random):
-    """Scanner damage: skew, blur, speckle, low-resolution JPEG. Seeded."""
+def _degrade_params(level: str, rng: random.Random) -> tuple | None:
+    """Draw the scan damage for one page. Always called, rendered or not, so the
+    random stream (and every later case) is identical whether a page is rendered
+    and OCR'd or its OCR text comes from the cache."""
+    if level == "clean":
+        return None
+    heavy = level == "heavy"
+    angle = rng.uniform(-2.0, 2.0) if heavy else rng.uniform(-0.7, 0.7)
+    blur = rng.uniform(0.8, 1.3) if heavy else rng.uniform(0.3, 0.6)
+    noise_seed = rng.randrange(2**32)
+    return heavy, angle, blur, noise_seed
+
+
+def _apply_degrade(img, params: tuple | None):
     import numpy as np
     from PIL import Image, ImageFilter
 
-    if level == "clean":
+    if params is None:
         return img
-    heavy = level == "heavy"
-    img = img.rotate(rng.uniform(-2.0, 2.0) if heavy else rng.uniform(-0.7, 0.7), expand=False, fillcolor=255)
-    img = img.filter(ImageFilter.GaussianBlur(rng.uniform(0.8, 1.3) if heavy else rng.uniform(0.3, 0.6)))
+    heavy, angle, blur, noise_seed = params
+    img = img.rotate(angle, expand=False, fillcolor=255)
+    img = img.filter(ImageFilter.GaussianBlur(blur))
     arr = np.asarray(img, dtype=np.int16)
-    noise = np.random.default_rng(rng.randrange(2**32)).normal(0, 22 if heavy else 9, arr.shape)
+    noise = np.random.default_rng(noise_seed).normal(0, 22 if heavy else 9, arr.shape)
     arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
     img = Image.fromarray(arr)
     if heavy:
@@ -215,6 +227,11 @@ def degrade(img, level: str, rng: random.Random):
     img.save(buf, format="JPEG", quality=35 if heavy else 70)
     buf.seek(0)
     return Image.open(buf).convert("L")
+
+
+def degrade(img, level: str, rng: random.Random):
+    """Scanner damage: skew, blur, speckle, low-resolution JPEG. Seeded."""
+    return _apply_degrade(img, _degrade_params(level, rng))
 
 
 @lru_cache(maxsize=1)
@@ -271,11 +288,18 @@ def ocr_text(img) -> str:
 
 
 def generate_documents(
-    n: int, seed: int = 5151, task: str = "extract", keep_images: list | None = None
+    n: int,
+    seed: int = 5151,
+    task: str = "extract",
+    keep_images: list | None = None,
+    ocr_texts: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """`n` invoice documents, kinds (layout x scan level) round-robin. The model's
     input is the OCR text; `keep_images`, when a list, receives (source_id, PNG
-    bytes) for the first page of each document (audit samples)."""
+    bytes) for the first page of each document (audit samples). `ocr_texts`
+    ({invoice_id: OCR text} from an earlier run of this generator, same seed)
+    skips rendering and OCR for those pages: the cases, labels and prompts are
+    rebuilt by the current code, only the expensive OCR is reused."""
     if n < 1:
         raise ValueError("n must be >= 1")
     build = record_builder(task)
@@ -287,12 +311,35 @@ def generate_documents(
         kind = DOC_KINDS[i % len(DOC_KINDS)]
         template, level = kind.split(":")
         d = _content(c, rng)
-        img = degrade(rasterize(render_pdf(d, template)), level, rng)
-        text = ocr_text(img)
-        if keep_images is not None:
-            buf = io.BytesIO()
-            img.save(buf, format="PNG", optimize=True)
-            keep_images.append((c.invoice_id, buf.getvalue()))
+        params = _degrade_params(level, rng)
+        cached = (ocr_texts or {}).get(c.invoice_id)
+        if cached is not None and keep_images is None:
+            text = cached
+        else:
+            img = _apply_degrade(rasterize(render_pdf(d, template)), params)
+            text = ocr_text(img)
+            if keep_images is not None:
+                buf = io.BytesIO()
+                img.save(buf, format="PNG", optimize=True)
+                keep_images.append((c.invoice_id, buf.getvalue()))
         meta = {"split": "docs", "ood_kind": kind, "doc_template": template, "scan": level, "ocr": engine}
-        out.append(build(c, f"OCR text of a scanned vendor invoice:\n\n{text}", meta))
+        out.append(build(c, f"{OCR_PREFIX}{text}", meta))
+    return out
+
+
+OCR_PREFIX = "OCR text of a scanned vendor invoice:\n\n"
+RENDER_VERSION = "1"  # bump when rendering, degradation or OCR settings change (invalidates OCR caches)
+# documents.py file hashes (first 12 hex of sha256) whose rendering is RENDER_VERSION 1:
+# their OCR caches (named docs-<task>-n<N>-s<seed>-<hash>.jsonl) hold the same text.
+# Verified pixel-identical when degrade() was split into _degrade_params/_apply_degrade.
+LEGACY_RENDER_HASHES = ("5857fcb9f107",)
+
+
+def ocr_texts_from_records(records: list[dict[str, Any]]) -> dict[str, str]:
+    """{invoice_id: OCR text} from records this generator produced (any task)."""
+    out = {}
+    for r in records:
+        text = r["messages"][1]["content"]
+        if text.startswith(OCR_PREFIX):
+            out[r["meta"]["source_id"]] = text[len(OCR_PREFIX) :]
     return out

@@ -108,6 +108,29 @@ more sets measure that path (`mccp-gpu eval-messy --set docs|invcdip`, scoring a
 Both are built on the CPU before vLLM starts and cached in `/workspace/mccp-cache`, so the slow part
 (about 2-3 s of OCR per page) is paid once across runs and machines.
 
+## Amounts as printed (`invoice-extract@v2`, `realdoc-amounts@v1`)
+
+On the real scans the model dropped decimal points in about half of the wrong totals: the OCR text
+read `GRAND TOTAL $1,533.54`, `316.77`, `$22.25` and the model wrote `153354`, `31677`, `2225`. The
+prompt asked for "a number without currency symbols or thousands separators", and the model stripped
+the decimal point with the separators. So number formatting moved to code, like id formatting:
+
+* the model copies the amount exactly as printed: `unit_price_raw` (extract task),
+  `total_amount_raw` (real scans);
+* `mccp.rules.extraction.parse_money` turns it into the canonical `unit_price_billed` /
+  `total_amount`: currency symbol or code before or after, a per-unit suffix, thousands commas in the
+  right places, up to two decimals, stray OCR marks around it (`8,333.00~`);
+* it refuses anything a person would have to interpret (`$35.805.60`, `316:77`, `2:851475`,
+  `3l6.77`): no number is produced, the answer fails the schema and serving routes the invoice to
+  human review; scoring counts these as `unparseable_amounts`;
+* the gold label goes through the same parser, so answer and label are compared as numbers
+  (`USD 1,234.50` and `$1,234.50` match); an annotation it cannot read is not scored;
+* `json_validity_raw` is measured against the model's own schema (`raw_output_schema`), so it keeps
+  reporting what the model wrote.
+
+Suites moved to version 2. OCR text is cached by rendering version (`RENDER_VERSION`); records are
+always rebuilt by the current code, so a prompt or label change never needs a new OCR pass.
+
 ## Serving
 
 `mccp.agent.extract.triage_extract(chat, text, model=..., lookup_po=..., lookup_vendor=...)`: one

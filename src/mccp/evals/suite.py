@@ -75,6 +75,9 @@ class EvalSuite(BaseModel):
     # ids ignore case/spaces/punctuation, amounts match to the cent, and a field the
     # label leaves null is not scored (unlabelled is not the same as absent).
     field_match: Literal["exact", "normalized"] = "exact"
+    # What the model itself must write, before the normalizer (e.g. amounts as printed).
+    # json_validity_raw is measured against it when given, else against output_schema.
+    raw_output_schema: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _known_rules(self) -> "EvalSuite":
