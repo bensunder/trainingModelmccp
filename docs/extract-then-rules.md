@@ -193,6 +193,15 @@ The realdoc suite (v4) decides with `realdoc-validation@v3` and
 --policy none --keep-redacted-labels` reproduces the measurement above exactly;
 `deploy/gpu/measure_policies.sh` does that and then measures each fix as its own step.
 
+**Confusable-tolerant id match (measurement only).** The audit showed most
+id-only auto-wrong answers copy an OCR letter/digit confusion (329S1 printed as
+329Si). `confusable_ids` in the failures result folds ids (o=0, i/l=1, s=5, b=8,
+g=6, t=7, z=2; case, spaces and punctuation ignored) and reports how many
+auto-wrong ids would match their label under such a lookup, and, as the risk,
+how many labelled ids become indistinguishable from another after folding. It
+never changes a score; in production such a lookup must accept a single match
+in the vendor master / PO records only.
+
 **Redaction placeholders are never labels.** PII redaction runs over the label as
 well as the text, so a PO number that looks like a card number became the label
 `<CREDIT_CARD_1>` and was scored. The set builder now drops any label redaction

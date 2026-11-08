@@ -116,6 +116,14 @@ for label, k in (("nothing", ()), ("A missing field", (MISS,)), ("D several tota
     if r:
         print(line(label, r))
 print("   auto-wrong by field (new default): %s" % m["auto_wrong_by_field"])
+cf = m.get("confusable_ids") or {}
+if cf:
+    print("   confusable-tolerant id match (l/1 O/0 S/5 B/8 G/6 T/7 Z/2; measurement only):")
+    print("     would fix %d of %d id-only auto-wrong (%s); ids also fixed on %d of %d amount+id" % (
+        cf["id_only_recoverable"], cf["id_only_auto_wrong"],
+        ", ".join("%s %d/%d" % (f, c.get("recoverable", 0), c.get("wrong", 0)) for f, c in cf["by_field"].items()),
+        cf["amount_and_id_ids_recoverable"], cf["amount_and_id_auto_wrong"]))
+    print("     risk: labelled ids that collide with another after folding: %s" % cf["labelled_ids_colliding_after_folding"])
 if m.get("redacted_labels_unscored"):
     print("   PII-placeholder labels no longer scored: %d" % m["redacted_labels_unscored"])
 

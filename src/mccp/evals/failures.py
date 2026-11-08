@@ -249,6 +249,8 @@ def classify_rows(
     # (source_id, correct, flags, wrong fields) of every answer validation lets through
     passed: list[tuple[str, bool, frozenset[str], frozenset[str]]] = []
     auto_wrong_fields: list[frozenset[str]] = []
+    auto_wrong_ids: list[tuple[str, dict[str, tuple[Any, Any]], frozenset[str]]] = []
+    labels_by_field: dict[str, set[str]] = defaultdict(set)
     missing_text = 0
     redacted_labels = 0
     for r in rows:
@@ -283,6 +285,11 @@ def classify_rows(
         outcomes[outcome] += 1
         if outcome == "auto_wrong":
             auto_wrong_fields.append(frozenset(wrong))
+            auto_wrong_ids.append(
+                (x["sid"], {f: (exp.get(f), got.get(f)) for f in wrong if f in ID_FIELDS}, frozenset(wrong))
+            )
+        for f in ID_FIELDS & set(x["scored"]):
+            labels_by_field[f].add(str(exp.get(f)))
         for f in wrong:
             e, g = exp.get(f), got.get(f)
             if f in AMOUNT_FIELDS:
@@ -322,6 +329,7 @@ def classify_rows(
                 )
     kinds, by_field = _split(auto_wrong_fields)
     return {
+        "confusable_ids": confusable_report(auto_wrong_ids, labels_by_field),
         "rows": sum(outcomes.values()),
         "outcomes": dict(outcomes),
         "review_policy": getattr(policy, "id", None),
@@ -348,6 +356,66 @@ def outcomes_before_policy(outcomes: Counter, policy_blocked: Counter, passed: l
     n = sum(outcomes.values())
     wrong = sum(1 for p in passed if not p[1])
     return {"auto_correct": len(passed) - wrong, "auto_wrong": wrong, "human_review": n - len(passed)}
+
+
+# OCR letter/digit confusions seen on the INV-CDIP scans (329S1/329Si, #36106/#36l06,
+# 04T44636/04744636, G7866655/67866655, 010535/O10535, 80750B/807508), plus Z/2.
+CONFUSABLES = str.maketrans({"o": "0", "i": "1", "l": "1", "s": "5", "b": "8", "g": "6", "t": "7", "z": "2"})
+CONFUSABLE_RULE = "confusables-v1: o=0 i/l=1 s=5 b=8 g=6 t=7 z=2 (case, spaces, punctuation ignored)"
+
+
+def fold_confusables(value: Any) -> str:
+    """An id as a confusable-tolerant lookup key: ignore case, spaces and punctuation,
+    and map letters OCR mistakes for digits onto the digit. Two ids with the same key
+    cannot be told apart by such a lookup."""
+    return _squash(value).translate(CONFUSABLES)
+
+
+def confusable_report(
+    auto_wrong: list[tuple[str, dict[str, tuple[Any, Any]], frozenset[str]]], labels: dict[str, set[str]]
+) -> dict[str, Any]:
+    """What a confusable-tolerant id lookup would do to the auto-wrong answers. A
+    measurement, never a scoring change: an id counts as recoverable only when the
+    model's id and the label have the same folded key. The risk side is reported
+    too: labelled ids that become indistinguishable from another labelled id after
+    folding (in production: two vendor-master or PO records one key would match, so
+    the lookup must accept only a single match)."""
+    by_field: dict[str, Counter] = defaultdict(Counter)
+    id_only = id_only_fixed = mixed = mixed_ids_fixed = 0
+    examples: list[dict[str, Any]] = []
+    for sid, ids, wrong in auto_wrong:
+        if not ids:
+            continue
+        fixed = {f for f, (e, g) in ids.items() if g not in (None, "") and fold_confusables(e) == fold_confusables(g)}
+        for f in ids:
+            by_field[f]["wrong"] += 1
+            by_field[f]["recoverable"] += f in fixed
+        if set(ids) == set(wrong):  # only ids are wrong
+            id_only += 1
+            if fixed == set(ids):
+                id_only_fixed += 1
+                if len(examples) < 8:
+                    examples.append({"source_id": sid, **{f: {"label": e, "answer": g} for f, (e, g) in ids.items()}})
+        else:
+            mixed += 1
+            mixed_ids_fixed += fixed == set(ids)
+    collisions: dict[str, int] = {}
+    for f, vals in labels.items():
+        keys: dict[str, set[str]] = defaultdict(set)
+        for v in vals:
+            if _squash(v):
+                keys[fold_confusables(v)].add(_squash(v))
+        collisions[f] = sum(len(s) for s in keys.values() if len(s) > 1)
+    return {
+        "rule": CONFUSABLE_RULE,
+        "id_only_auto_wrong": id_only,
+        "id_only_recoverable": id_only_fixed,
+        "amount_and_id_auto_wrong": mixed,
+        "amount_and_id_ids_recoverable": mixed_ids_fixed,
+        "by_field": {f: dict(c) for f, c in sorted(by_field.items())},
+        "labelled_ids_colliding_after_folding": collisions,
+        "examples": examples,
+    }
 
 
 def simulate_policies(passed: list[tuple[Any, ...]], outcomes: dict[str, int]) -> list[dict[str, Any]]:

@@ -1174,6 +1174,13 @@ def failures(args: argparse.Namespace) -> int:
                 f"   blocked: {res['review_policy_blocked'] or 0}   hints left to reviewers: {res['review_hints'] or 0}"
             )
         print(f"   auto_wrong by kind: {res['auto_wrong_by_kind']}   by field: {res['auto_wrong_by_field']}")
+        cf = res.get("confusable_ids") or {}
+        if cf.get("id_only_auto_wrong") or cf.get("amount_and_id_auto_wrong"):
+            print(
+                f"   confusable-tolerant id match (measurement only): would fix {cf['id_only_recoverable']}"
+                f" of {cf['id_only_auto_wrong']} id-only auto-wrong; by field {cf['by_field']};"
+                f" labelled ids colliding after folding {cf['labelled_ids_colliding_after_folding']}"
+            )
         if res["redacted_labels_unscored"]:
             print(
                 f"   ({res['redacted_labels_unscored']} labels were PII placeholders, e.g. <CREDIT_CARD_1>: not scored)"

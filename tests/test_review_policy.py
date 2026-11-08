@@ -478,3 +478,63 @@ def test_rescoring_unscores_placeholder_labels_in_old_sets():
     old = classify_rows(rows, REALDOC, normalize_realdoc, keep_redacted=True, **kw)
     assert old["outcomes"] == {"auto_wrong": 1}  # what the report said before the fix
     assert label_audit_rows(rows, REALDOC, normalize_realdoc, **kw) == []
+
+
+# -- confusable-tolerant id match (measurement only) -------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "answer"),
+    [  # pairs from the INV-CDIP label audit: the OCR printed the answer, the model copied it
+        ("329S1", "329Si"),
+        ("#36106", "36l06"),
+        ("04T44636", "04744636"),
+        ("G7866655", "67866655"),
+        ("010535", "O10535"),
+        ("80750B", "807508"),
+        ("1306/5201", "1306/520l"),
+        ("EIL09510230", "E1L09510230"),
+        ("Verbal-Teen H.I.P.", "Verbal-Teen H.l.P."),
+    ],
+)
+def test_observed_ocr_confusions_fold_together(label, answer):
+    from mccp.evals.failures import fold_confusables
+
+    assert fold_confusables(label) == fold_confusables(answer)
+
+
+@pytest.mark.parametrize(
+    ("label", "answer"),
+    [("171185", "171135"), ("6134", "5134"), ("042471", "942471"), ("705052", "70502")],  # real digit errors
+)
+def test_a_different_digit_is_never_recoverable(label, answer):
+    from mccp.evals.failures import fold_confusables
+
+    assert fold_confusables(label) != fold_confusables(answer)
+
+
+def test_confusable_report_counts_recoverable_and_collisions():
+    from mccp.evals.failures import confusable_report
+
+    auto_wrong = [
+        ("a", {"invoice_number": ("329S1", "329Si")}, frozenset({"invoice_number"})),  # id-only, recoverable
+        ("b", {"invoice_number": ("171185", "171135")}, frozenset({"invoice_number"})),  # id-only, real digit
+        ("c", {"po_number": ("6O1", "601")}, frozenset({"po_number", "total_amount"})),  # amount too
+        ("d", {}, frozenset({"total_amount"})),  # amount only: not an id case
+        ("e", {"invoice_number": ("777", None)}, frozenset({"invoice_number"})),  # missing never recovers
+    ]
+    labels = {"invoice_number": {"329S1", "32951", "171185"}, "po_number": {"6O1"}}
+    r = confusable_report(auto_wrong, labels)
+    assert (r["id_only_auto_wrong"], r["id_only_recoverable"]) == (3, 1)
+    assert (r["amount_and_id_auto_wrong"], r["amount_and_id_ids_recoverable"]) == (1, 1)
+    assert r["by_field"]["invoice_number"] == {"wrong": 3, "recoverable": 1}
+    assert r["labelled_ids_colliding_after_folding"] == {"invoice_number": 2, "po_number": 0}  # 329S1 ~ 32951
+
+
+def test_classify_rows_reports_confusables_without_changing_outcomes():
+    exp = {"invoice_number": "329S1", "po_number": None, "total_amount_raw": "$1,533.54"}
+    page = "INVOICE NO 329Si\nGRAND TOTAL $1,533.54"
+    rows = [_row("fspb0030", exp, {**exp, "invoice_number": "329Si"}, page)]
+    res = classify_rows(rows, REALDOC, normalize_realdoc, validator=validate_realdoc_v3)
+    assert res["outcomes"] == {"auto_wrong": 1}  # scoring is untouched
+    assert res["confusable_ids"]["id_only_recoverable"] == 1
