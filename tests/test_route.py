@@ -569,7 +569,6 @@ def test_setup_is_surgical_reversible_and_private(tmp_path):
 @pytest.mark.parametrize(
     ("args", "msg"),
     [
-        ({"harnesses": ["codex"]}, "Responses API"),
         ({"gateway": "http://inference.example.com"}, "https"),
         ({"key": "sk-not-ours"}, "rk_"),
         ({"default_profile": "auto-nope"}, "profiles"),
@@ -599,3 +598,128 @@ def test_setup_refuses_to_touch_a_broken_settings_file(tmp_path):
     with pytest.raises(su.SetupError, match="not valid JSON"):
         su.apply(tmp_path, ["claude-code"], "https://g.example.com", "rk_x", ["auto-cost"], "auto-cost")
     assert (tmp_path / ".claude" / "settings.json").read_text() == "{not json"
+
+
+# -- Codex: Responses API translation --------------------------------------------------------
+
+
+def test_responses_request_to_chat():
+    from mccp.route import responses as rs
+
+    body = {
+        "model": "auto-balanced", "instructions": "You are Codex.", "stream": True, "max_output_tokens": 800,
+        "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
+                  {"type": "custom", "name": "apply_patch", "description": "Apply a patch."}],
+        "input": [
+            {"role": "developer", "content": [{"type": "input_text", "text": "repo rules"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the test"}]},
+            {"type": "reasoning", "summary": []},
+            {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": '{"cmd":"pytest"}'},
+            {"type": "custom_tool_call", "call_id": "c2", "name": "apply_patch", "input": "*** Begin Patch"},
+            {"type": "function_call_output", "call_id": "c1", "output": "1 failed"},
+            {"type": "custom_tool_call_output", "call_id": "c2", "output": "ok"},
+        ],
+    }  # fmt: skip
+    chat, custom = rs.to_chat(body)
+    assert custom == {"apply_patch"} and chat["max_tokens"] == 800 and chat["stream"] is True
+    roles = [m["role"] for m in chat["messages"]]
+    assert roles == ["system", "system", "user", "assistant", "tool", "tool"]
+    calls = chat["messages"][3]["tool_calls"]
+    assert [c["id"] for c in calls] == ["c1", "c2"] and json.loads(calls[1]["function"]["arguments"]) == {
+        "input": "*** Begin Patch"
+    }
+    assert chat["tools"][1]["function"]["parameters"]["required"] == ["input"]
+    with pytest.raises(rs.Unsupported, match="previous_response_id"):
+        rs.to_chat({**body, "previous_response_id": "resp_1"})
+    with pytest.raises(rs.Unsupported, match="web_search"):
+        rs.to_chat({**body, "tools": [{"type": "web_search"}]})
+
+
+def test_chat_answer_back_to_responses_including_custom_tools():
+    from mccp.route import responses as rs
+
+    chat = {"choices": [{"finish_reason": "tool_calls", "message": {"content": "Patching.", "tool_calls": [
+        {"id": "c9", "type": "function", "function": {"name": "apply_patch", "arguments": '{"input": "*** Begin Patch\\n"}'}},
+        {"id": "c10", "type": "function", "function": {"name": "shell", "arguments": '{"cmd": "ls"}'}}]}}],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 7, "prompt_tokens_details": {"cached_tokens": 20}}}  # fmt: skip
+    r = rs.from_chat(chat, "glm", {"apply_patch"})
+    types = [o["type"] for o in r["output"]]
+    assert (
+        r["object"] == "response"
+        and r["status"] == "completed"
+        and types == ["message", "custom_tool_call", "function_call"]
+    )
+    assert r["output"][1]["input"] == "*** Begin Patch\n" and r["output"][2]["arguments"] == '{"cmd": "ls"}'
+    assert r["usage"]["input_tokens_details"]["cached_tokens"] == 20 and r["usage"]["total_tokens"] == 57
+
+
+async def test_chat_stream_to_responses_events():
+    from mccp.route import responses as rs
+
+    chunks = [
+        b'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\ndata: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"shell","arguments":"{\\"cmd\\""}}]}}]}\n',
+        b'\ndata: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\\"ls\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+        b'data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4}}\n\ndata: [DONE]\n\n',
+    ]
+
+    async def src():
+        for c in chunks:
+            yield c
+
+    out = b"".join([b async for b in rs.stream_from_chat(src(), "glm", set())]).decode()
+    events = [json.loads(line[5:]) for line in out.splitlines() if line.startswith("data:")]
+    types = [e["type"] for e in events]
+    assert types[0] == "response.created" and types[-1] == "response.completed"
+    assert "".join(e["delta"] for e in events if e["type"] == "response.output_text.delta") == "Hello"
+    args = "".join(e["delta"] for e in events if e["type"] == "response.function_call_arguments.delta")
+    assert json.loads(args) == {"cmd": "ls"}
+    assert [e["sequence_number"] for e in events] == list(range(1, len(events) + 1))
+    final = events[-1]["response"]
+    assert [o["type"] for o in final["output"]] == ["message", "function_call"] and final["usage"]["output_tokens"] == 4
+    assert types.index("response.output_text.done") < types.index("response.function_call_arguments.done")
+
+
+def test_responses_endpoint_routes_to_chat_providers(env):
+    c, fake, store = env
+    _, _, key = setup_key(c)
+    h = {"authorization": f"Bearer {key}"}
+    r = c.post("/v1/responses", headers=h, json={"model": "auto-cost", "input": "add a docstring"})
+    assert r.status_code == 200, r.text
+    assert r.json()["object"] == "response" and r.json()["output"][0]["content"][0]["text"] == "patched"
+    assert fake.calls[-1]["url"].endswith("/chat/completions")  # Codex traffic reaches chat providers
+    bad = c.post("/v1/responses", headers=h, json={"model": "auto-cost", "input": "x", "previous_response_id": "r1"})
+    assert bad.status_code == 400 and bad.json()["type"].endswith("unsupported-feature")
+    c.portal.call(c.app.state.gw.writer.flush)
+    assert any(e.wire == "openai_responses" for e in store.usage)
+
+
+def test_codex_setup_preserves_the_rest_of_config_toml(tmp_path):
+    import tomllib
+
+    from mccp.route import setup as su
+
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text(
+        '# my settings\napproval_policy = "on-request"\n\n[mcp_servers.docs]\ncommand = "docs-mcp"\n'
+    )
+    su.apply(tmp_path, ["codex"], "https://g.example.com", "rk_x", ["auto-cost"], "auto-cost")
+    text = (tmp_path / ".codex" / "config.toml").read_text()
+    cfg = tomllib.loads(text)
+    assert (
+        "# my settings" in text
+        and cfg["approval_policy"] == "on-request"
+        and cfg["mcp_servers"]["docs"]["command"] == "docs-mcp"
+    )
+    assert cfg["model_provider"] == "route" and cfg["model"] == "auto-cost"
+    assert cfg["model_providers"]["route"] == {
+        "name": "Route gateway",
+        "base_url": "https://g.example.com/v1",
+        "env_key": "ROUTE_API_KEY",
+        "wire_api": "responses",
+    }
+    assert "rk_x" not in text  # the key lives in route.env, not in config.toml
+    assert su.codex_apply(tmp_path, "https://g.example.com", "auto-cost").action == "unchanged"
+    su.remove(tmp_path, ["codex"])
+    cfg = tomllib.loads((tmp_path / ".codex" / "config.toml").read_text())
+    assert "model_provider" not in cfg and "model_providers" not in cfg and cfg["approval_policy"] == "on-request"

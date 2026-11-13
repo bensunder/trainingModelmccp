@@ -1,7 +1,7 @@
 """`mccp-route`: run the gateway, connect developer tools, operate it.
 
   mccp-route serve                       run the gateway (settings from ROUTE_* env)
-  mccp-route setup --gateway URL         connect Claude Code / OpenCode (key asked hidden)
+  mccp-route setup --gateway URL         connect Claude Code / OpenCode / Codex (key asked hidden)
   mccp-route remove                      undo `setup`
   mccp-route doctor --gateway URL        check reachability and key, no model call
   mccp-route admin bootstrap ...         create org + team + first key (admin token asked hidden)
@@ -56,7 +56,7 @@ def serve() -> None:
 @app.command()
 def setup(
     gateway: Gateway,
-    harness: Annotated[str, typer.Option(help="comma list: claude-code,opencode")] = "claude-code,opencode",
+    harness: Annotated[str, typer.Option(help="comma list: claude-code,opencode,codex")] = "claude-code,opencode,codex",
     profile: Annotated[str | None, typer.Option(help="route profile (default: the gateway's default)")] = None,
     strong_profile: Annotated[str | None, typer.Option(help="profile for Claude Code's opus alias")] = None,
 ) -> None:
@@ -76,11 +76,13 @@ def setup(
         raise typer.Exit(2) from e
     for c in changes:
         typer.echo(f"  {c.harness:12} {c.action:9} {c.path}" + (f"  (backup {c.backup.name})" if c.backup else ""))
-    typer.echo(f"done: profile {chosen}. Open a new terminal (OpenCode reads {setup_mod.KEY_ENV} from your shell).")
+    typer.echo(
+        f"done: profile {chosen}. Open a new terminal (OpenCode and Codex read {setup_mod.KEY_ENV} from your shell)."
+    )
 
 
 @app.command()
-def remove(harness: Annotated[str, typer.Option()] = "claude-code,opencode") -> None:
+def remove(harness: Annotated[str, typer.Option()] = "claude-code,opencode,codex") -> None:
     """Undo `setup`: remove exactly the settings it wrote (backups are kept)."""
     for c in setup_mod.remove(Path.home(), [h.strip() for h in harness.split(",") if h.strip()]):
         typer.echo(f"  {c.harness:12} {c.action:9} {c.path}")

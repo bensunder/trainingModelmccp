@@ -22,6 +22,7 @@ dependencies = [
     "redis>=5.2",
     "safetensors>=0.8.0",
     "sqlalchemy[asyncio]>=2.0",
+    "tomlkit>=0.13",
     "typer>=0.27.2",
     "uvicorn[standard]>=0.54.0",
 ]

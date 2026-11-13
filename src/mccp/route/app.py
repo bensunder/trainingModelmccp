@@ -4,6 +4,7 @@ Client API (what coding tools call):
   POST /v1/messages                Anthropic Messages (Claude Code)
   POST /v1/messages/count_tokens   estimate (Claude Code context bookkeeping)
   POST /v1/chat/completions        OpenAI Chat Completions (OpenCode, SDKs)
+  POST /v1/responses               OpenAI Responses (Codex), translated to Chat Completions
   GET  /v1/models                  route profiles and the models this key may use
   GET  /v1/usage                   this key's own usage this month
 Admin API (platform operator, ROUTE_ADMIN_TOKEN):
@@ -250,6 +251,10 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def chat(request: Request, g: G, ctx: C) -> Response:
         return respond(await g.handle(Wire.OPENAI_CHAT, await json_body(request), dict(request.headers), ctx))
+
+    @app.post("/v1/responses")
+    async def responses_api(request: Request, g: G, ctx: C) -> Response:
+        return respond(await g.handle_responses(await json_body(request), dict(request.headers), ctx))
 
     @app.get("/v1/models")
     async def models(g: G, ctx: C) -> dict[str, Any]:

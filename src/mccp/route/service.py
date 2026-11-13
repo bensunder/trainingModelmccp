@@ -292,15 +292,24 @@ class Gateway:
 
     # -- the request ----------------------------------------------------------------
     def _event(
-        self, rid: str, ctx: KeyContext, f: Features | None, wire: Wire, body: dict[str, Any], **kw: Any
+        self,
+        rid: str,
+        ctx: KeyContext,
+        f: Features | None,
+        wire: Wire,
+        body: dict[str, Any],
+        label: str | None = None,
+        **kw: Any,
     ) -> UsageEvent:
         return UsageEvent(
             id=str(uuid.uuid4()), request_id=rid, created_at=now(), org_id=ctx.org.id, team_id=ctx.team.id,
-            key_id=ctx.key.id, wire=wire.value, requested_model=str(body.get("model", ""))[:200],
+            key_id=ctx.key.id, wire=label or wire.value, requested_model=str(body.get("model", ""))[:200],
             stream=bool(f.stream) if f else False, **kw,
         )  # fmt: skip
 
-    async def handle(self, wire: Wire, body: dict[str, Any], headers: dict[str, str], ctx: KeyContext) -> Result:
+    async def handle(
+        self, wire: Wire, body: dict[str, Any], headers: dict[str, str], ctx: KeyContext, label: str | None = None
+    ) -> Result:
         rid = f"req_{uuid.uuid4().hex[:24]}"
         t0 = time.monotonic()
         await self.rate_limit(ctx)
@@ -312,7 +321,7 @@ class Gateway:
         policy = GuardrailPolicy(**ctx.org.guardrails) if ctx.org.guardrails else GuardrailPolicy()
         fwd, verdict = apply_guardrails(body, policy)
         if verdict.blocked:
-            self.writer.submit(self._event(rid, ctx, f, wire, body, profile=None, task=None, model=None, provider=None,
+            self.writer.submit(self._event(rid, ctx, f, wire, body, label=label, profile=None, task=None, model=None, provider=None,
                                            status=400, route_reason="guardrail block", guardrail=verdict.summary()))  # fmt: skip
             raise GatewayError(400, "guardrail-blocked", "Blocked by guardrail policy",
                                "the request contains content your organisation does not allow to leave: " + ", ".join(sorted(verdict.findings)),
@@ -338,7 +347,9 @@ class Gateway:
                 attempts.append(_Attempt(mid, e.reason[:120]))
                 continue
             if f.stream and resp.stream is not None:
-                return self._stream_result(rid, ctx, f, wire, body, plan, mid, resp, attempts, t0, out_headers, verdict)
+                return self._stream_result(
+                    rid, ctx, f, wire, body, plan, mid, resp, attempts, t0, out_headers, verdict, label
+                )
             data: Any = None
             try:
                 data = json.loads(resp.body or b"null")
@@ -354,7 +365,7 @@ class Gateway:
             c = cost(self.catalog, mid, u)
             extra = cost(self.catalog, attempts[-1].model, spent_failed).usd if attempts and spent_failed.total else 0.0
             ev = self._event(
-                rid, ctx, f, wire, body, profile=plan.profile.id if plan.profile else None, task=plan.task.task.value,
+                rid, ctx, f, wire, body, label=label, profile=plan.profile.id if plan.profile else None, task=plan.task.task.value,
                 model=mid, provider=m.provider, status=resp.status, input_tokens=u.input_tokens,
                 output_tokens=u.output_tokens, cache_read_tokens=u.cache_read_tokens, cache_write_tokens=u.cache_write_tokens,
                 usage_reported=u.reported, cost_usd=c.usd + extra, baseline_cost_usd=c.baseline_usd,
@@ -366,7 +377,7 @@ class Gateway:
             if resp.status < 400 and plan.sticky_key and plan.profile:
                 await self.cache.set(plan.sticky_key, mid, plan.profile.sticky_ttl_s)
             return Result(resp.status, {**out_headers, **resp.headers, "x-route-model": mid}, body=resp.body)
-        self.writer.submit(self._event(rid, ctx, f, wire, body, profile=plan.profile.id if plan.profile else None,
+        self.writer.submit(self._event(rid, ctx, f, wire, body, label=label, profile=plan.profile.id if plan.profile else None,
                                        task=plan.task.task.value, model=None, provider=None, status=503,
                                        attempts=len(attempts), route_reason=self._reason(plan, attempts)))  # fmt: skip
         raise GatewayError(503, "upstream-unavailable", "No model available",
@@ -380,7 +391,9 @@ class Gateway:
             r += " | failover: " + ", ".join(f"{a.model} ({a.outcome})" for a in attempts)
         return r[:1000]
 
-    def _stream_result(self, rid, ctx, f, wire, body, plan, mid, resp, attempts, t0, out_headers, verdict) -> Result:
+    def _stream_result(
+        self, rid, ctx, f, wire, body, plan, mid, resp, attempts, t0, out_headers, verdict, label=None
+    ) -> Result:
         meter = StreamMeter(wire)
         m = self.catalog.model(mid)
 
@@ -399,7 +412,7 @@ class Gateway:
                 c = cost(self.catalog, mid, meter.usage)
                 status = resp.status if completed and not meter.error else 499 if not completed else 502
                 ev = self._event(
-                    rid, ctx, f, wire, body, profile=plan.profile.id if plan.profile else None, task=plan.task.task.value,
+                    rid, ctx, f, wire, body, label=label, profile=plan.profile.id if plan.profile else None, task=plan.task.task.value,
                     model=mid, provider=m.provider, status=status, input_tokens=meter.usage.input_tokens,
                     output_tokens=meter.usage.output_tokens, cache_read_tokens=meter.usage.cache_read_tokens,
                     cache_write_tokens=meter.usage.cache_write_tokens, usage_reported=meter.usage.reported,
@@ -418,6 +431,28 @@ class Gateway:
         hdrs = {**out_headers, "x-route-model": mid, "content-type": resp.headers.get("content-type", "text/event-stream"),
                 "cache-control": "no-cache"}  # fmt: skip
         return Result(resp.status, hdrs, stream=gen())
+
+    async def handle_responses(self, body: dict[str, Any], headers: dict[str, str], ctx: KeyContext) -> Result:
+        """OpenAI Responses API (Codex): translate to Chat, route as Chat, translate back."""
+        from . import responses as rs
+
+        try:
+            chat, custom = rs.to_chat(body)
+        except rs.Unsupported as e:
+            raise GatewayError(400, "unsupported-feature", "Unsupported Responses feature", str(e)) from e
+        res = await self.handle(Wire.OPENAI_CHAT, chat, headers, ctx, label="openai_responses")
+        model = res.headers.get("x-route-model", str(body.get("model", "")))
+        if res.stream is not None:
+            hdrs = {**res.headers, "content-type": "text/event-stream"}
+            return Result(res.status, hdrs, stream=rs.stream_from_chat(res.stream, model, custom))
+        if res.status >= 400:
+            return res
+        try:
+            data = json.loads(res.body or b"{}")
+        except json.JSONDecodeError:
+            raise GatewayError(502, "bad-upstream", "Bad upstream answer", "the model returned invalid JSON") from None
+        out = json.dumps(rs.from_chat(data, model, custom)).encode()
+        return Result(res.status, {**res.headers, "content-type": "application/json"}, body=out)
 
     def count_tokens(self, wire: Wire, body: dict[str, Any]) -> int:
         """Estimate for /v1/messages/count_tokens (no provider call): ~4 chars/token.

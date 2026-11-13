@@ -12,8 +12,9 @@ Harness config formats (checked 2026-11-12):
   (haiku = background tasks).
 * OpenCode: `~/.config/opencode/opencode.json` -> provider.<id> with npm
   "@ai-sdk/openai-compatible", options.baseURL, options.apiKey "{env:ROUTE_API_KEY}".
-* Codex: speaks only the OpenAI Responses API (wire_api="responses"); not supported
-  until the gateway serves /v1/responses.
+* Codex: `~/.codex/config.toml` -> model, model_provider = "route", and
+  [model_providers.route] base_url, env_key = "ROUTE_API_KEY", wire_api = "responses"
+  (Codex speaks only the Responses API; the gateway translates it to Chat Completions).
 """
 
 from __future__ import annotations
@@ -160,6 +161,66 @@ def opencode_remove(home: Path) -> Change:
     return Change("opencode", path, "removed", backup)
 
 
+def codex_apply(home: Path, gateway: str, profile: str) -> Change:
+    import tomlkit
+
+    path = home / ".codex" / "config.toml"
+    try:
+        doc = tomlkit.parse(path.read_text(encoding="utf-8")) if path.exists() else tomlkit.document()
+    except Exception as e:  # noqa: BLE001 - tomlkit raises several parse error types
+        raise SetupError(f"{path} is not valid TOML ({e}); fix or move it, nothing was changed") from e
+    want = {
+        "name": "Route gateway",
+        "base_url": gateway.rstrip("/") + "/v1",
+        "env_key": KEY_ENV,
+        "wire_api": "responses",
+    }
+    provs = doc.get("model_providers") or {}
+    if (
+        doc.get("model") == profile
+        and doc.get("model_provider") == PROVIDER_ID
+        and dict(provs.get(PROVIDER_ID) or {}) == want
+    ):
+        return Change("codex", path, "unchanged")
+    backup = _backup(path)
+    doc["model"] = profile
+    doc["model_provider"] = PROVIDER_ID
+    if "model_providers" not in doc:
+        doc["model_providers"] = tomlkit.table(is_super_table=True)
+    tbl = tomlkit.table()
+    for k, v in want.items():
+        tbl[k] = v
+    doc["model_providers"][PROVIDER_ID] = tbl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name("config.toml.tmp")
+    tmp.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    tmp.replace(path)
+    return Change("codex", path, "written", backup)
+
+
+def codex_remove(home: Path) -> Change:
+    import tomlkit
+
+    path = home / ".codex" / "config.toml"
+    if not path.exists():
+        return Change("codex", path, "unchanged")
+    doc = tomlkit.parse(path.read_text(encoding="utf-8"))
+    provs = doc.get("model_providers")
+    if doc.get("model_provider") != PROVIDER_ID and not (provs and PROVIDER_ID in provs):
+        return Change("codex", path, "unchanged")
+    backup = _backup(path)
+    if doc.get("model_provider") == PROVIDER_ID:
+        del doc["model_provider"]
+        if str(doc.get("model", "")).startswith("auto"):
+            del doc["model"]
+    if provs and PROVIDER_ID in provs:
+        del provs[PROVIDER_ID]
+        if not provs:
+            del doc["model_providers"]
+    path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    return Change("codex", path, "removed", backup)
+
+
 def env_file_apply(home: Path, key: str, shells: tuple[str, ...] = (".zshrc", ".bashrc")) -> list[Change]:
     """~/.config/route/route.env (0600) exports the key; shell rc files source it
     (one marked line, added once)."""
@@ -203,11 +264,6 @@ def apply(home: Path, harnesses: list[str], gateway: str, key: str, profiles: li
     unknown = set(harnesses) - set(HARNESSES)
     if unknown:
         raise SetupError(f"unknown harness {sorted(unknown)}; choose from {', '.join(HARNESSES)}")
-    if "codex" in harnesses:
-        raise SetupError(
-            "Codex speaks only the OpenAI Responses API; the gateway does not serve /v1/responses yet. "
-            "Set up claude-code and opencode now; Codex follows when the Responses translator ships."
-        )
     if not gateway.startswith("https://") and not gateway.startswith(("http://127.0.0.1", "http://localhost")):
         raise SetupError("gateway URL must be https (the API key travels with every request)")
     if not key.startswith("rk_"):
@@ -219,6 +275,9 @@ def apply(home: Path, harnesses: list[str], gateway: str, key: str, profiles: li
         out.append(claude_code_apply(home, gateway, key, default_profile, strong_profile))
     if "opencode" in harnesses:
         out.append(opencode_apply(home, gateway, profiles, default_profile))
+    if "codex" in harnesses:
+        out.append(codex_apply(home, gateway, default_profile))
+    if {"opencode", "codex"} & set(harnesses):
         out.extend(env_file_apply(home, key))
     return out
 
@@ -229,5 +288,8 @@ def remove(home: Path, harnesses: list[str]) -> list[Change]:
         out.append(claude_code_remove(home))
     if "opencode" in harnesses:
         out.append(opencode_remove(home))
+    if "codex" in harnesses:
+        out.append(codex_remove(home))
+    if {"opencode", "codex"} & set(harnesses):
         out.extend(env_file_remove(home))
     return out
