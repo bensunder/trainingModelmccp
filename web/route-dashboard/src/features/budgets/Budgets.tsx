@@ -1,13 +1,14 @@
 import { useState, type FormEvent } from "react";
 import { ApiError } from "../../api/client";
 import type { ApiKey, Budget, Period, Scope, Team } from "../../api/types";
-import { useClient } from "../../auth/AuthContext";
+import { useCan, useClient } from "../../auth/AuthContext";
 import { Button, Card, DataTable, Empty, ErrorNote, Field, Loading } from "../../components/ui";
 import { useResource } from "../../hooks/useResource";
 import { usd } from "../../utils/format";
 
 export default function BudgetsContainer({ orgId }: { orgId: string }) {
   const client = useClient();
+  const { write } = useCan();
   const budgets = useResource<Budget[]>(`budgets:${orgId}`, (s) => client.budgets(orgId, s));
   const teams = useResource<Team[]>(`teams:${orgId}`, (s) => client.teams(orgId, s));
   const keys = useResource<ApiKey[]>(`keys:${orgId}`, (s) => client.keys(orgId, s));
@@ -36,7 +37,7 @@ export default function BudgetsContainer({ orgId }: { orgId: string }) {
     <>
       <ErrorNote error={budgets.error ?? err} onRetry={budgets.refresh} />
       {budgets.loading && <Loading label="Loading budgets" />}
-      <BudgetForm
+      {write && <BudgetForm
         targets={targets}
         busy={busy}
         onSave={(b) =>
@@ -45,7 +46,7 @@ export default function BudgetsContainer({ orgId }: { orgId: string }) {
             budgets.mutate((prev) => [...(prev ?? []).filter((x) => x.id !== saved.id), saved]);
           })
         }
-      />
+      />}
       <Card title="Budgets">
         {budgets.data?.length ? (
           <DataTable
@@ -58,7 +59,7 @@ export default function BudgetsContainer({ orgId }: { orgId: string }) {
               { key: "l", header: "Limit", numeric: true, render: (b) => usd(b.limit_usd) },
               { key: "h", header: "When reached", render: (b) => (b.hard ? "Refuse requests" : "Warn only") },
               {
-                key: "x", header: "", render: (b) => (
+                key: "x", header: "", render: (b) => !write ? null : (
                   <Button type="button" variant="danger" aria-label="Delete budget" disabled={busy}
                     onClick={() => run(async () => { await client.deleteBudget(orgId, b.id); budgets.mutate((prev) => prev?.filter((x) => x.id !== b.id)); })}>
                     Delete

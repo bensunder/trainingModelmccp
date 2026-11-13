@@ -98,9 +98,11 @@ export interface Column<T> {
   numeric?: boolean;
 }
 
-export function DataTable<T>({ caption, columns, rows, rowKey }: { caption: string; columns: Column<T>[]; rows: T[]; rowKey: (r: T) => string }) {
+/** `stackOnNarrow`: below ~640px each row becomes a block of "label: value" lines
+ * (headers repeated via data-label) instead of a sideways-scrolling table. */
+export function DataTable<T>({ caption, columns, rows, rowKey, stackOnNarrow }: { caption: string; columns: Column<T>[]; rows: T[]; rowKey: (r: T) => string; stackOnNarrow?: boolean }) {
   return (
-    <div className="table-wrap" tabIndex={0} role="region" aria-label={caption}>
+    <div className={`table-wrap${stackOnNarrow ? " table-stack" : ""}`} tabIndex={0} role="region" aria-label={caption}>
       <table>
         <caption className="sr-only">{caption}</caption>
         <thead>
@@ -116,7 +118,7 @@ export function DataTable<T>({ caption, columns, rows, rowKey }: { caption: stri
           {rows.map((r) => (
             <tr key={rowKey(r)}>
               {columns.map((c) => (
-                <td key={c.key} className={c.numeric ? "num" : undefined}>
+                <td key={c.key} className={c.numeric ? "num" : undefined} data-label={c.header || undefined}>
                   {c.render(r)}
                 </td>
               ))}

@@ -763,3 +763,87 @@ def test_dashboard_is_served_with_strict_security_headers(tmp_path, monkeypatch,
         a = c.get("/dashboard/assets/app-abc123.js")
         assert "immutable" in a.headers["cache-control"]
         assert "content-security-policy" not in c.get("/healthz").headers  # API responses untouched
+
+
+def as_(c: TestClient, token: str, method: str, path: str, **kw) -> httpx.Response:
+    return c.request(method, "/admin/v1" + path, headers={"authorization": f"Bearer {token}"}, **kw)
+
+
+def test_org_admins_are_confined_to_their_org_and_role(env):
+    c, _, store = env
+    a, team_a, client_key = setup_key(c, name="acme")
+    b, team_b, _ = setup_key(c, name="globex")
+    owner = admin(c, "POST", f"/orgs/{a['id']}/admins", json={"label": "alice", "role": "owner"}).json()
+    assert owner["token"].startswith("ra_") and "token_hash" not in owner
+    tok = owner["token"]
+    assert as_(c, tok, "GET", "/me").json() == {"kind": "org", "role": "owner", "org_id": a["id"], "label": "alice",
+                                                "admin_id": owner["id"]}  # fmt: skip
+    # sees only its own org; another org's objects are absent (404), never confirmed (403)
+    assert [o["id"] for o in as_(c, tok, "GET", "/orgs").json()] == [a["id"]]
+    for method, path in [("GET", f"/orgs/{b['id']}"), ("GET", f"/orgs/{b['id']}/teams"), ("GET", f"/orgs/{b['id']}/usage"),
+                         ("GET", f"/orgs/{b['id']}/audit"), ("POST", f"/orgs/{b['id']}/teams/{team_b['id']}/keys"),
+                         ("GET", f"/orgs/{b['id']}/admins")]:  # fmt: skip
+        r = as_(c, tok, method, path, json={"label": "x"} if method == "POST" else None)
+        assert r.status_code == 404, (method, path, r.status_code)
+    # owner manages its org, but platform settings stay with the operator
+    assert as_(c, tok, "POST", f"/orgs/{a['id']}/teams", json={"name": "data"}).status_code == 201
+    assert as_(c, tok, "PATCH", f"/orgs/{a['id']}", json={"default_profile": "auto-cost"}).status_code == 200
+    assert as_(c, tok, "PATCH", f"/orgs/{a['id']}", json={"rpm_per_key": 99999}).status_code == 403
+    assert as_(c, tok, "POST", "/orgs", json={"name": "mine"}).status_code == 403
+    assert as_(c, tok, "GET", "/catalog").status_code == 200 and as_(c, tok, "GET", "/routing").status_code == 200
+    # viewer: reads, cannot change anything
+    viewer = as_(c, tok, "POST", f"/orgs/{a['id']}/admins", json={"label": "bob", "role": "viewer"}).json()["token"]
+    assert as_(c, viewer, "GET", f"/orgs/{a['id']}/usage").status_code == 200
+    for method, path, body in [
+        ("POST", f"/orgs/{a['id']}/teams", {"name": "v"}),
+        ("POST", f"/orgs/{a['id']}/teams/{team_a['id']}/keys", {"label": "v"}),
+        ("PUT", f"/orgs/{a['id']}/guardrails", {"secrets": "off", "pii": "off", "injection": "off"}),
+        ("PUT", f"/orgs/{a['id']}/budgets", {"scope": "org", "scope_id": a["id"], "period": "day", "limit_usd": 1}),
+        ("POST", f"/orgs/{a['id']}/admins", {"label": "v", "role": "owner"}),
+    ]:
+        assert as_(c, viewer, method, path, json=body).status_code == 403, path
+    # tokens are not interchangeable: a client key is no admin token and vice versa
+    assert as_(c, client_key, "GET", "/orgs").status_code == 401
+    assert c.post("/v1/messages", headers={"x-api-key": tok}, json=anthropic_body()).status_code == 401
+    # revocation is immediate
+    admins = as_(c, tok, "GET", f"/orgs/{a['id']}/admins").json()
+    bob = next(x for x in admins if x["label"] == "bob")
+    assert as_(c, tok, "DELETE", f"/orgs/{a['id']}/admins/{bob['id']}").json()["revoked_at"]
+    assert as_(c, viewer, "GET", f"/orgs/{a['id']}/usage").status_code == 401
+    assert as_(c, "ra_not-a-real-token", "GET", "/me").status_code == 401
+
+
+def test_every_admin_change_is_audited_without_secrets(env):
+    c, _, store = env
+    org, team, key = setup_key(c)
+    oid = org["id"]
+    owner = admin(c, "POST", f"/orgs/{oid}/admins", json={"label": "alice", "role": "owner"}).json()
+    tok = owner["token"]
+    k = as_(c, tok, "POST", f"/orgs/{oid}/teams/{team['id']}/keys", json={"label": "ci"}).json()
+    as_(c, tok, "DELETE", f"/orgs/{oid}/keys/{k['id']}")
+    b = as_(
+        c,
+        tok,
+        "PUT",
+        f"/orgs/{oid}/budgets",
+        json={"scope": "org", "scope_id": oid, "period": "month", "limit_usd": 50},
+    ).json()
+    as_(c, tok, "DELETE", f"/orgs/{oid}/budgets/{b['id']}")
+    as_(c, tok, "PUT", f"/orgs/{oid}/guardrails", json={"secrets": "block", "pii": "flag", "injection": "flag"})
+    as_(c, tok, "PATCH", f"/orgs/{oid}/teams/{team['id']}", json={"approved_models": ["glm"]})
+    as_(c, tok, "GET", f"/orgs/{oid}/usage")  # reads are not audited
+    log = as_(c, tok, "GET", f"/orgs/{oid}/audit").json()
+    actions = [e["action"] for e in reversed(log["events"])]
+    assert actions == ["org.create", "team.create", "key.create", "admin.create", "key.create", "key.revoke",
+                       "budget.put", "budget.delete", "guardrails.update", "team.update"]  # fmt: skip
+    by = {e["action"]: e for e in reversed(log["events"])}  # oldest first: the newest of each action wins
+    assert by["org.create"]["actor"] == "operator" and by["key.revoke"]["actor"] == f"admin:{owner['id']}"
+    assert (
+        by["key.create"]["detail"]["prefix"] == k["prefix"] and by["guardrails.update"]["detail"]["secrets"] == "block"
+    )
+    dump = json.dumps(log)
+    assert key not in dump and k["key"] not in dump and tok not in dump  # no plaintext key or token, ever
+    page = as_(c, tok, "GET", f"/orgs/{oid}/audit", params={"limit": 3}).json()
+    assert len(page["events"]) == 3 and page["next_before"]
+    rest = as_(c, tok, "GET", f"/orgs/{oid}/audit", params={"limit": 100, "before": page["next_before"]}).json()
+    assert len(rest["events"]) == len(log["events"]) - 3 and rest["next_before"] is None

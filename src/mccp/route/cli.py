@@ -115,8 +115,12 @@ def bootstrap(
     team: Annotated[str, typer.Option(help="team name")] = "engineering",
     label: Annotated[str, typer.Option(help="who uses the first key")] = "first-developer",
     approved: Annotated[str | None, typer.Option(help="comma list of approved models (default: all)")] = None,
+    owner: Annotated[
+        str | None, typer.Option(help="also issue an org-owner dashboard token to this person (name or e-mail)")
+    ] = None,
 ) -> None:
-    """Create an organisation, a team and its first API key (printed once)."""
+    """Create an organisation, a team and its first API key (printed once); optionally the
+    customer's first owner token, so they manage their own teams, keys and budgets."""
     tok = _secret("ROUTE_ADMIN_TOKEN", "Admin token (hidden): ")
     h = {"authorization": f"Bearer {tok}"}
     base = gateway.rstrip("/") + "/admin/v1"
@@ -131,7 +135,13 @@ def bootstrap(
         t.raise_for_status()
         k = c.post(f"{base}/orgs/{oid}/teams/{t.json()['id']}/keys", json={"label": label})
         k.raise_for_status()
+        a = None
+        if owner:
+            a = c.post(f"{base}/orgs/{oid}/admins", json={"label": owner, "role": "owner"})
+            a.raise_for_status()
     typer.echo(f"org {oid}\nteam {t.json()['id']}\nkey (shown once, store it now): {k.json()['key']}")
+    if a is not None:
+        typer.echo(f"owner token for {owner} (shown once; sign in at /dashboard): {a.json()['token']}")
 
 
 @admin_app.command()

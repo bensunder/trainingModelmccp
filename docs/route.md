@@ -139,12 +139,32 @@ file_search, ...) are refused with a clear 400.
 
 ## Admin API
 
-`/admin/v1` with `Authorization: Bearer <admin token>` (only its SHA-256 is stored):
-orgs (create, patch `default_profile` / `rpm_per_key`), `PUT orgs/{id}/guardrails`,
+`/admin/v1` with `Authorization: Bearer <token>`. Two kinds of principal:
+
+| Token | Who | Can |
+|---|---|---|
+| operator (`ROUTE_ADMIN_TOKEN`, only its SHA-256 configured) | you, the platform operator | everything, every org; only one that creates orgs and changes `rpm_per_key` |
+| `ra_...` role `owner` | a customer's administrator | everything inside their own org, including other admins |
+| `ra_...` role `viewer` | e.g. finance | read only (usage, teams, keys, budgets, audit) |
+
+Org-admin tokens are stored like API keys (HMAC under the pepper), shown once, revoked
+immediately (`DELETE orgs/{id}/admins/{admin_id}`). Another org's objects answer 404,
+never 403, so a token cannot probe what exists. A client key (`rk_`) is never an admin
+token and an admin token is never a client key (tested). `GET /admin/v1/me` says who a
+token is. Every change (org, guardrails, team, key, budget, admin) is written to the org's
+audit log with the actor; keys and tokens appear by prefix only, never in plaintext.
+`GET orgs/{id}/audit?limit=&before=` pages newest first. The audit row is written after
+the change and before the response: a 2xx means it is logged; if the audit write fails
+the request returns 500 even though the change was applied (logged server-side).
+
+`mccp-route admin bootstrap --org NAME --owner dana@acme.com` creates the org, team, first
+API key and the customer's first owner token in one step.
+
+Endpoints: orgs (create, patch `default_profile` / `rpm_per_key`), `PUT orgs/{id}/guardrails`,
 teams (create, patch approved models / default profile), keys (create: plaintext shown
 once; list; revoke), budgets (upsert, list, delete), `GET orgs/{id}/usage` (spend,
 baseline, saved, saved %, tokens, cache hit rate, by model / day / team / task; optional
-raw events), `GET routing`. Errors are RFC 9457 `application/problem+json`. Every org-
+raw events), `GET routing`, admins (create: token shown once; list; revoke), `GET audit`, `GET me`. Errors are RFC 9457 `application/problem+json`. Every org-
 scoped call filters by org in SQL; cross-org access returns 404 (tested).
 
 ## Deployment (srv1507394)
@@ -171,6 +191,6 @@ evidence generation.
 Not yet verified: the Docker image build and compose stack on the VPS, Caddy, real
 provider endpoints and model names (`route.example.yaml` marks every price and the
 Anthropic model id `UNVERIFIED`), live Claude Code / OpenCode / Codex sessions through
-the gateway, the Docker sandbox on a host with a daemon. Not built yet: org-admin (non-operator) accounts, mechanical scoring for `explain` and
+the gateway, the Docker sandbox on a host with a daemon. Not built yet: single sign-on (SAML/OIDC) for org admins (today: tokens), mechanical scoring for `explain` and
 `agentic`, `refactor` tasks from real code, hosted open models on GridShare as a
 route.

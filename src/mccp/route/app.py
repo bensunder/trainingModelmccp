@@ -7,8 +7,11 @@ Client API (what coding tools call):
   POST /v1/responses               OpenAI Responses (Codex), translated to Chat Completions
   GET  /v1/models                  route profiles and the models this key may use
   GET  /v1/usage                   this key's own usage this month
-Admin API (platform operator, ROUTE_ADMIN_TOKEN):
-  /admin/v1/orgs, /teams, /keys, /budgets, /guardrails, /usage, /routing
+Admin API (/admin/v1), two kinds of principal:
+  operator   ROUTE_ADMIN_TOKEN (only its SHA-256 is configured): every org, creates orgs
+  org admin  `ra_...` token bound to one org; role owner (manage the org) or viewer (read)
+  Another org's objects answer 404, not 403: an org admin cannot learn what exists.
+  Every change is written to the org's audit log (GET /admin/v1/orgs/{id}/audit).
 Health: /healthz (process), /readyz (store, cache, providers)
 
 Errors are RFC 9457 problem+json. Client API keys are accepted as
@@ -23,7 +26,7 @@ import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Annotated, Any, Literal
 
@@ -37,7 +40,20 @@ from .config import Catalog, Wire, load_catalog
 from .guardrails import GuardrailPolicy
 from .policy import Evidence, explain
 from .service import Gateway, GatewayError, KeyContext
-from .state import MemoryStore, NotFound, Store, event_dict, hash_key, mint_key, now, period_start, summarize
+from .state import (
+    ADMIN_PREFIX,
+    AuditEvent,
+    MemoryStore,
+    NotFound,
+    Store,
+    event_dict,
+    hash_key,
+    mint_key,
+    new_id,
+    now,
+    period_start,
+    summarize,
+)  # fmt: skip
 from .upstream import Upstream
 
 log = logging.getLogger("mccp.route.api")
@@ -127,6 +143,11 @@ class KeyIn(_Body):
     default_profile: str | None = None
 
 
+class AdminIn(_Body):
+    label: str = Field(min_length=1, max_length=200)
+    role: Literal["owner", "viewer"]
+
+
 class BudgetIn(_Body):
     scope: Literal["org", "team", "key"]
     scope_id: str
@@ -148,18 +169,56 @@ async def _client(request: Request) -> KeyContext:
     return await request.app.state.gw.authenticate(token)
 
 
-async def _admin(request: Request) -> None:
+@dataclass(frozen=True)
+class Principal:
+    kind: Literal["operator", "org"]
+    role: str  # operator | owner | viewer
+    actor: str  # recorded in the audit log
+    org_id: str | None = None
+    label: str = "operator"
+    admin_id: str | None = None
+
+
+OPERATOR = Principal("operator", "operator", "operator")
+
+
+async def _admin(request: Request) -> Principal:
     auth = request.headers.get("authorization", "")
     tok = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    unauthorized = GatewayError(401, "unauthorized", "Unauthorized", "admin token required")
+    if not tok:
+        raise unauthorized
     want = request.app.state.settings.admin_token_sha256
-    got = hashlib.sha256(tok.encode()).hexdigest()
-    if not tok or not hmac.compare_digest(got, want):
-        raise GatewayError(401, "unauthorized", "Unauthorized", "admin token required")
+    if hmac.compare_digest(hashlib.sha256(tok.encode()).hexdigest(), want):
+        return OPERATOR
+    if tok.startswith(ADMIN_PREFIX):
+        g: Gateway = request.app.state.gw
+        a = await g.store.admin_by_hash(hash_key(g.pepper, tok))
+        if a is not None and a.revoked_at is None:
+            return Principal("org", a.role, f"admin:{a.id}", a.org_id, a.label, a.id)
+    raise unauthorized
 
 
 G = Annotated[Gateway, Depends(_gw)]
 C = Annotated[KeyContext, Depends(_client)]
-A = Depends(_admin)
+P = Annotated[Principal, Depends(_admin)]
+FORBIDDEN_RO = ("forbidden", "Forbidden", "this admin token is read-only (viewer)")
+
+
+def allow(p: Principal, org_id: str, write: bool = False) -> None:
+    """Operator: any org. Org admin: its own org only (others look absent: 404);
+    viewers cannot change anything (403)."""
+    if p.kind == "operator":
+        return
+    if p.org_id != org_id:
+        raise NotFound("org")
+    if write and p.role != "owner":
+        raise GatewayError(403, *FORBIDDEN_RO)
+
+
+def operator_only(p: Principal, what: str) -> None:
+    if p.kind != "operator":
+        raise GatewayError(403, "forbidden", "Forbidden", f"{what} is reserved for the platform operator")
 
 
 def create_app(
@@ -320,83 +379,136 @@ def create_app(
     def _ser(obj: Any) -> dict[str, Any]:
         d = asdict(obj)
         d.pop("key_hash", None)
+        d.pop("token_hash", None)
         return {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
 
-    @app.post("/admin/v1/orgs", status_code=201, dependencies=[A])
-    async def create_org(body: OrgIn, g: G) -> dict[str, Any]:
-        _check_profile(g, body.default_profile)
-        return _ser(await g.store.create_org(body.name, body.default_profile))
+    _ser_admin = _ser
 
-    @app.get("/admin/v1/orgs/{org_id}", dependencies=[A])
-    async def get_org(org_id: str, g: G) -> dict[str, Any]:
+    async def audit(g: Gateway, p: Principal, org_id: str, action: str, target: str, **detail: Any) -> None:
+        """Written after the change succeeds, before the response: a client that got a
+        2xx can rely on the change being in the log. If the audit write fails the
+        request fails (500) even though the change itself was applied; the error is logged."""
+        await g.store.record_audit(AuditEvent(new_id(), now(), org_id, p.actor, action, target, detail))
+
+    @app.get("/admin/v1/me")
+    async def me(p: P) -> dict[str, Any]:
+        return {"kind": p.kind, "role": p.role, "org_id": p.org_id, "label": p.label, "admin_id": p.admin_id}
+
+    @app.post("/admin/v1/orgs", status_code=201)
+    async def create_org(body: OrgIn, g: G, p: P) -> dict[str, Any]:
+        operator_only(p, "creating organisations")
+        _check_profile(g, body.default_profile)
+        o = await g.store.create_org(body.name, body.default_profile)
+        await audit(g, p, o.id, "org.create", o.id, name=o.name)
+        return _ser(o)
+
+    @app.get("/admin/v1/orgs")
+    async def list_orgs(g: G, p: P) -> list[dict[str, Any]]:
+        if p.kind == "org":
+            return [_ser(await g.store.get_org(p.org_id or ""))]
+        return [_ser(o) for o in await g.store.list_orgs()]
+
+    @app.get("/admin/v1/orgs/{org_id}")
+    async def get_org(org_id: str, g: G, p: P) -> dict[str, Any]:
+        allow(p, org_id)
         return _ser(await g.store.get_org(org_id))
 
-    @app.patch("/admin/v1/orgs/{org_id}", dependencies=[A])
-    async def patch_org(org_id: str, body: OrgPatch, g: G) -> dict[str, Any]:
+    @app.patch("/admin/v1/orgs/{org_id}")
+    async def patch_org(org_id: str, body: OrgPatch, g: G, p: P) -> dict[str, Any]:
+        allow(p, org_id, write=True)
+        fields = body.model_dump(exclude_unset=True)
+        if "rpm_per_key" in fields:
+            operator_only(p, "changing the per-key rate limit")
         _check_profile(g, body.default_profile)
-        return _ser(await g.store.update_org(org_id, **body.model_dump(exclude_unset=True)))
+        o = await g.store.update_org(org_id, **fields)
+        await audit(g, p, org_id, "org.update", org_id, **fields)
+        return _ser(o)
 
-    @app.put("/admin/v1/orgs/{org_id}/guardrails", dependencies=[A])
-    async def put_guardrails(org_id: str, body: GuardrailPolicy, g: G) -> dict[str, Any]:
-        return _ser(await g.store.update_org(org_id, guardrails=body.model_dump(mode="json")))
+    @app.put("/admin/v1/orgs/{org_id}/guardrails")
+    async def put_guardrails(org_id: str, body: GuardrailPolicy, g: G, p: P) -> dict[str, Any]:
+        allow(p, org_id, write=True)
+        policy = body.model_dump(mode="json")
+        o = await g.store.update_org(org_id, guardrails=policy)
+        await audit(g, p, org_id, "guardrails.update", org_id, **policy)
+        return _ser(o)
 
-    @app.post("/admin/v1/orgs/{org_id}/teams", status_code=201, dependencies=[A])
-    async def create_team(org_id: str, body: TeamIn, g: G) -> dict[str, Any]:
+    @app.post("/admin/v1/orgs/{org_id}/teams", status_code=201)
+    async def create_team(org_id: str, body: TeamIn, g: G, p: P) -> dict[str, Any]:
+        allow(p, org_id, write=True)
         _check_profile(g, body.default_profile)
         _check_models(g, body.approved_models)
         try:
-            return _ser(await g.store.create_team(org_id, body.name, body.approved_models, body.default_profile))
+            t = await g.store.create_team(org_id, body.name, body.approved_models, body.default_profile)
         except ValueError as e:
             raise GatewayError(409, "conflict", "Conflict", str(e)) from e
+        await audit(g, p, org_id, "team.create", t.id, name=t.name, approved_models=body.approved_models)
+        return _ser(t)
 
-    @app.get("/admin/v1/orgs/{org_id}/teams", dependencies=[A])
-    async def list_teams(org_id: str, g: G) -> list[dict[str, Any]]:
+    @app.get("/admin/v1/orgs/{org_id}/teams")
+    async def list_teams(org_id: str, g: G, p: P) -> list[dict[str, Any]]:
+        allow(p, org_id)
         return [_ser(t) for t in await g.store.list_teams(org_id)]
 
-    @app.patch("/admin/v1/orgs/{org_id}/teams/{team_id}", dependencies=[A])
-    async def patch_team(org_id: str, team_id: str, body: TeamPatch, g: G) -> dict[str, Any]:
+    @app.patch("/admin/v1/orgs/{org_id}/teams/{team_id}")
+    async def patch_team(org_id: str, team_id: str, body: TeamPatch, g: G, p: P) -> dict[str, Any]:
+        allow(p, org_id, write=True)
         _check_profile(g, body.default_profile)
         _check_models(g, body.approved_models)
-        return _ser(await g.store.update_team(org_id, team_id, **body.model_dump(exclude_unset=True)))
+        fields = body.model_dump(exclude_unset=True)
+        t = await g.store.update_team(org_id, team_id, **fields)
+        await audit(g, p, org_id, "team.update", team_id, **fields)
+        return _ser(t)
 
-    @app.post("/admin/v1/orgs/{org_id}/teams/{team_id}/keys", status_code=201, dependencies=[A])
-    async def create_key(org_id: str, team_id: str, body: KeyIn, g: G) -> dict[str, Any]:
+    @app.post("/admin/v1/orgs/{org_id}/teams/{team_id}/keys", status_code=201)
+    async def create_key(org_id: str, team_id: str, body: KeyIn, g: G, p: P) -> dict[str, Any]:
+        allow(p, org_id, write=True)
         _check_profile(g, body.default_profile)
         plain, prefix = mint_key()
         k = await g.store.create_key(
             org_id, team_id, body.label, hash_key(g.pepper, plain), prefix, body.default_profile
         )
+        await audit(g, p, org_id, "key.create", k.id, team_id=team_id, label=k.label, prefix=k.prefix)
         return {**_ser(k), "key": plain, "note": "shown once; store it now"}
 
-    @app.get("/admin/v1/orgs/{org_id}/keys", dependencies=[A])
-    async def list_keys(org_id: str, g: G, team_id: str | None = None) -> list[dict[str, Any]]:
+    @app.get("/admin/v1/orgs/{org_id}/keys")
+    async def list_keys(org_id: str, g: G, p: P, team_id: str | None = None) -> list[dict[str, Any]]:
+        allow(p, org_id)
         return [_ser(k) for k in await g.store.list_keys(org_id, team_id)]
 
-    @app.delete("/admin/v1/orgs/{org_id}/keys/{key_id}", dependencies=[A])
-    async def revoke_key(org_id: str, key_id: str, g: G) -> dict[str, Any]:
+    @app.delete("/admin/v1/orgs/{org_id}/keys/{key_id}")
+    async def revoke_key(org_id: str, key_id: str, g: G, p: P) -> dict[str, Any]:
+        allow(p, org_id, write=True)
         k = await g.store.revoke_key(org_id, key_id)
         await g.on_revoke(k)
+        await audit(g, p, org_id, "key.revoke", key_id, prefix=k.prefix, label=k.label)
         return _ser(k)
 
-    @app.put("/admin/v1/orgs/{org_id}/budgets", dependencies=[A])
-    async def put_budget(org_id: str, body: BudgetIn, g: G) -> dict[str, Any]:
-        return _ser(await g.store.set_budget(org_id, body.scope, body.scope_id, body.period, body.limit_usd, body.hard))
+    @app.put("/admin/v1/orgs/{org_id}/budgets")
+    async def put_budget(org_id: str, body: BudgetIn, g: G, p: P) -> dict[str, Any]:
+        allow(p, org_id, write=True)
+        b = await g.store.set_budget(org_id, body.scope, body.scope_id, body.period, body.limit_usd, body.hard)
+        await audit(g, p, org_id, "budget.put", b.id, **body.model_dump())
+        return _ser(b)
 
-    @app.get("/admin/v1/orgs/{org_id}/budgets", dependencies=[A])
-    async def list_budgets(org_id: str, g: G) -> list[dict[str, Any]]:
+    @app.get("/admin/v1/orgs/{org_id}/budgets")
+    async def list_budgets(org_id: str, g: G, p: P) -> list[dict[str, Any]]:
+        allow(p, org_id)
         return [_ser(b) for b in await g.store.list_budgets(org_id)]
 
-    @app.delete("/admin/v1/orgs/{org_id}/budgets/{budget_id}", status_code=204, dependencies=[A])
-    async def delete_budget(org_id: str, budget_id: str, g: G) -> Response:
+    @app.delete("/admin/v1/orgs/{org_id}/budgets/{budget_id}", status_code=204)
+    async def delete_budget(org_id: str, budget_id: str, g: G, p: P) -> Response:
+        allow(p, org_id, write=True)
         await g.store.delete_budget(org_id, budget_id)
+        await audit(g, p, org_id, "budget.delete", budget_id)
         return Response(status_code=204)
 
-    @app.get("/admin/v1/orgs/{org_id}/usage", dependencies=[A])
+    @app.get("/admin/v1/orgs/{org_id}/usage")
     async def org_usage(
-        org_id: str, g: G,
+        org_id: str, g: G, p: P,
         since: datetime | None = None, until: datetime | None = None,
         events: bool = Query(default=False, description="include raw events (max 1000)"),
     ) -> dict[str, Any]:  # fmt: skip
+        allow(p, org_id)
         await g.store.get_org(org_id)
         s = since or period_start("month")
         u = until or (now() + timedelta(seconds=1))
@@ -406,12 +518,42 @@ def create_app(
             out["events"] = [event_dict(e) for e in rows[-1000:]]
         return out
 
-    @app.get("/admin/v1/orgs", dependencies=[A])
-    async def list_orgs(g: G) -> list[dict[str, Any]]:
-        return [_ser(o) for o in await g.store.list_orgs()]
+    # -- org admins and the audit log ----------------------------------------------------
+    @app.post("/admin/v1/orgs/{org_id}/admins", status_code=201)
+    async def create_admin(org_id: str, body: AdminIn, g: G, p: P) -> dict[str, Any]:
+        allow(p, org_id, write=True)
+        plain, prefix = mint_key(ADMIN_PREFIX)
+        a = await g.store.create_admin(org_id, body.label, body.role, hash_key(g.pepper, plain), prefix)
+        await audit(g, p, org_id, "admin.create", a.id, label=a.label, role=a.role, prefix=a.prefix)
+        return {**_ser_admin(a), "token": plain, "note": "shown once; store it now"}
 
-    @app.get("/admin/v1/catalog", dependencies=[A])
-    async def catalog_view(g: G) -> dict[str, Any]:
+    @app.get("/admin/v1/orgs/{org_id}/admins")
+    async def list_admins(org_id: str, g: G, p: P) -> list[dict[str, Any]]:
+        allow(p, org_id)
+        return [_ser_admin(a) for a in await g.store.list_admins(org_id)]
+
+    @app.delete("/admin/v1/orgs/{org_id}/admins/{admin_id}")
+    async def revoke_admin(org_id: str, admin_id: str, g: G, p: P) -> dict[str, Any]:
+        allow(p, org_id, write=True)
+        a = await g.store.revoke_admin(org_id, admin_id)
+        await audit(g, p, org_id, "admin.revoke", admin_id, label=a.label, prefix=a.prefix)
+        return _ser_admin(a)
+
+    @app.get("/admin/v1/orgs/{org_id}/audit")
+    async def list_audit(
+        org_id: str, g: G, p: P,
+        limit: int = Query(default=100, ge=1, le=500), before: datetime | None = None,
+    ) -> dict[str, Any]:  # fmt: skip
+        allow(p, org_id)
+        await g.store.get_org(org_id)
+        rows = await g.store.list_audit(org_id, limit, before)
+        return {
+            "events": [{**asdict(e), "created_at": e.created_at.isoformat()} for e in rows],
+            "next_before": rows[-1].created_at.isoformat() if len(rows) == limit else None,
+        }
+
+    @app.get("/admin/v1/catalog")
+    async def catalog_view(g: G, p: P) -> dict[str, Any]:
         c = g.catalog
         return {
             "version": c.version,
@@ -427,8 +569,8 @@ def create_app(
                           "fallback": p.fallback, "background_model": p.background_model} for p in c.profiles],
         }  # fmt: skip
 
-    @app.get("/admin/v1/routing", dependencies=[A])
-    async def routing(g: G) -> dict[str, Any]:
+    @app.get("/admin/v1/routing")
+    async def routing(g: G, p: P) -> dict[str, Any]:
         return {
             "catalog_version": g.catalog.version,
             "evidence": {"suite": g.evidence.suite, "generated_at": g.evidence.generated_at},

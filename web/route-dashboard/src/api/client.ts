@@ -1,5 +1,6 @@
 import type {
-  ApiKey, Budget, Catalog, CreatedKey, GuardrailPolicy, Org, Period, Problem, Routing, Scope, Team, Usage,
+  AdminRole, ApiKey, AuditPage, Budget, Catalog, CreatedAdmin, CreatedKey, GuardrailPolicy, Me, Org, OrgAdmin, Period,
+  Problem, Routing, Scope, Team, Usage,
 } from "./types";
 
 /** An error the admin API reported (RFC 9457 problem+json), or a transport failure. */
@@ -52,6 +53,12 @@ export function createClient(token: string, fetchImpl: Fetch = fetch.bind(global
 
   const org = (id: string) => `/admin/v1/orgs/${encodeURIComponent(id)}`;
   return {
+    me: (s?: AbortSignal) => request<Me>("GET", "/admin/v1/me", undefined, s),
+    admins: (id: string, s?: AbortSignal) => request<OrgAdmin[]>("GET", `${org(id)}/admins`, undefined, s),
+    createAdmin: (id: string, label: string, role: AdminRole) => request<CreatedAdmin>("POST", `${org(id)}/admins`, { label, role }),
+    revokeAdmin: (id: string, adminId: string) => request<OrgAdmin>("DELETE", `${org(id)}/admins/${encodeURIComponent(adminId)}`),
+    audit: (id: string, before?: string | null, s?: AbortSignal) =>
+      request<AuditPage>("GET", `${org(id)}/audit?limit=100${before ? `&before=${encodeURIComponent(before)}` : ""}`, undefined, s),
     listOrgs: (s?: AbortSignal) => request<Org[]>("GET", "/admin/v1/orgs", undefined, s),
     createOrg: (name: string) => request<Org>("POST", "/admin/v1/orgs", { name }),
     patchOrg: (id: string, patch: Partial<Pick<Org, "name" | "default_profile" | "rpm_per_key">>) => request<Org>("PATCH", org(id), patch),

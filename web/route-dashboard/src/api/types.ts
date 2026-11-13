@@ -116,3 +116,42 @@ export interface Problem {
   detail: string;
   [extra: string]: unknown;
 }
+
+export interface Me {
+  kind: "operator" | "org";
+  role: "operator" | "owner" | "viewer";
+  org_id: string | null;
+  label: string;
+  admin_id: string | null;
+}
+
+export type AdminRole = "owner" | "viewer";
+
+export interface OrgAdmin {
+  id: string;
+  org_id: string;
+  label: string;
+  role: AdminRole;
+  prefix: string;
+  created_at: Iso;
+  revoked_at: Iso | null;
+}
+
+export interface CreatedAdmin extends OrgAdmin {
+  token: string; // plaintext, shown once
+}
+
+export interface AuditEvent {
+  id: string;
+  created_at: Iso;
+  org_id: string;
+  actor: string; // "operator" | "admin:<id>"
+  action: string;
+  target: string;
+  detail: Record<string, unknown>;
+}
+
+export interface AuditPage {
+  events: AuditEvent[];
+  next_before: Iso | null;
+}

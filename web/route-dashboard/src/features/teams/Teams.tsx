@@ -1,13 +1,14 @@
 import { useState, type FormEvent } from "react";
 import { ApiError } from "../../api/client";
 import type { ApiKey, Catalog, CreatedKey, Team } from "../../api/types";
-import { useClient } from "../../auth/AuthContext";
+import { useCan, useClient } from "../../auth/AuthContext";
 import { Button, Card, DataTable, Dialog, Empty, ErrorNote, Field, Loading } from "../../components/ui";
 import { useResource } from "../../hooks/useResource";
 import { date } from "../../utils/format";
 
 export default function TeamsContainer({ orgId }: { orgId: string }) {
   const client = useClient();
+  const { write } = useCan();
   const teams = useResource<Team[]>(`teams:${orgId}`, (s) => client.teams(orgId, s));
   const keys = useResource<ApiKey[]>(`keys:${orgId}`, (s) => client.keys(orgId, s));
   const catalog = useResource<Catalog>("catalog", (s) => client.catalog(s));
@@ -35,6 +36,7 @@ export default function TeamsContainer({ orgId }: { orgId: string }) {
       models={catalog.data?.models.map((m) => m.id) ?? []}
       profiles={catalog.data?.profiles.map((p) => p.id) ?? []}
       loading={teams.loading || keys.loading}
+      canWrite={write}
       error={teams.error ?? keys.error ?? actionError}
       busy={busy}
       created={created}
@@ -72,6 +74,7 @@ interface ViewProps {
   models: string[];
   profiles: string[];
   loading: boolean;
+  canWrite: boolean;
   error: ApiError | null;
   busy: string | null;
   created: CreatedKey | null;
@@ -87,7 +90,7 @@ export function TeamsView(p: ViewProps) {
     <>
       <ErrorNote error={p.error} />
       {p.loading && <Loading label="Loading teams" />}
-      <NewTeamForm busy={p.busy === "team"} onCreate={p.onCreateTeam} />
+      {p.canWrite && <NewTeamForm busy={p.busy === "team"} onCreate={p.onCreateTeam} />}
       {p.teams?.length === 0 && <Empty>No teams yet. Create one to issue API keys.</Empty>}
       {p.teams?.map((t) => (
         <TeamCard key={t.id} {...p} team={t} keys={(p.keys ?? []).filter((k) => k.team_id === t.id)} />
@@ -124,7 +127,7 @@ function NewTeamForm({ busy, onCreate }: { busy: boolean; onCreate: (name: strin
   );
 }
 
-function TeamCard({ team, keys, models, profiles, busy, onSaveTeam, onCreateKey, onRevoke }: Omit<ViewProps, "keys"> & { team: Team; keys: ApiKey[] }) {
+function TeamCard({ team, keys, models, profiles, busy, canWrite, onSaveTeam, onCreateKey, onRevoke }: Omit<ViewProps, "keys"> & { team: Team; keys: ApiKey[] }) {
   const [all, setAll] = useState(team.approved_models === null);
   const [approved, setApproved] = useState<Set<string>>(new Set(team.approved_models ?? []));
   const [profile, setProfile] = useState(team.default_profile ?? "");
@@ -139,7 +142,7 @@ function TeamCard({ team, keys, models, profiles, busy, onSaveTeam, onCreateKey,
           void onSaveTeam(team, all ? null : [...approved].sort(), profile || null);
         }}
       >
-        <fieldset>
+        <fieldset disabled={!canWrite}>
           <legend>Approved models</legend>
           <label className="check">
             <input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} /> Every catalog model
@@ -156,7 +159,7 @@ function TeamCard({ team, keys, models, profiles, busy, onSaveTeam, onCreateKey,
         </fieldset>
         <Field label="Default route profile" hint="Used when a tool asks for a model the gateway does not know">
           {(id) => (
-            <select id={id} value={profile} onChange={(e) => setProfile(e.target.value)}>
+            <select id={id} value={profile} onChange={(e) => setProfile(e.target.value)} disabled={!canWrite}>
               <option value="">Organisation default</option>
               {profiles.map((pr) => (
                 <option key={pr} value={pr}>{pr}</option>
@@ -164,7 +167,7 @@ function TeamCard({ team, keys, models, profiles, busy, onSaveTeam, onCreateKey,
             </select>
           )}
         </Field>
-        <div><Button type="submit" variant="ghost" busy={busy === `save:${team.id}`}>Save team</Button></div>
+        {canWrite && <div><Button type="submit" variant="ghost" busy={busy === `save:${team.id}`}>Save team</Button></div>}
       </form>
       <h3>API keys</h3>
       {keys.length ? (
@@ -179,7 +182,7 @@ function TeamCard({ team, keys, models, profiles, busy, onSaveTeam, onCreateKey,
             { key: "s", header: "Status", render: (k) => (k.revoked_at ? <span className="tag tag-off">revoked</span> : <span className="tag tag-on">active</span>) },
             {
               key: "a", header: "", render: (k) =>
-                k.revoked_at ? null : (
+                k.revoked_at || !canWrite ? null : (
                   <Button type="button" variant="danger" busy={busy === `revoke:${k.id}`} onClick={() => void onRevoke(k)} aria-label={`Revoke ${k.label}`}>
                     Revoke
                   </Button>
@@ -190,7 +193,7 @@ function TeamCard({ team, keys, models, profiles, busy, onSaveTeam, onCreateKey,
       ) : (
         <Empty>No keys yet.</Empty>
       )}
-      <form
+      {canWrite && <form
         className="row"
         onSubmit={(e) => {
           e.preventDefault();
@@ -201,7 +204,7 @@ function TeamCard({ team, keys, models, profiles, busy, onSaveTeam, onCreateKey,
           {(id) => <input id={id} value={label} onChange={(e) => setLabel(e.target.value)} maxLength={200} placeholder="e.g. alice-laptop" />}
         </Field>
         <Button type="submit" busy={busy === `key:${team.id}`}>Issue key</Button>
-      </form>
+      </form>}
     </Card>
   );
 }

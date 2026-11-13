@@ -1,12 +1,13 @@
-"""Durable state: organisations, teams, API keys, budgets, usage events.
+"""Durable state: organisations, teams, API keys, budgets, usage events, org
+admins and the admin audit log.
 
 Two implementations of one interface: `MemoryStore` (tests, local development)
 and `PgStore` (production; schema `route`, its own append-only migrations). Every
 query that reads tenant data takes the org id and filters on it; tenant isolation
 is tested, not assumed.
 
-API keys are stored as HMAC-SHA256 under a server-side pepper, never in clear.
-The plaintext is returned once, at creation.
+API keys (`rk_`) and org-admin tokens (`ra_`) are stored as HMAC-SHA256 under a
+server-side pepper, never in clear. The plaintext is returned once, at creation.
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 KEY_PREFIX = "rk_"
+ADMIN_PREFIX = "ra_"
+ROLES = ("owner", "viewer")
 
 
 def now() -> datetime:
@@ -105,15 +108,44 @@ class UsageEvent:
     stream: bool = False
 
 
+@dataclass(frozen=True)
+class OrgAdmin:
+    """A customer-side administrator of one organisation. owner: manage everything in
+    the org (teams, keys, budgets, guardrails, other admins); viewer: read only."""
+
+    id: str
+    org_id: str
+    label: str  # who holds it (person, team)
+    role: str  # owner | viewer
+    prefix: str
+    token_hash: str
+    created_at: datetime
+    revoked_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AuditEvent:
+    """One admin change: who (operator or admin prefix), what, on which object. Never
+    carries secrets: created keys/tokens are recorded by id and prefix only."""
+
+    id: str
+    created_at: datetime
+    org_id: str
+    actor: str  # "operator" | "admin:<id>"
+    action: str  # e.g. key.create, budget.delete
+    target: str  # object id
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
 def hash_key(pepper: bytes, plaintext: str) -> str:
     return hmac.new(pepper, plaintext.encode(), hashlib.sha256).hexdigest()
 
 
-def mint_key() -> tuple[str, str]:
+def mint_key(prefix: str = KEY_PREFIX) -> tuple[str, str]:
     """(plaintext, prefix). 32 random bytes; the prefix identifies, never authenticates."""
     body = secrets.token_urlsafe(32)
-    plain = f"{KEY_PREFIX}{body}"
-    return plain, plain[: len(KEY_PREFIX) + 8]
+    plain = f"{prefix}{body}"
+    return plain, plain[: len(prefix) + 8]
 
 
 def period_start(period: str, at: datetime | None = None) -> datetime:
@@ -160,6 +192,12 @@ class Store(Protocol):
     ) -> Budget: ...
     async def list_budgets(self, org_id: str) -> list[Budget]: ...
     async def delete_budget(self, org_id: str, budget_id: str) -> None: ...
+    async def create_admin(self, org_id: str, label: str, role: str, token_hash: str, prefix: str) -> OrgAdmin: ...
+    async def admin_by_hash(self, token_hash: str) -> OrgAdmin | None: ...
+    async def list_admins(self, org_id: str) -> list[OrgAdmin]: ...
+    async def revoke_admin(self, org_id: str, admin_id: str) -> OrgAdmin: ...
+    async def record_audit(self, event: AuditEvent) -> None: ...
+    async def list_audit(self, org_id: str, limit: int = 100, before: datetime | None = None) -> list[AuditEvent]: ...
     async def record_usage(self, events: list[UsageEvent]) -> None: ...
     async def spend(self, org_id: str, scope: str, scope_id: str, since: datetime) -> float: ...
     async def usage_rows(
@@ -177,6 +215,8 @@ class MemoryStore:
         self.keys: dict[str, ApiKey] = {}
         self.budgets: dict[str, Budget] = {}
         self.usage: list[UsageEvent] = []
+        self.admins: dict[str, OrgAdmin] = {}
+        self.audit: list[AuditEvent] = []
 
     async def create_org(self, name: str, default_profile: str | None = None) -> Org:
         o = Org(new_id(), name, now(), default_profile=default_profile)
@@ -267,6 +307,35 @@ class MemoryStore:
         if b is None or b.org_id != org_id:
             raise NotFound("budget")
         del self.budgets[budget_id]
+
+    async def create_admin(self, org_id, label, role, token_hash, prefix) -> OrgAdmin:
+        await self.get_org(org_id)
+        if role not in ROLES:
+            raise ValueError(f"unknown role {role}")
+        a = OrgAdmin(new_id(), org_id, label, role, prefix, token_hash, now())
+        self.admins[a.id] = a
+        return a
+
+    async def admin_by_hash(self, token_hash) -> OrgAdmin | None:
+        return next((a for a in self.admins.values() if hmac.compare_digest(a.token_hash, token_hash)), None)
+
+    async def list_admins(self, org_id) -> list[OrgAdmin]:
+        return sorted((a for a in self.admins.values() if a.org_id == org_id), key=lambda a: a.created_at)
+
+    async def revoke_admin(self, org_id, admin_id) -> OrgAdmin:
+        a = self.admins.get(admin_id)
+        if a is None or a.org_id != org_id:
+            raise NotFound("admin")
+        a = replace(a, revoked_at=a.revoked_at or now())
+        self.admins[a.id] = a
+        return a
+
+    async def record_audit(self, event) -> None:
+        self.audit.append(event)
+
+    async def list_audit(self, org_id, limit=100, before=None) -> list[AuditEvent]:
+        rows = [e for e in self.audit if e.org_id == org_id and (before is None or e.created_at < before)]
+        return sorted(rows, key=lambda e: e.created_at, reverse=True)[:limit]
 
     async def record_usage(self, events) -> None:
         self.usage.extend(events)

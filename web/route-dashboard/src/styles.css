@@ -38,7 +38,7 @@ code, .secret { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fon
 .brand { font-weight: 800; letter-spacing: -.02em; font-size: 1.15rem; }
 .brand-dot { color: var(--accent); }
 .topbar nav ul { list-style: none; display: flex; gap: .25rem; margin: 0; padding: 0; flex-wrap: wrap; }
-.topbar nav a { display: block; padding: .4rem .7rem; border-radius: 8px; text-decoration: none; color: var(--muted); }
+.topbar nav a { display: block; white-space: nowrap; padding: .4rem .7rem; border-radius: 8px; text-decoration: none; color: var(--muted); }
 .topbar nav a[aria-current="page"] { background: var(--bg); color: var(--text); font-weight: 600; }
 .topbar-end { margin-left: auto; display: flex; gap: .5rem; align-items: center; }
 .content { width: 100%; max-width: 1180px; margin: 0 auto; padding: 1.25rem 1rem 3rem; display: flex; flex-direction: column; gap: 1rem; }
@@ -107,13 +107,25 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .signin { min-height: 100vh; display: grid; place-items: center; padding: 1rem; }
 .signin .card { width: min(420px, 100%); display: flex; flex-direction: column; gap: .9rem; }
 .org-pick select { min-width: 160px; }
+.who { font-size: .85rem; color: var(--muted); white-space: nowrap; max-width: 14rem; overflow: hidden; text-overflow: ellipsis; }
 
 @media (max-width: 720px) {
   .row { flex-direction: column; align-items: stretch; }
-  .topbar nav { order: 3; width: 100%; overflow-x: auto; }
+  .topbar nav { order: 3; width: 100%; overflow-x: auto; scrollbar-width: none;
+    /* fade at the edge: there is more to scroll to */
+    mask-image: linear-gradient(to right, #000 85%, transparent); }
+  .topbar nav::-webkit-scrollbar { display: none; }
   .topbar nav ul { flex-wrap: nowrap; }
   .field { min-width: 0; }
   th, td { padding: .4rem .35rem; }
   table { font-size: .85rem; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+@media (max-width: 640px) {
+  .table-stack thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .table-stack table, .table-stack tbody, .table-stack tr, .table-stack td { display: block; width: 100%; }
+  .table-stack tr { padding: .6rem 0; border-bottom: 1px solid var(--line); }
+  .table-stack td { border: 0; padding: .15rem 0; }
+  .table-stack td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; }
+}

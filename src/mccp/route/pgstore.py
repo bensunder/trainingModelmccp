@@ -15,7 +15,7 @@ from typing import Any
 
 import asyncpg
 
-from .state import ApiKey, Budget, NotFound, Org, Team, UsageEvent, new_id, now
+from .state import ROLES, ApiKey, AuditEvent, Budget, NotFound, Org, OrgAdmin, Team, UsageEvent, new_id, now
 
 MIGRATIONS: list[tuple[str, str]] = [
     (
@@ -60,6 +60,24 @@ MIGRATIONS: list[tuple[str, str]] = [
         CREATE INDEX ON route.usage (org_id, created_at);
         CREATE INDEX ON route.usage (org_id, team_id, created_at);
         CREATE INDEX ON route.usage (org_id, key_id, created_at);
+        """,
+    ),
+    (
+        "0002_org_admins_audit",
+        """
+        CREATE TABLE route.org_admins (
+          id uuid PRIMARY KEY, org_id uuid NOT NULL REFERENCES route.orgs(id) ON DELETE CASCADE,
+          label text NOT NULL, role text NOT NULL CHECK (role IN ('owner','viewer')),
+          prefix text NOT NULL, token_hash text NOT NULL UNIQUE,
+          created_at timestamptz NOT NULL, revoked_at timestamptz
+        );
+        CREATE INDEX ON route.org_admins (org_id);
+        CREATE TABLE route.audit (
+          id uuid PRIMARY KEY, created_at timestamptz NOT NULL,
+          org_id uuid NOT NULL REFERENCES route.orgs(id) ON DELETE CASCADE,
+          actor text NOT NULL, action text NOT NULL, target text NOT NULL, detail jsonb NOT NULL
+        );
+        CREATE INDEX ON route.audit (org_id, created_at DESC);
         """,
     ),
 ]
@@ -126,6 +144,21 @@ def _budget(r: asyncpg.Record) -> Budget:
     return Budget(
         str(r["id"]), str(r["org_id"]), r["scope"], str(r["scope_id"]), r["period"], float(r["limit_usd"]), r["hard"]
     )
+
+
+def _admin(r: asyncpg.Record) -> OrgAdmin:
+    return OrgAdmin(
+        str(r["id"]), str(r["org_id"]), r["label"], r["role"], r["prefix"], r["token_hash"], r["created_at"],
+        r["revoked_at"],
+    )  # fmt: skip
+
+
+def _audit(r: asyncpg.Record) -> AuditEvent:
+    d = r["detail"]
+    return AuditEvent(
+        str(r["id"]), r["created_at"], str(r["org_id"]), r["actor"], r["action"], r["target"],
+        json.loads(d) if isinstance(d, str) else dict(d),
+    )  # fmt: skip
 
 
 _USAGE_COLS = [
@@ -284,6 +317,49 @@ class PgStore:
         r = await self.pool.execute("DELETE FROM route.budgets WHERE org_id = $1 AND id = $2", org_id, budget_id)
         if r.endswith(" 0"):
             raise NotFound("budget")
+
+    async def create_admin(self, org_id, label, role, token_hash, prefix) -> OrgAdmin:
+        await self.get_org(org_id)
+        if role not in ROLES:
+            raise ValueError(f"unknown role {role}")
+        r = await self._one(
+            "INSERT INTO route.org_admins (id, org_id, label, role, prefix, token_hash, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+            new_id(), org_id, label, role, prefix, token_hash, now(),
+        )  # fmt: skip
+        return _admin(r)
+
+    async def admin_by_hash(self, token_hash) -> OrgAdmin | None:
+        r = await self.pool.fetchrow("SELECT * FROM route.org_admins WHERE token_hash = $1", token_hash)
+        return _admin(r) if r else None
+
+    async def list_admins(self, org_id) -> list[OrgAdmin]:
+        rows = await self.pool.fetch("SELECT * FROM route.org_admins WHERE org_id = $1 ORDER BY created_at", org_id)
+        return [_admin(r) for r in rows]
+
+    async def revoke_admin(self, org_id, admin_id) -> OrgAdmin:
+        r = await self._one(
+            "UPDATE route.org_admins SET revoked_at = COALESCE(revoked_at, $3) WHERE org_id = $1 AND id = $2 RETURNING *",
+            org_id, admin_id, now(),
+        )  # fmt: skip
+        return _admin(r)
+
+    async def record_audit(self, event: AuditEvent) -> None:
+        await self.pool.execute(
+            "INSERT INTO route.audit (id, created_at, org_id, actor, action, target, detail) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            event.id, event.created_at, event.org_id, event.actor, event.action, event.target, event.detail,
+        )  # fmt: skip
+
+    async def list_audit(self, org_id, limit=100, before=None) -> list[AuditEvent]:
+        if before is None:
+            rows = await self.pool.fetch(
+                "SELECT * FROM route.audit WHERE org_id = $1 ORDER BY created_at DESC LIMIT $2", org_id, limit
+            )
+        else:
+            rows = await self.pool.fetch(
+                "SELECT * FROM route.audit WHERE org_id = $1 AND created_at < $2 ORDER BY created_at DESC LIMIT $3",
+                org_id, before, limit,
+            )  # fmt: skip
+        return [_audit(r) for r in rows]
 
     async def record_usage(self, events: list[UsageEvent]) -> None:
         if not events:

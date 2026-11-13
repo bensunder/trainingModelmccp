@@ -6,6 +6,8 @@ export const usd = (v: number) => (Math.abs(v) > 0 && Math.abs(v) < 1 ? smallUsd
 export const compact = (v: number) => compactFmt.format(v);
 export const pct = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `${(v * 100).toFixed(1)}%`);
 export const date = (iso: string) => new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+export const dateTime = (iso: string) =>
+  new Date(iso).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 
 /** First day of the current UTC month, as the API expects. */
 export function monthStartIso(now = new Date()): string {

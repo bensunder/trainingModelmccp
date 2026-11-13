@@ -9,7 +9,18 @@ from datetime import timedelta
 import pytest
 
 from mccp.route.pgstore import MIGRATIONS, PgStore, migrate
-from mccp.route.state import MemoryStore, NotFound, UsageEvent, hash_key, mint_key, new_id, now, summarize
+from mccp.route.state import (
+    ADMIN_PREFIX,
+    AuditEvent,
+    MemoryStore,
+    NotFound,
+    UsageEvent,
+    hash_key,
+    mint_key,
+    new_id,
+    now,
+    summarize,
+)  # fmt: skip
 from tests.conftest import ADMIN_DSN, PG
 
 pytestmark = pytest.mark.asyncio
@@ -99,6 +110,32 @@ async def test_budgets_upsert_and_spend_by_scope(store):
     await store.delete_budget(o.id, b.id)
     with pytest.raises(NotFound):
         await store.delete_budget(o.id, b.id)
+
+
+async def test_org_admins_and_audit_are_per_org(store):
+    a = await store.create_org("A")
+    b = await store.create_org("B")
+    plain, prefix = mint_key(ADMIN_PREFIX)
+    assert plain.startswith("ra_") and prefix.startswith("ra_")
+    adm = await store.create_admin(a.id, "alice", "owner", hash_key(b"p" * 32, plain), prefix)
+    assert (await store.admin_by_hash(hash_key(b"p" * 32, plain))).id == adm.id
+    with pytest.raises(ValueError):
+        await store.create_admin(a.id, "x", "superuser", "h", "ra_x")
+    with pytest.raises(NotFound):
+        await store.revoke_admin(b.id, adm.id)  # A's admin through B's org
+    r = await store.revoke_admin(a.id, adm.id)
+    assert r.revoked_at is not None and (await store.revoke_admin(a.id, adm.id)).revoked_at == r.revoked_at
+    assert [x.id for x in await store.list_admins(a.id)] == [adm.id] and await store.list_admins(b.id) == []
+    t0 = now()
+    for i in range(3):
+        await store.record_audit(AuditEvent(new_id(), t0 + timedelta(seconds=i), a.id, "operator", f"act.{i}", "t",
+                                            {"n": i}))  # fmt: skip
+    await store.record_audit(AuditEvent(new_id(), t0, b.id, "operator", "other", "t", {}))
+    rows = await store.list_audit(a.id, limit=2)
+    assert [e.action for e in rows] == ["act.2", "act.1"] and rows[0].detail == {"n": 2}  # newest first
+    older = await store.list_audit(a.id, before=rows[-1].created_at)
+    assert [e.action for e in older] == ["act.0"]
+    assert [e.action for e in await store.list_audit(b.id)] == ["other"]
 
 
 async def test_pg_migrations_are_append_only():
