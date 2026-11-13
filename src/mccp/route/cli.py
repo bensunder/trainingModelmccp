@@ -6,6 +6,7 @@
   mccp-route doctor --gateway URL        check reachability and key, no model call
   mccp-route admin bootstrap ...         create org + team + first key (admin token asked hidden)
   mccp-route admin routing               what each profile routes to today, and why
+  mccp-route eval import|estimate|run    build tasks from benchmarks, price a run, measure models
 
 Secrets are never accepted as command-line arguments (shell history, process
 lists): keys and tokens come from a hidden prompt or an environment variable.
@@ -160,6 +161,39 @@ def eval_sample(
 
     tasks.write(tasks.SAMPLE, out)
     typer.echo(f"wrote {len(tasks.SAMPLE)} tasks to {out}")
+
+
+@eval_app.command("import")
+def eval_import(
+    source: Annotated[str, typer.Option(help="humaneval | mbpp")],
+    path: Annotated[Path, typer.Option(help="local copy of the pinned benchmark file (see docs/route.md)")],
+    out: Annotated[Path, typer.Option(help="task file to write (JSONL)")],
+    classes: Annotated[str, typer.Option(help="comma list of quick_edit,debug,tests")] = "quick_edit,debug,tests",
+    allow_unpinned: Annotated[bool, typer.Option(help="accept a file whose sha256 is not the pinned release")] = False,
+    limit: Annotated[int | None, typer.Option(help="only the first N problems")] = None,
+    seed: Annotated[int, typer.Option(help="planted-bug selection seed")] = 0,
+) -> None:
+    """Build scored tasks from a public benchmark. Runs only the benchmark's own code in the
+    local sandbox to validate it; makes no model calls and costs nothing."""
+    import asyncio
+
+    from .config import TaskClass
+    from .evals import importers, tasks
+    from .evals.sandbox import LocalSandbox
+
+    try:
+        wanted = tuple(TaskClass(c.strip()) for c in classes.split(",") if c.strip())
+        ts, rep = asyncio.run(importers.build(source, importers.read(path), LocalSandbox(), wanted,
+                                              allow_unpinned=allow_unpinned, limit=limit, seed=seed))  # fmt: skip
+    except (importers.SourceError, ValueError) as e:
+        typer.echo(f"not imported: {e}", err=True)
+        raise typer.Exit(2) from e
+    tasks.write(ts, out)
+    typer.echo(f"{source}: {rep.problems} problems -> {len(ts)} tasks {json.dumps(rep.tasks_by_class)} -> {out}")
+    if rep.dropped_reference_fails:
+        typer.echo(f"  dropped (canonical solution fails its own tests here): {', '.join(rep.dropped_reference_fails)}")
+    if rep.no_killed_mutant:
+        typer.echo(f"  no debug/tests task (no planted bug that the tests catch): {len(rep.no_killed_mutant)} problems")
 
 
 @eval_app.command("estimate")

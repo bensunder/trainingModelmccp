@@ -70,6 +70,36 @@ mccp-route eval run -g https://inference.whyaidata.com --catalog route.yaml --ta
 cp eval-2026-11/evidence.json deploy/route/evidence/evidence.json   # gateway reads ROUTE_EVIDENCE
 ```
 
+### Real task sets from public benchmarks (no model calls, no cost)
+
+```
+git clone https://github.com/openai/human-eval && git -C human-eval checkout b9453e8f1865df0a0057a1383767caa400acfbcf
+git clone --depth 1 --filter=blob:none --sparse https://github.com/google-research/google-research \
+    && git -C google-research sparse-checkout set mbpp
+mccp-route eval import --source humaneval --path human-eval/data/HumanEval.jsonl.gz --out he.jsonl
+mccp-route eval import --source mbpp --path google-research/mbpp/sanitized-mbpp.json --out mbpp.jsonl
+cat he.jsonl mbpp.jsonl > tasks.jsonl
+```
+
+The importer refuses a file whose SHA-256 is not the pinned release (`importers.PINS`),
+and runs only the benchmark's own code (local sandbox) to validate each task. Per
+problem it makes a `quick_edit` task (implement from the spec), a `debug` task (the
+canonical solution with one planted bug: a single comparison / arithmetic / boolean /
+constant mutation, kept only if the benchmark's tests catch it) and a `tests` task
+(write asserts that pass on the canonical solution and catch every planted bug; an
+answer that redefines the function is rejected). Measured on the pinned files:
+
+| source | licence | problems | quick_edit | debug | tests | dropped |
+|---|---|---|---|---|---|---|
+| HumanEval (164) | MIT | 164 | 164 | 147 | 147 | 0 |
+| MBPP sanitized (427) | repo Apache-2.0; dataset card CC-BY-4.0 (card not re-checked here) | 427 | 426 | 293 | 293 | 1 (canonical fails its own tests) |
+
+Every one of the 1,470 tasks was checked: the canonical answer passes, the planted bug
+fails, the benchmark's own tests pass as a `tests` answer. Caveats: these benchmarks
+are public and old, so models may have trained on them (absolute pass rates are
+optimistic; the comparison on identical tasks is what routing uses), and the tasks
+are single functions, not multi-file repository edits. `refactor` gets no tasks yet.
+
 Tasks are scored by running code in a sandbox, never by judging prose: quick_edit /
 debug / refactor answers must pass hidden tests; a `tests` answer must pass on the
 reference implementation and fail on every planted bug. `explain` and `agentic` have no
@@ -141,6 +171,6 @@ evidence generation.
 Not yet verified: the Docker image build and compose stack on the VPS, Caddy, real
 provider endpoints and model names (`route.example.yaml` marks every price and the
 Anthropic model id `UNVERIFIED`), live Claude Code / OpenCode / Codex sessions through
-the gateway, the Docker sandbox on a host with a daemon. Not built yet: the web
-dashboard, org-admin (non-operator) accounts, mechanical scoring for `explain` and
-`agentic`, hosted open models on GridShare as a route.
+the gateway, the Docker sandbox on a host with a daemon. Not built yet: org-admin (non-operator) accounts, mechanical scoring for `explain` and
+`agentic`, `refactor` tasks from real code, hosted open models on GridShare as a
+route.

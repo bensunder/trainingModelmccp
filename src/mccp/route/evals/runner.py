@@ -55,6 +55,8 @@ async def score(task: Task, code: str | None, sandbox: Sandbox, timeout_s: float
     if not code:
         return False, "no code block in the answer"
     if task.task_class is TaskClass.TESTS:
+        if task.entry_point and re.search(rf"^\s*def {re.escape(task.entry_point)}\s*\(", code, re.M):
+            return False, f"answer redefines {task.entry_point}() instead of testing the given one"
         ref = await sandbox.run({"run.py": task.reference + "\n\n" + code}, ["python", "run.py"], timeout_s)
         if not ref.ok:
             return False, "tests fail on the correct implementation" + (" (timeout)" if ref.timed_out else "")
@@ -66,7 +68,14 @@ async def score(task: Task, code: str | None, sandbox: Sandbox, timeout_s: float
     if task.entry_point and not re.search(rf"^\s*def {re.escape(task.entry_point)}\s*\(", code, re.M):
         return False, f"answer does not define {task.entry_point}()"
     r = await sandbox.run(
-        {"run.py": code + "\n\n# --- hidden tests ---\n" + (task.tests or "")}, ["python", "run.py"], timeout_s
+        {
+            "run.py": (task.preamble + "\n\n" if task.preamble else "")
+            + code
+            + "\n\n# --- hidden tests ---\n"
+            + (task.tests or "")
+        },
+        ["python", "run.py"],
+        timeout_s,
     )
     if r.timed_out:
         return False, "timeout"

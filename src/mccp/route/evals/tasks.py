@@ -37,6 +37,7 @@ class Task(BaseModel):
     language: Literal["python"] = "python"
     prompt: str = Field(min_length=10)
     entry_point: str | None = None  # function the answer must define
+    preamble: str | None = None  # imports the spec relies on, prepended to the answer when scoring
     tests: str | None = None  # hidden asserts run against the answer (quick_edit/debug/refactor)
     reference: str | None = None  # correct implementation (tests class)
     mutants: list[str] = Field(default_factory=list)  # buggy implementations (tests class)
