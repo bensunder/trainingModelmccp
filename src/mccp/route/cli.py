@@ -145,3 +145,88 @@ def routing(gateway: Gateway) -> None:
         typer.echo(f"\n{pid} ({p['strategy']})")
         for task, v in p["routes"].items():
             typer.echo(f"  {task:11} -> {v['model'] or '-':16} {v['reason']}")
+
+
+eval_app = typer.Typer(no_args_is_help=True, help="Measure models on executable coding tasks -> routing evidence.")
+app.add_typer(eval_app, name="eval")
+
+
+@eval_app.command("sample")
+def eval_sample(
+    out: Annotated[Path, typer.Option(help="where to write the starter task file")] = Path("route-tasks.sample.jsonl"),
+) -> None:
+    """Write the small original starter task set (plumbing checks; too small to move routing)."""
+    from .evals import tasks
+
+    tasks.write(tasks.SAMPLE, out)
+    typer.echo(f"wrote {len(tasks.SAMPLE)} tasks to {out}")
+
+
+@eval_app.command("estimate")
+def eval_estimate(
+    catalog: Annotated[Path, typer.Option()],
+    tasks_file: Annotated[Path, typer.Option("--tasks")],
+    models: Annotated[str, typer.Option(help="comma list of catalog model ids")],
+    max_tokens: Annotated[int, typer.Option()] = 2048,
+) -> None:
+    """Estimate the API cost of a run before spending anything."""
+    from .config import load_catalog
+    from .evals import runner, tasks
+
+    cat = load_catalog(catalog)
+    ts, _ = tasks.load(tasks_file)
+    est = runner.estimate_usd(cat, ts, [m.strip() for m in models.split(",")], max_tokens)
+    for m, usd in est.items():
+        typer.echo(f"  {m:20} ~${usd:.4f}  ({len(ts)} tasks; price source: {cat.model(m).price_source})")
+    typer.echo(f"  total ~${sum(est.values()):.4f} (rough: prompt chars/4 in, half of max_tokens out)")
+
+
+@eval_app.command("run")
+def eval_run(
+    gateway: Gateway,
+    catalog: Annotated[Path, typer.Option()],
+    tasks_file: Annotated[Path, typer.Option("--tasks")],
+    models: Annotated[str, typer.Option(help="comma list of catalog model ids")],
+    out: Annotated[Path, typer.Option(help="results directory")] = Path("route-eval"),
+    sandbox: Annotated[str, typer.Option(help="docker | local")] = "docker",
+    allow_local_sandbox: Annotated[bool, typer.Option(help="accept the weaker local sandbox")] = False,
+    image: Annotated[str, typer.Option(help="sandbox image (pin a digest in production)")] = "python:3.12-slim",
+    concurrency: Annotated[int, typer.Option(min=1, max=32)] = 4,
+    max_tokens: Annotated[int, typer.Option()] = 2048,
+    yes: Annotated[bool, typer.Option("--yes", help="skip the cost confirmation")] = False,
+) -> None:
+    """Score models on the task file through the gateway; write results.jsonl and evidence.json."""
+    import asyncio
+
+    from .config import load_catalog
+    from .evals import runner, tasks
+    from .evals.sandbox import DockerSandbox, LocalSandbox
+
+    if sandbox == "local" and not allow_local_sandbox:
+        typer.echo("refusing the local sandbox (same filesystem view as this machine); use --sandbox docker, "
+                   "or --allow-local-sandbox on a disposable machine", err=True)  # fmt: skip
+        raise typer.Exit(2)
+    cat = load_catalog(catalog)
+    ms = [m.strip() for m in models.split(",") if m.strip()]
+    unknown = [m for m in ms if not cat.has_model(m)]
+    if unknown:
+        raise typer.BadParameter(f"not in the catalog: {unknown}")
+    ts, digest = tasks.load(tasks_file)
+    est = runner.estimate_usd(cat, ts, ms, max_tokens)
+    typer.echo(f"{len(ts)} tasks x {len(ms)} models; estimated ~${sum(est.values()):.4f} " + json.dumps(est))
+    if not yes and not typer.confirm("Run it (paid API calls)?"):
+        raise typer.Exit(1)
+    key = _secret("ROUTE_API_KEY", "Route API key for the evaluation (hidden): ")
+    sb = DockerSandbox(image=image) if sandbox == "docker" else LocalSandbox()
+    rows = asyncio.run(runner.run(cat, gateway, key, ts, ms, sb, out, concurrency, max_tokens))
+    ev, prov = runner.evidence(rows, suite=f"{tasks_file.name}@{digest[:12]}",
+                               provenance={"tasks_sha256": digest, "catalog_version": cat.version, "sandbox": sb.kind, "models": ms})  # fmt: skip
+    (out / "evidence.json").write_text(ev.model_dump_json(indent=2), encoding="utf-8")
+    for m in ms:
+        cells = ev.results.get(m, {})
+        typer.echo(
+            f"  {m:20} " + "  ".join(f"{t.value} {c.passed}/{c.n} (low {c.lower:.2f})" for t, c in cells.items())
+        )
+    typer.echo(
+        f"wrote {out / 'results.jsonl'} and {out / 'evidence.json'} ({prov['excluded_no_answer']} unanswered excluded)"
+    )

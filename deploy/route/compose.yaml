@@ -1,0 +1,55 @@
+# Route gateway on one host (srv1507394). Postgres and Redis are on a private
+# network with no published ports; only the gateway is published, and only on
+# 127.0.0.1 (Caddy terminates TLS for inference.whyaidata.com in front of it).
+#   ./deploy/route/install.sh        (first time: secrets, provider keys, start)
+#   docker compose -f deploy/route/compose.yaml --env-file deploy/route/.env up -d --build
+name: route
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: route
+      POSTGRES_DB: route
+      POSTGRES_PASSWORD: ${ROUTE_PG_PASSWORD:?set in deploy/route/.env}
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U route -d route"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", "", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  gateway:
+    build: {context: ../.., dockerfile: deploy/docker/route.Dockerfile}
+    env_file: .env
+    environment:
+      ROUTE_ENV: ${ROUTE_ENV:-production}
+      ROUTE_CATALOG: /config/route.yaml
+      ROUTE_EVIDENCE: /evidence/evidence.json   # absent = no evidence = no downgrade
+      ROUTE_DATABASE_URL: postgresql://route:${ROUTE_PG_PASSWORD}@postgres:5432/route
+      ROUTE_REDIS_URL: redis://redis:6379/0
+    volumes: ["./route.yaml:/config/route.yaml:ro", "./evidence:/evidence:ro"]
+    ports: ["127.0.0.1:${ROUTE_PORT:-8090}:8090"]
+    networks: [internal, egress]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+networks:
+  internal: {internal: true}   # no route to the internet: Postgres and Redis only
+  egress: {}                   # the gateway's path to model providers
+
+volumes:
+  pgdata:

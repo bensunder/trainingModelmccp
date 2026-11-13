@@ -177,6 +177,13 @@ Base models are switchable: a recipe names a profile (`profiles/<id>@v<N>.yaml`)
 
 `--methods rgt` adds a strategy-explicit copy of every decision sample (the rule chain for that invoice, plus the base model's actual mistake), rendered in the model's own reasoning block and verified against the real chat template before training. `mccp-gpu queue add qwen3-8b@v1 --n 100,300,1000 --methods sft,rgt --seeds 42 --test-n 300` runs the SFT-vs-RGT learning curve on one fixed test set and writes `curve.md`. See [docs/rgt.md](docs/rgt.md).
 
+## Route gateway (coding traffic control layer)
+
+`mccp-route`: one gateway in front of every model provider for Claude Code, OpenCode
+and Codex. Approved models per team, budgets, guardrails, usage and savings, and
+routing of each request to the cheapest model whose measured pass rate clears the bar
+for that task class (no evidence, no downgrade). See [docs/route.md](docs/route.md).
+
 ## Extract-then-rules
 
 `--task extract` trains the model to read the invoice facts in one call (no tool calls); code looks up the PO and vendor by the extracted ids and applies the policy in `mccp.rules.invoice_triage`, with a rule trace. It exists because the agent task's model guessed near the 2% and 30-day thresholds (about chance on both sides) and failed bank-change precedence 0/20, whatever the training mix. `mccp-gpu queue add qwen3-8b@v1 --n 1000 --seeds 42 --test-n 300 --task extract`. See [docs/extract-then-rules.md](docs/extract-then-rules.md).

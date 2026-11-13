@@ -1,0 +1,21 @@
+# Add to the host's Caddyfile (not the Caddy admin API: routes added there are
+# lost on restart). Caddy obtains the TLS certificate once DNS for
+# inference.whyaidata.com points at this server.
+inference.whyaidata.com {
+	encode zstd gzip
+	# Streams must reach clients as they are produced.
+	reverse_proxy 127.0.0.1:8090 {
+		flush_interval -1
+		transport http {
+			read_timeout 15m
+			write_timeout 15m
+		}
+	}
+	request_body {
+		max_size 32MB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}

@@ -46,6 +46,7 @@ class Evidence(BaseModel):
     suite: str
     generated_at: str
     results: dict[str, dict[TaskClass, Cell]] = Field(default_factory=dict)
+    provenance: dict[str, Any] = Field(default_factory=dict)  # task file hash, catalog version, sandbox, ...
 
     def cell(self, model_id: str, task: TaskClass) -> Cell | None:
         return self.results.get(model_id, {}).get(task)
