@@ -1,0 +1,100 @@
+# Route catalog: copy to deploy/route/route.yaml and edit.
+#
+# EVERY price below is a placeholder marked UNVERIFIED. Look up each provider's
+# current price page, set `price` and `price_source` ("https://... checked YYYY-MM-DD"),
+# then start in production mode, which refuses UNVERIFIED prices. Model names
+# (`upstream`) also change between releases: confirm each with the provider's
+# /models listing before go-live.
+#
+# Base URLs: the gateway appends /v1/messages to an anthropic base and
+# /chat/completions to an openai_chat base (which carries its own version prefix).
+version: "2026-11-12"
+baseline_model: claude-sonnet          # "what this traffic would have cost" in savings reports
+default_profile: auto-balanced
+
+providers:
+  - id: deepseek
+    name: DeepSeek
+    base_urls:
+      anthropic: https://api.deepseek.com/anthropic
+      openai_chat: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+  - id: moonshot
+    name: Moonshot (Kimi)
+    base_urls:
+      anthropic: https://api.moonshot.ai/anthropic
+      openai_chat: https://api.moonshot.ai/v1
+    api_key_env: MOONSHOT_API_KEY
+  - id: zai
+    name: Z.ai (GLM)
+    base_urls:
+      anthropic: https://api.z.ai/api/anthropic
+      openai_chat: https://api.z.ai/api/paas/v4
+    api_key_env: ZAI_API_KEY
+  - id: anthropic
+    name: Anthropic
+    base_urls:
+      anthropic: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    auth: x-api-key
+
+models:
+  - id: deepseek-flash
+    provider: deepseek
+    upstream: deepseek-flash
+    wires: [anthropic, openai_chat]
+    price: {input_per_m: 0.30, output_per_m: 1.20, cache_read_per_m: 0.03}
+    price_source: UNVERIFIED placeholder
+    context_window: 128000
+    tier: fast
+  - id: kimi
+    provider: moonshot
+    upstream: kimi-k2.6
+    wires: [anthropic, openai_chat]
+    price: {input_per_m: 0.95, output_per_m: 4.00, cache_read_per_m: 0.15}
+    price_source: UNVERIFIED placeholder
+    context_window: 256000
+    tier: strong
+  - id: glm
+    provider: zai
+    upstream: glm-5.3
+    wires: [anthropic, openai_chat]
+    price: {input_per_m: 0.60, output_per_m: 2.20, cache_read_per_m: 0.11}
+    price_source: UNVERIFIED placeholder
+    context_window: 200000
+    tier: strong
+  - id: claude-sonnet
+    provider: anthropic
+    upstream: UNVERIFIED-set-current-sonnet-model-id
+    wires: [anthropic]
+    price: {input_per_m: 3.00, output_per_m: 15.00, cache_read_per_m: 0.30, cache_write_per_m: 3.75}
+    price_source: UNVERIFIED placeholder
+    context_window: 200000
+    tier: frontier
+
+profiles:
+  - id: auto-cost
+    name: Lowest cost
+    strategy: cost
+    candidates: [deepseek-flash, glm, kimi, claude-sonnet]
+    fallback: claude-sonnet
+    background_model: deepseek-flash
+    escalation: [kimi, claude-sonnet]
+    quality_bar: 0.80
+  - id: auto-balanced
+    name: Balanced
+    strategy: balanced
+    candidates: [deepseek-flash, glm, kimi, claude-sonnet]
+    fallback: claude-sonnet
+    background_model: deepseek-flash
+    escalation: [kimi, claude-sonnet]
+    quality_bar: 0.85
+    quality_bar_by_class: {agentic: 0.90, debug: 0.90}
+  - id: auto-intelligence
+    name: Best quality
+    strategy: intelligence
+    candidates: [glm, kimi, claude-sonnet]
+    fallback: claude-sonnet
+    background_model: deepseek-flash
+    escalation: [claude-sonnet]
+    quality_bar: 0.90
