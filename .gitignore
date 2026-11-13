@@ -7,3 +7,7 @@ examples/out/
 secrets/
 deploy/secrets/
 deploy/.env
+
+# dashboard
+web/route-dashboard/node_modules/
+web/route-dashboard/dist/

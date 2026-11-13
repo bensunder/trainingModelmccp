@@ -188,6 +188,9 @@ class PgStore:
         )  # fmt: skip
         return _org(r)
 
+    async def list_orgs(self) -> list[Org]:
+        return [_org(r) for r in await self.pool.fetch("SELECT * FROM route.orgs ORDER BY name")]
+
     async def get_org(self, org_id: str) -> Org:
         return _org(await self._one("SELECT * FROM route.orgs WHERE id = $1", org_id))
 

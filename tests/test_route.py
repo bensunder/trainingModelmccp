@@ -723,3 +723,43 @@ def test_codex_setup_preserves_the_rest_of_config_toml(tmp_path):
     su.remove(tmp_path, ["codex"])
     cfg = tomllib.loads((tmp_path / ".codex" / "config.toml").read_text())
     assert "model_provider" not in cfg and "model_providers" not in cfg and cfg["approval_policy"] == "on-request"
+
+
+# -- dashboard support ------------------------------------------------------------------------
+
+
+def test_admin_lists_orgs_catalog_and_day_by_model_spend(env):
+    c, _, _ = env
+    org, _, key = setup_key(c, name="zeta")
+    setup_key(c, name="alpha")
+    names = [o["name"] for o in admin(c, "GET", "/orgs").json()]
+    assert names == sorted(names) and {"alpha", "zeta"} <= set(names)
+    cat = admin(c, "GET", "/catalog").json()
+    assert cat["baseline_model"] == "claude-sonnet" and {m["id"] for m in cat["models"]} >= {"glm", "kimi"}
+    assert all(not any("api_key" in k or "secret" in k for k in m) for m in cat["models"])  # no credentials exposed
+    assert {m["id"]: m["provider_ready"] for m in cat["models"]}["glm"] is True
+    c.post("/v1/messages", headers={"x-api-key": key}, json=anthropic_body("add a docstring"))
+    c.portal.call(c.app.state.gw.writer.flush)
+    u = admin(c, "GET", f"/orgs/{org['id']}/usage").json()
+    ((day, models),) = u["by_day_model"].items()
+    assert models["deepseek-flash"] > 0
+
+
+def test_dashboard_is_served_with_strict_security_headers(tmp_path, monkeypatch, cat):
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "index.html").write_text("<!doctype html><title>t</title>")
+    (tmp_path / "assets" / "app-abc123.js").write_text("console.log(1)")
+    monkeypatch.setenv("ROUTE_DASHBOARD_DIR", str(tmp_path))
+    settings = Settings(
+        catalog_path=str(EXAMPLE), key_pepper=b"p" * 32, admin_token_sha256=hashlib.sha256(ADMIN.encode()).hexdigest()
+    )
+    app = create_app(settings, catalog=cat, store=MemoryStore(), cache=MemoryCache(), upstream=Upstream(cat, env={}))
+    with TestClient(app) as c:
+        r = c.get("/dashboard/")
+        assert r.status_code == 200 and "<title>t</title>" in r.text
+        csp = r.headers["content-security-policy"]
+        assert "default-src 'self'" in csp and "frame-ancestors 'none'" in csp and "unsafe-inline" not in csp
+        assert r.headers["x-frame-options"] == "DENY" and r.headers["cache-control"] == "no-cache"
+        a = c.get("/dashboard/assets/app-abc123.js")
+        assert "immutable" in a.headers["cache-control"]
+        assert "content-security-policy" not in c.get("/healthz").headers  # API responses untouched

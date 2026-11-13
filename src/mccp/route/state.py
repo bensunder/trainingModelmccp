@@ -141,6 +141,7 @@ class NotFound(LookupError):
 class Store(Protocol):
     async def create_org(self, name: str, default_profile: str | None = None) -> Org: ...
     async def get_org(self, org_id: str) -> Org: ...
+    async def list_orgs(self) -> list[Org]: ...
     async def update_org(self, org_id: str, **fields: Any) -> Org: ...
     async def create_team(
         self, org_id: str, name: str, approved_models: list[str] | None, default_profile: str | None
@@ -181,6 +182,9 @@ class MemoryStore:
         o = Org(new_id(), name, now(), default_profile=default_profile)
         self.orgs[o.id] = o
         return o
+
+    async def list_orgs(self) -> list[Org]:
+        return sorted(self.orgs.values(), key=lambda o: o.name)
 
     async def get_org(self, org_id: str) -> Org:
         if org_id not in self.orgs:
@@ -291,6 +295,7 @@ def summarize(rows: list[UsageEvent]) -> dict[str, Any]:
     by_day: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     by_team: dict[str, float] = defaultdict(float)
     by_task: dict[str, int] = defaultdict(int)
+    by_day_model: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     spend = baseline = 0.0
     inp = out = cread = cwrite = 0
     errors = unreported = 0
@@ -308,7 +313,10 @@ def summarize(rows: list[UsageEvent]) -> dict[str, Any]:
             m["requests"] += 1
             m["cost_usd"] += e.cost_usd
             m["tokens"] += e.input_tokens + e.output_tokens + e.cache_read_tokens + e.cache_write_tokens
-        d = by_day[e.created_at.date().isoformat()]
+        day = e.created_at.date().isoformat()
+        d = by_day[day]
+        if e.model:
+            by_day_model[day][e.model] += e.cost_usd
         d["cost_usd"] += e.cost_usd
         d["requests"] += 1
         by_team[e.team_id] += e.cost_usd
@@ -329,6 +337,7 @@ def summarize(rows: list[UsageEvent]) -> dict[str, Any]:
         "by_day": {k: {kk: round(vv, 6) for kk, vv in v.items()} for k, v in sorted(by_day.items())},
         "by_team": {k: round(v, 6) for k, v in sorted(by_team.items())},
         "by_task": dict(sorted(by_task.items())),
+        "by_day_model": {d: {m: round(v, 6) for m, v in sorted(ms.items())} for d, ms in sorted(by_day_model.items())},
     }
 
 

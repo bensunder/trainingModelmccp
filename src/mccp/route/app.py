@@ -406,6 +406,27 @@ def create_app(
             out["events"] = [event_dict(e) for e in rows[-1000:]]
         return out
 
+    @app.get("/admin/v1/orgs", dependencies=[A])
+    async def list_orgs(g: G) -> list[dict[str, Any]]:
+        return [_ser(o) for o in await g.store.list_orgs()]
+
+    @app.get("/admin/v1/catalog", dependencies=[A])
+    async def catalog_view(g: G) -> dict[str, Any]:
+        c = g.catalog
+        return {
+            "version": c.version,
+            "baseline_model": c.baseline_model,
+            "default_profile": c.default_profile,
+            "models": [
+                {"id": m.id, "provider": m.provider, "tier": m.tier, "wires": [w.value for w in m.wires],
+                 "price": m.price.model_dump(), "price_source": m.price_source, "context_window": m.context_window,
+                 "provider_ready": g.upstream.configured(m.provider)}
+                for m in c.models
+            ],
+            "profiles": [{"id": p.id, "name": p.name, "strategy": p.strategy.value, "candidates": p.candidates,
+                          "fallback": p.fallback, "background_model": p.background_model} for p in c.profiles],
+        }  # fmt: skip
+
     @app.get("/admin/v1/routing", dependencies=[A])
     async def routing(g: G) -> dict[str, Any]:
         return {
@@ -417,7 +438,43 @@ def create_app(
             },
         }
 
+    _mount_dashboard(app)
     return app
+
+
+DASHBOARD_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+)
+
+
+def _mount_dashboard(app: FastAPI) -> None:
+    """Serve the built dashboard (web/route-dashboard/dist) at /dashboard when present.
+    Same origin as the admin API, strict CSP, no third-party code."""
+    from pathlib import Path
+
+    from fastapi.staticfiles import StaticFiles
+
+    root = Path(
+        os.environ.get("ROUTE_DASHBOARD_DIR", Path(__file__).resolve().parents[3] / "web" / "route-dashboard" / "dist")
+    )
+    if not (root / "index.html").exists():
+        return
+    app.mount("/dashboard", StaticFiles(directory=root, html=True), name="dashboard")
+
+    @app.middleware("http")
+    async def _dashboard_headers(request: Request, call_next):
+        resp = await call_next(request)
+        if request.url.path.startswith("/dashboard"):
+            resp.headers["content-security-policy"] = DASHBOARD_CSP
+            resp.headers["x-content-type-options"] = "nosniff"
+            resp.headers["referrer-policy"] = "no-referrer"
+            resp.headers["x-frame-options"] = "DENY"
+            if request.url.path.endswith((".js", ".css")) and "/assets/" in request.url.path:
+                resp.headers["cache-control"] = "public, max-age=31536000, immutable"  # hashed file names
+            else:
+                resp.headers["cache-control"] = "no-cache"
+        return resp
 
 
 def main() -> None:  # pragma: no cover - process entry point
